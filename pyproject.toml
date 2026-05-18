@@ -1,0 +1,49 @@
+[project]
+name = "guling-trader"
+version = "0.1.0"
+description = "Windows 桌面客户端：通过 WS 隧道连接 guling.pro / yu-agent 并驱动同花顺独立委托客户端（xiadan.exe）执行 A 股交易"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "GPL-3.0-or-later"}
+authors = [
+    {name = "孙洋", email = "suny911@gmail.com"},
+]
+keywords = ["trading", "ths", "tonghuashun", "xiadan", "rpa", "a-shares", "agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "websockets>=13.0",      # WS 隧道客户端（支持 wss:// SSL/TLS）
+    "pywin32>=306; sys_platform == 'win32'",     # Win32 API（xiadan 窗口自动化）
+    "pystray>=0.19; sys_platform == 'win32'",    # 系统托盘图标
+    "pillow>=10.0",          # 图像处理（tray icon 生成）
+    "opencv-python>=4.8",    # 图像处理（xiadan 截图）
+    "pytesseract>=0.3.10",   # OCR 识别（委托结果解析）
+    "numpy>=1.26",           # 数值计算（image processing）
+    "python-dotenv>=1.0",    # 环境变量加载（配置管理）
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0"]  # Windows EXE 打包
+
+[project.urls]
+Homepage = "https://github.com/suny911/guling-trader"
+Repository = "https://github.com/suny911/guling-trader"
+Issues = "https://github.com/suny911/guling-trader/issues"
+
+[project.scripts]
+guling-trader = "trader.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trader"]

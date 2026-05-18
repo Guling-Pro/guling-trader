@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# PyInstaller
+*.spec.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Local config (contains agent_token plaintext per PH-061)
+# Users' personal install state — never committed
+config.json
+*.local
+
+# Logs
+*.log
+
+# OCR artifacts (left by ths.win.ocr_rect)
+ret.png
+ret1.png
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
