@@ -27,7 +27,7 @@ jobs:
           pyinstaller --onefile --windowed `
                       --name guling-trader `
                       --collect-submodules trader `
-                      -m trader
+                      src/trader/__main__.py
         shell: pwsh
 
       - name: Compute SHA-256 checksum
