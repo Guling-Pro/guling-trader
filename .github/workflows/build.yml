@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write   # required for softprops/action-gh-release to create release + upload assets
+
 jobs:
   build-windows:
     runs-on: windows-latest
