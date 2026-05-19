@@ -28,7 +28,9 @@ async def handle_call(
 
     try:
         if method == "balance":
+            logger.info("[RPC] method=balance, frame_id=%s", frame_id)
             result = await backend.balance()
+            logger.info("[RPC] balance → code=%s", result.get("code"))
         elif method == "position":
             result = await backend.position()
         elif method == "orders_active":

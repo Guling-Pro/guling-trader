@@ -267,6 +267,22 @@ class WinThsBackend:
     def __init__(self):
         self.hwnd_main = None
 
+    def _ensure_bound(self) -> dict[str, Any] | None:
+        """检查是否已绑定；否则 lazy bind，返回错误 dict 或 None（成功）"""
+        if self.hwnd_main and self.hwnd_main > 0:
+            return None  # 已绑定
+
+        # 尝试 bind
+        logger.info("未检测到 xiadan 窗口，尝试 lazy bind...")
+        self.bind_client()
+        if self.hwnd_main and self.hwnd_main > 0:
+            logger.info("✓ 成功绑定到 xiadan 窗口: hwnd=%s", self.hwnd_main)
+            return None
+
+        # bind 失败
+        logger.error("✗ 未检测到 xiadan 窗口（window_title 为空或窗口未运行）")
+        return {"code": 1, "error": "未检测到 xiadan 窗口（请确保同花顺已打开并登录）"}
+
     def bind_client(self):
         # Try exact match first for backward compat, then prefix match.
         hwnd = win32gui.FindWindow(None, window_title)
@@ -1017,15 +1033,27 @@ class WinThsBackend:
     # ------------------------------------------------------------------
 
     async def balance(self) -> dict[str, Any]:
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
         return await asyncio.to_thread(self.get_balance)
 
     async def position(self) -> dict[str, Any]:
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
         return await asyncio.to_thread(self.get_position)
 
     async def orders_active(self) -> dict[str, Any]:
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
         return await asyncio.to_thread(self.get_active_orders)
 
     async def orders_filled(self) -> dict[str, Any]:
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
         return await asyncio.to_thread(self.get_filled_orders)
 
     async def buy(
@@ -1035,6 +1063,9 @@ class WinThsBackend:
         price: Optional[float] = None,
         client_order_id: Optional[str] = None,
     ) -> dict[str, Any]:
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
         return await asyncio.to_thread(
             self._do_buy, stock_no, amount, price if price is not None else 0
         )
@@ -1046,9 +1077,15 @@ class WinThsBackend:
         price: Optional[float] = None,
         client_order_id: Optional[str] = None,
     ) -> dict[str, Any]:
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
         return await asyncio.to_thread(
             self._do_sell, stock_no, amount, price if price is not None else 0
         )
 
     async def cancel(self, entrust_no: str) -> dict[str, Any]:
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
         return await asyncio.to_thread(self._do_cancel, entrust_no)
