@@ -25,14 +25,56 @@ jobs:
           pip install -e .
           pip install pyinstaller
 
+      - name: Download Tesseract for bundling
+        shell: pwsh
+        run: |
+          $TessVersion = "5.4.0.20240606"
+          $TessUrl = "https://digi.bib.uni-mannheim.de/tesseract/tesseract-ocr-w64-setup-v$TessVersion.exe"
+          $TessExe = "tess-setup.exe"
+          $TessBundle = "tess-bundle"
+
+          Write-Host "下载 Tesseract $TessVersion..."
+          Invoke-WebRequest -Uri $TessUrl -OutFile $TessExe
+
+          Write-Host "Silent install 到临时目录..."
+          Start-Process -Wait -FilePath $TessExe -ArgumentList "/S", "/D=$pwd\$TessBundle"
+
+          Write-Host "验证 Tesseract 文件..."
+          if (!(Test-Path "$TessBundle\tesseract.exe")) {
+            throw "tesseract.exe 不存在于 $TessBundle"
+          }
+          if (!(Test-Path "$TessBundle\tessdata\chi_sim.traineddata")) {
+            throw "chi_sim.traineddata 不存在"
+          }
+          if (!(Test-Path "$TessBundle\tessdata\eng.traineddata")) {
+            throw "eng.traineddata 不存在"
+          }
+
+          Write-Host "✓ Tesseract bundle 准备完成"
+
       - name: Build single-file executable
         run: |
           pyinstaller --onefile --windowed `
                       --name guling-trader `
                       --paths src `
                       --collect-submodules trader `
+                      --add-binary "tess-bundle\tesseract.exe;tesseract" `
+                      --add-data "tess-bundle\tessdata\chi_sim.traineddata;tesseract/tessdata" `
+                      --add-data "tess-bundle\tessdata\eng.traineddata;tesseract/tessdata" `
                       run_trader.py
         shell: pwsh
+
+      - name: Verify executable size
+        shell: pwsh
+        run: |
+          $exePath = "dist\guling-trader.exe"
+          $sizeBytes = (Get-Item $exePath).Length
+          $sizeMB = [math]::Round($sizeBytes / 1MB, 2)
+          Write-Host "✓ 构建完成：$sizeMB MB"
+
+          if ($sizeMB -gt 100) {
+            Write-Host "⚠ 警告：executable 大小超过 100MB ($sizeMB MB)"
+          }
 
       - name: Compute SHA-256 checksum
         run: |
