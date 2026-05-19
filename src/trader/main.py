@@ -63,6 +63,10 @@ def _check_xiadan_conflict() -> None:
     if platform.system() != "Windows":
         return
 
+    if not globals().get("psutil"):
+        logger.debug("psutil not available, skipping conflict check")
+        return
+
     try:
         for proc in psutil.process_iter(["name"]):
             try:
