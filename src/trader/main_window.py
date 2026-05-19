@@ -165,7 +165,7 @@ class MainWindow:
         # ---- 安装进度区（仅 INSTALLING 状态显示） ----
         self.install_frame = ttk.LabelFrame(self.root, text="安装进度", padding=(10, 6))
         # 默认不 pack，状态变 INSTALLING 时再 pack
-        self.install_progress_var = tk.DoubleVar(value=0.0)
+        self.install_progress_var = tk.DoubleVar(master=self.root, value=0.0)
         self.install_progress_bar = ttk.Progressbar(
             self.install_frame,
             variable=self.install_progress_var,
