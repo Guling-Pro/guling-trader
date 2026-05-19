@@ -166,7 +166,26 @@ class WsClient:
             logger.info("配对码已生成：%s", code)
 
         elif frame_type == "bind_ok":
-            logger.info("配对成功")
+            # 关键持久化：bind_ok 帧里的 agent_token plaintext 是唯一一次出现，
+            # 必须立刻保存到本地 config.json，否则 trader 重启就丢，下次启动
+            # has_paired() = False → pair_init → server reject "device_already_paired"
+            # → 死循环。
+            account_name = frame.get("account_name")
+            agent_token = frame.get("agent_token")
+            session_id = frame.get("session_id")
+            logger.info("配对成功 account=%s session=%s", account_name, session_id)
+
+            try:
+                from datetime import datetime
+                cfg = config.load()
+                cfg.agent_token = agent_token
+                cfg.account_name = account_name
+                cfg.paired_at = datetime.now().isoformat()
+                config.save(cfg)
+                logger.info("✓ 已持久化 agent_token 到 config.json")
+            except Exception as e:
+                logger.exception("⚠ 保存 agent_token 到 config 失败：%s", e)
+
             self._set_state(ConnectionState.CONNECTED)
 
         elif frame_type == "welcome":
