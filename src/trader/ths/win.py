@@ -61,7 +61,7 @@ retry_time = 1
 # Set by `setup()` from Config. Module-level so the existing call sites
 # (`win32gui.FindWindow(None, window_title)`) keep working without threading
 # config through every method.
-window_title: str = ""
+window_title: str = "网上股票交易系统5.0"
 
 
 def setup(window_title_value: str, tesseract_cmd: str) -> None:
