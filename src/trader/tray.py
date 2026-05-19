@@ -61,6 +61,7 @@ class TrayConfig:
     on_exit: Optional[Callable[[], None]] = None
     on_show_status: Optional[Callable[[str, str, str], None]] = None
     on_installer_event: Optional[Callable[[any], None]] = None  # installer 事件回调
+    on_show_window: Optional[Callable[[], None]] = None  # 从托盘恢复窗口
 
 
 class TrayManager:
@@ -124,6 +125,12 @@ class TrayManager:
             self.root.withdraw()
 
             menu = pystray.Menu(  # type: ignore
+                pystray.MenuItem(  # type: ignore
+                    "显示窗口",
+                    self._on_show_window_menu,
+                    default=True,  # 双击托盘图标触发此项
+                ),
+                pystray.MenuItem.SEPARATOR,  # type: ignore
                 pystray.MenuItem("配对码...", self._on_show_pairing_code),  # type: ignore
                 pystray.MenuItem("连接状态", self._on_show_status),  # type: ignore
                 pystray.MenuItem("打开 xiadan", self._on_open_xiadan),  # type: ignore
@@ -147,6 +154,11 @@ class TrayManager:
             return
         icon_image = _create_icon_image(self.state)
         self.icon.icon = icon_image
+
+    def _on_show_window_menu(self, icon: "pystray.Icon", item: "pystray.MenuItem") -> None:  # type: ignore
+        """菜单 / 双击：显示主窗口"""
+        if self.config.on_show_window:
+            self.config.on_show_window()
 
     def _on_show_pairing_code(self, icon: "pystray.Icon", item: "pystray.MenuItem") -> None:  # type: ignore
         """菜单：显示配对码"""

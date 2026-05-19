@@ -51,6 +51,45 @@ class PendingRPC:
     future: asyncio.Future
 
 
+def _format_rpc_log(
+    method: str, params: dict, result: Any = None, error: str = None
+) -> str:
+    """格式化单行 Agent 操作日志: [Agent] method args → result/✗ error"""
+    if method in ("buy", "sell"):
+        stock = params.get("stock_no", "?")
+        amount = params.get("amount", "?")
+        price = params.get("price")
+        args = f"{stock}×{amount}" + (f"@{price}" if price is not None else "")
+    elif method == "cancel":
+        args = str(params.get("entrust_no", "?"))
+    else:
+        args = ""
+
+    prefix = f"[Agent] {method}" + (f" {args}" if args else "")
+
+    if error:
+        return f"{prefix} → ✗ {error}"
+
+    if result is None:
+        return prefix
+
+    if isinstance(result, dict) and result.get("code") == 0:
+        if method == "balance":
+            avail = result.get("available_cash") or result.get("available")
+            tail = f"可用 {avail}" if avail is not None else "OK"
+        elif method in ("buy", "sell"):
+            oid = result.get("entrust_no") or result.get("order_id")
+            tail = f"委托号 {oid}" if oid else "OK"
+        elif method == "cancel":
+            tail = "已撤单"
+        else:
+            tail = "OK"
+    else:
+        tail = "OK"
+
+    return f"{prefix} → {tail}"
+
+
 class WsClient:
     """WebSocket 客户端管理"""
 
@@ -59,6 +98,7 @@ class WsClient:
         dev_url: Optional[str] = None,
         on_state_change: Optional[Callable[[ConnectionState], None]] = None,
         on_pair_pending: Optional[Callable[[str, Any], None]] = None,
+        on_rpc_log: Optional[Callable[[str], None]] = None,
         backend: Optional[WinThsBackend] = None,
     ):
         self.endpoint = dev_url or WS_ENDPOINT
@@ -69,6 +109,7 @@ class WsClient:
         self.max_reconnect_delay = 60.0
         self.on_pair_pending = on_pair_pending
         self.on_state_change = on_state_change
+        self.on_rpc_log = on_rpc_log
         self.backend = backend or WinThsBackend()
 
     def _set_state(self, new_state: ConnectionState) -> None:
@@ -163,7 +204,11 @@ class WsClient:
         if frame_type == "pair_pending":
             self._set_state(ConnectionState.AWAITING_BIND)
             code = frame.get("code")
+            expires_at = frame.get("expires_at")
             logger.info("配对码已生成：%s", code)
+            # 新码到来时，通知上层更新 pairing_code + expires_at + 清除 refreshing
+            if self.on_pair_pending:
+                self.on_pair_pending(code, expires_at)
 
         elif frame_type == "bind_ok":
             # 关键持久化：bind_ok 帧里的 agent_token plaintext 是唯一一次出现，
@@ -206,9 +251,13 @@ class WsClient:
                 result = await self._dispatch_call(method, params)
                 reply["ok"] = True
                 reply["result"] = result
+                if self.on_rpc_log:
+                    self.on_rpc_log(_format_rpc_log(method, params, result=result))
             except Exception as e:
                 reply["ok"] = False
                 reply["error"] = str(e)
+                if self.on_rpc_log:
+                    self.on_rpc_log(_format_rpc_log(method, params, error=str(e)))
             if self.ws:
                 await self.ws.send(json.dumps(reply, ensure_ascii=False))
 

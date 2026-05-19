@@ -12,7 +12,6 @@ import io
 import logging
 import os
 import platform
-import subprocess
 import sys
 import threading
 import traceback
@@ -131,6 +130,90 @@ def _make_installer_event_handler(state: SharedState):
 _ws_client_holder: dict = {"client": None, "loop": None}
 
 
+async def _pairing_refresh_watcher(state: SharedState, client: ws_client.WsClient) -> None:
+    """检测配对码过期 → ws.close() 触发重连申请新码"""
+    while True:
+        try:
+            await asyncio.sleep(5)
+            snap = state.snapshot()
+            if snap["connection_state"] != "AWAITING_BIND":
+                continue
+            exp = snap.get("pairing_expires_at")
+            if exp is None:
+                continue
+            import time as _t
+            if _t.time() < exp:
+                continue
+            # 过期
+            code = snap.get("pairing_code", "?")
+            state.update(ths_refreshing=True)
+            state.log(f"配对码 {code} 已过期，重连获取新码...")
+            if client.ws is not None:
+                try:
+                    await client.ws.close()
+                except Exception:
+                    pass
+            # 重连后 on_pair_pending 会被调用，到时 ths_refreshing 会被清除
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("pairing refresh watcher exception: %s", e)
+
+
+async def _ths_polling_task(state: SharedState) -> None:
+    """THS 4步检测循环：2秒周期，exception-safe"""
+    while True:
+        try:
+            await asyncio.sleep(2)
+            snap = state.snapshot()
+            # 断开/错误时不检测
+            if snap["connection_state"] in ("DISCONNECTED", "FATAL"):
+                continue
+
+            # Step 1: hexin
+            step1 = _check_hexin_running()
+            if not step1:
+                if snap["ths_steps_complete"] != 0:
+                    state.update(ths_steps_complete=0, ths_expanded=True)
+                continue
+
+            # Step 2: xiadan
+            xiadan_path = _check_xiadan_running()
+            if not xiadan_path:
+                if snap["ths_steps_complete"] != 1:
+                    state.update(ths_steps_complete=1, ths_expanded=True)
+                continue
+
+            # Step 3: 旧版窗口
+            if platform.system() == "Windows":
+                win_result = bootstrap._detect_xiadan_window("网上股票交易系统5.0")
+            else:
+                win_result = None
+            if not win_result:
+                if snap["ths_steps_complete"] != 2:
+                    state.update(ths_steps_complete=2, ths_expanded=True)
+                continue
+
+            # Step 4: 路径有效
+            if snap["ths_steps_complete"] < 3:
+                state.update(ths_steps_complete=3, ths_expanded=True)
+            # 更新 xiadan_path 如果还没有
+            if not snap.get("xiadan_path"):
+                state.update(xiadan_path=xiadan_path)
+                state.log(f"✓ 检测到 xiadan：{xiadan_path}")
+
+            if snap["ths_steps_complete"] < 4:
+                state.update(ths_steps_complete=4, ths_expanded=False)
+                state.log("✓ 自检完成 · xiadan 就绪")
+
+            # 已折叠后继续轮询监听进程断连（loop 继续）
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("THS polling exception: %s", e)
+
+
 async def _async_main(
     bootstrap_result: bootstrap.BootstrapResult,
     state: SharedState,
@@ -177,7 +260,7 @@ async def _async_main(
                 pass
 
     def on_pair_pending(code, expires_at) -> None:
-        """收到 pair_pending：把 code + expires_at 推给主窗口显示"""
+        """收到 pair_pending：把 code + expires_at 推给主窗口显示，清除刷新标志"""
         # expires_at 可能是 ISO 字符串或数字时间戳，统一转 unix timestamp
         from datetime import datetime, timezone
         import time as _time
@@ -201,7 +284,7 @@ async def _async_main(
                 # 兜底：当前时间 +5min
                 exp_ts = _time.time() + 300
 
-        state.update(pairing_code=code, pairing_expires_at=exp_ts)
+        state.update(pairing_code=code, pairing_expires_at=exp_ts, ths_refreshing=False)
         state.log(f"✓ 收到配对码：{code}，5 分钟内有效")
 
     state.log("连接 guling.pro...")
@@ -209,10 +292,15 @@ async def _async_main(
         dev_url=os.environ.get("YU_TRADER_DEV_URL"),
         on_state_change=on_ws_state_change,
         on_pair_pending=on_pair_pending,
+        on_rpc_log=state.log,
     )
     # 暴露给主线程的「重新配对」按钮用——thread-safe 关 ws 触发重连
     _ws_client_holder["client"] = client
     _ws_client_holder["loop"] = asyncio.get_event_loop()
+
+    # 同时跑 ws_client + THS polling + pairing refresh watcher
+    polling_task = asyncio.create_task(_ths_polling_task(state))
+    refresh_task = asyncio.create_task(_pairing_refresh_watcher(state, client))
     try:
         await client.run()
     except asyncio.CancelledError:
@@ -220,6 +308,41 @@ async def _async_main(
     except Exception as e:
         state.log(f"⚠ ws_client 异常: {e}")
         logger.exception("ws_client.run failed")
+    finally:
+        polling_task.cancel()
+        refresh_task.cancel()
+        try:
+            await asyncio.gather(polling_task, refresh_task, return_exceptions=True)
+        except Exception:
+            pass
+
+
+def _check_hexin_running() -> bool:
+    """Step 1: hexin.exe 或 ths.exe 进程存活"""
+    if platform.system() != "Windows" or psutil is None:
+        return False
+    try:
+        for proc in psutil.process_iter(["name"]):
+            name = (proc.info.get("name") or "").lower()
+            if name in {"hexin.exe", "ths.exe"}:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _check_xiadan_running() -> Optional[str]:
+    """Step 2: xiadan.exe 进程存活，返回 exe 路径"""
+    if platform.system() != "Windows" or psutil is None:
+        return None
+    try:
+        for proc in psutil.process_iter(["name", "exe"]):
+            name = (proc.info.get("name") or "").lower()
+            if name == "xiadan.exe":
+                return proc.info.get("exe") or None
+    except Exception:
+        pass
+    return None
 
 
 def _check_xiadan_conflict(state: SharedState) -> None:
@@ -327,7 +450,7 @@ def run() -> None:
         xiadan = snap.get("xiadan_path") or result.found_xiadan_path
         if xiadan:
             try:
-                subprocess.Popen([xiadan])
+                os.startfile(xiadan)
                 state.log("已启动同花顺")
             except Exception as e:
                 state.log(f"⚠ 启动同花顺失败: {e}")
@@ -419,7 +542,11 @@ def run() -> None:
         on_exit=on_main_exit,
         on_redetect_xiadan=on_redetect_xiadan,
         on_set_xiadan_path=on_set_xiadan_path,
+        minimize_to_tray=(platform.system() == "Windows"),
     )
+    # tray「显示窗口」回调在 mw 创建后才能绑定
+    if tray_mgr is not None:
+        tray_mgr.config.on_show_window = mw.show_window
     try:
         mw.run()
     except KeyboardInterrupt:
