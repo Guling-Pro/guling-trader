@@ -8,13 +8,79 @@
 """
 import argparse
 import asyncio
+import io
 import logging
 import os
 import platform
 import subprocess
 import sys
 import threading
+import traceback
+from pathlib import Path
 from typing import Optional
+
+
+# ---- 文件日志 + stderr/stdout 重定向 ----
+# PyInstaller --windowed 模式 stdout/stderr 被吞掉，wine 下 print 全部消失。
+# 启动期就把所有输出写到 %APPDATA%\guling-trader\trader.log（每次启动覆盖）。
+# 这是 wine/CrossOver 用户的唯一诊断渠道——异常 traceback 也会写进去。
+
+def _setup_file_logging() -> Path:
+    if platform.system() == "Windows":
+        log_dir = Path(os.environ.get("APPDATA", "")) / "guling-trader"
+    else:
+        log_dir = Path.home() / ".config" / "guling-trader"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = log_dir / "trader.log"
+    # 'w' 每次启动新建——避免日志无限增长
+    log_fh = open(log_file, "w", encoding="utf-8", buffering=1)
+
+    # 1) stdout / stderr 同时写到日志 + 原 sink（windowed 下原 sink 是 /dev/null，无副作用）
+    class _Tee(io.TextIOBase):
+        def __init__(self, *streams):
+            self.streams = [s for s in streams if s is not None]
+
+        def write(self, data):
+            for s in self.streams:
+                try:
+                    s.write(data)
+                    s.flush()
+                except Exception:
+                    pass
+            return len(data)
+
+        def flush(self):
+            for s in self.streams:
+                try:
+                    s.flush()
+                except Exception:
+                    pass
+
+    sys.stdout = _Tee(sys.__stdout__, log_fh)
+    sys.stderr = _Tee(sys.__stderr__, log_fh)
+
+    # 2) logging 模块也写到日志 + stderr（已 Tee 到文件）
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True,
+    )
+
+    # 3) 顶层异常都写到日志（uncaught exception hook）
+    def _excepthook(exc_type, exc_value, exc_tb):
+        print("\n=== UNCAUGHT EXCEPTION ===", file=sys.stderr)
+        traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stderr)
+        sys.stderr.flush()
+        log_fh.flush()
+
+    sys.excepthook = _excepthook
+
+    return log_file
+
+
+_LOG_FILE = _setup_file_logging()
+
 
 from . import bootstrap, config as trader_config, tray, ui_dialogs, ws_client
 from .installer import auto_install
@@ -28,11 +94,10 @@ if platform.system() == "Windows":
 else:
     psutil = None
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
+logger.info("=== guling-trader 启动 ===")
+logger.info("log file: %s", _LOG_FILE)
+logger.info("platform: %s, python: %s", platform.platform(), sys.version)
 
 
 def _make_installer_event_handler(state: SharedState):

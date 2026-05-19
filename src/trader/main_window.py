@@ -99,7 +99,8 @@ class MainWindow:
 
         self.root = tk.Tk()
         self.root.title("guling-trader")
-        self.root.geometry("520x540")
+        # 显式 +200+200 位置防止 wine 把窗口扔到屏外
+        self.root.geometry("520x540+200+200")
         self.root.minsize(420, 400)
 
         # 关闭按钮 → 触发真退出（不最小化到 tray，因为 tray 在 wine 下不可见）
@@ -107,6 +108,13 @@ class MainWindow:
 
         self._build_ui()
         self._schedule_poll()
+
+        # 强制窗口可见 + 在前——wine 下 tk 窗口默认有时被埋
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after(500, lambda: self.root.attributes("-topmost", False))
+        self.root.deiconify()
+        self.root.focus_force()
 
     def _build_ui(self) -> None:
         # ---- 状态条 ----
