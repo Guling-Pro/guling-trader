@@ -175,7 +175,7 @@ async def _async_main(
     def on_pair_pending(code, expires_at) -> None:
         """收到 pair_pending：把 code + expires_at 推给主窗口显示"""
         # expires_at 可能是 ISO 字符串或数字时间戳，统一转 unix timestamp
-        from datetime import datetime
+        from datetime import datetime, timezone
         import time as _time
 
         exp_ts = None
@@ -185,8 +185,14 @@ async def _async_main(
                     exp_ts = float(expires_at)
                 else:
                     # ISO 字符串如 "2026-05-19T08:05:00.123456Z"
-                    s = str(expires_at).rstrip("Z")
-                    exp_ts = datetime.fromisoformat(s).timestamp()
+                    # server 发的是 UTC + 'Z'；'Z' 替换成 '+00:00' 让 fromisoformat
+                    # 返回 tz-aware datetime，再 .timestamp() 才是正确的 unix 时间戳
+                    s = str(expires_at).replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(s)
+                    if dt.tzinfo is None:
+                        # 兜底：server 没带 tz 时按 UTC 算（server 一直发 UTC）
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    exp_ts = dt.timestamp()
             except Exception:
                 # 兜底：当前时间 +5min
                 exp_ts = _time.time() + 300
