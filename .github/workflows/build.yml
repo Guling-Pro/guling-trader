@@ -34,7 +34,8 @@ jobs:
           $TessBundle = "tess-bundle"
 
           Write-Host "下载 Tesseract $TessVersion..."
-          Invoke-WebRequest -Uri $TessUrl -OutFile $TessExe
+          $headers = @{"User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+          Invoke-WebRequest -Uri $TessUrl -OutFile $TessExe -Headers $headers
 
           Write-Host "Silent install 到临时目录..."
           Start-Process -Wait -FilePath $TessExe -ArgumentList "/S", "/D=$pwd\$TessBundle"
