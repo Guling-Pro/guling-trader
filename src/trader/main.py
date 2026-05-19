@@ -127,6 +127,10 @@ def _make_installer_event_handler(state: SharedState):
     return on_event
 
 
+# 跨线程访问 ws_client 实例 + 它跑的 asyncio loop
+_ws_client_holder: dict = {"client": None, "loop": None}
+
+
 async def _async_main(
     bootstrap_result: bootstrap.BootstrapResult,
     state: SharedState,
@@ -206,6 +210,9 @@ async def _async_main(
         on_state_change=on_ws_state_change,
         on_pair_pending=on_pair_pending,
     )
+    # 暴露给主线程的「重新配对」按钮用——thread-safe 关 ws 触发重连
+    _ws_client_holder["client"] = client
+    _ws_client_holder["loop"] = asyncio.get_event_loop()
     try:
         await client.run()
     except asyncio.CancelledError:
@@ -326,12 +333,20 @@ def run() -> None:
 
     def on_reset_pair() -> None:
         try:
+            # 1. 清 config 中的 pairing 字段
             result.config.agent_token = None
             result.config.account_name = None
             result.config.paired_at = None
             trader_config.save(result.config)
             state.update(pairing_code=None, account_name="", connection_state="UNPAIRED")
-            state.log("已清除配对，请重启 trader 重新配对")
+            state.log("已清除配对，正在重连服务器申请新配对码...")
+
+            # 2. thread-safe 关当前 ws → ws_client.run 外层 loop 重连 → 因 config 已清
+            #    cfg.has_paired() 返 False → 走 pair_init → 新配对码到来
+            client = _ws_client_holder.get("client")
+            loop = _ws_client_holder.get("loop")
+            if client and loop and client.ws is not None:
+                asyncio.run_coroutine_threadsafe(client.ws.close(), loop)
         except Exception as e:
             state.log(f"⚠ 重置失败: {e}")
 

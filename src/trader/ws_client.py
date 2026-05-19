@@ -68,9 +68,9 @@ class WsClient:
 
     async def run(self) -> None:
         """主循环：连接 → 握手 → 消息处理 → 重连"""
-        cfg = config.load()
-
         while True:
+            # 每次重连都重新读 config——支持运行期清 config 触发 pair_init
+            cfg = config.load()
             try:
                 self._set_state(ConnectionState.DIALING)
                 logger.info("正在连接到 %s...", self.endpoint)
