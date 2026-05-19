@@ -1,12 +1,18 @@
-"""启动入口：bootstrap → tray + ws_client 协程"""
+"""启动入口：bootstrap → 自动安装 xiadan → tray + ws_client 协程"""
 import argparse
 import asyncio
 import logging
 import os
+import platform
 import sys
+from typing import Optional
 
 from . import bootstrap, ws_client, tray, ui_dialogs
+from .installer import auto_install
 from .ths.win import WinThsBackend
+
+if platform.system() == "Windows":
+    import psutil
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,16 +21,70 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _on_installer_event(event: auto_install.InstallerEvent) -> None:
+    """处理 installer 事件"""
+    logger.info("Installer event: kind=%s payload=%s", event.kind, event.payload)
+    # 这里可以用 tray_manager 更新状态，暂时只记日志
+
+
 async def _main_async(
     bootstrap_result: bootstrap.BootstrapResult,
     tray_manager: tray.TrayManager,
 ) -> None:
-    """异步主循环：WS 客户端连接"""
+    """异步主循环：xiadan ensure → ws_client 连接"""
+    # Step 1: 确保 xiadan 可用（检测 / 下载 / 安装）
+    xiadan_path = await bootstrap.ensure_xiadan_async(
+        on_event=_on_installer_event
+    )
+
+    if not xiadan_path:
+        logger.warning("无法获取 xiadan，继续启动（功能受限）")
+    else:
+        logger.info("✓ xiadan 已就绪：%s", xiadan_path)
+        bootstrap_result.found_xiadan_path = str(xiadan_path)
+
+    # Step 2: 检查升级
+    await bootstrap.maybe_upgrade_async(on_event=_on_installer_event)
+
+    # Step 3: 启动 xiadan 前检查冲突
+    if platform.system() == "Windows" and bootstrap_result.found_xiadan_path:
+        _check_xiadan_conflict()
+
+    # Step 4: WS 连接
     client = ws_client.WsClient(
         dev_url=os.environ.get("YU_TRADER_DEV_URL"),
         on_state_change=lambda state: tray_manager.set_state(state),
     )
     await client.run()
+
+
+def _check_xiadan_conflict() -> None:
+    """检查是否有手动启动的 xiadan 进程"""
+    if platform.system() != "Windows":
+        return
+
+    try:
+        for proc in psutil.process_iter(["name"]):
+            try:
+                name = proc.info.get("name", "").lower()
+                if name in {"xiadan.exe", "hexin.exe", "ths.exe"}:
+                    logger.warning(
+                        "检测到运行中的同花顺进程：%s，请先关闭再启动 trader",
+                        name,
+                    )
+                    import tkinter as tk
+                    root = tk.Tk()
+                    root.withdraw()
+                    ui_dialogs.messagebox.showwarning(
+                        "冲突检测",
+                        "检测到运行中的同花顺进程，请先关闭再启动 trader，以避免操作冲突。",
+                    )
+                    root.destroy()
+                    return
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception as e:
+        logger.warning("冲突检测出错：%s", e)
 
 
 async def _diagnose() -> None:

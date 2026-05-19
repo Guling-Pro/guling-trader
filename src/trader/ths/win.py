@@ -24,6 +24,7 @@ import logging
 import os
 import platform
 import re
+import sys
 import time
 from typing import Any, Optional
 
@@ -41,6 +42,15 @@ if platform.system() == "Windows":
 from .const import BALANCE_CONTROL_ID_GROUP, VK_CODE
 
 logger = logging.getLogger(__name__)
+
+# PyInstaller bundled Tesseract 路径绑定（仅 onefile 模式激活）
+if hasattr(sys, "_MEIPASS"):
+    _tess_exe = os.path.join(sys._MEIPASS, "tesseract", "tesseract.exe")
+    _tess_data_dir = os.path.join(sys._MEIPASS, "tesseract", "tessdata")
+    if os.path.exists(_tess_exe):
+        pytesseract.pytesseract.tesseract_cmd = _tess_exe
+        os.environ["TESSDATA_PREFIX"] = _tess_data_dir
+        logger.info("✓ Bundled Tesseract 已绑定：%s", _tess_exe)
 
 # Tunables — kept identical to upstream.
 sleep_time = 0.2

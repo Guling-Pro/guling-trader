@@ -1,13 +1,15 @@
-"""首次启动：生成 device_id、自动查找 xiadan.exe 和 tesseract"""
+"""首次启动：生成 device_id、自动查找 xiadan.exe 和 tesseract、installer 流程"""
+import asyncio
 import logging
 import platform
 import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from . import config
+from .installer import auto_install
 
 if platform.system() == "Windows":
     import win32api
@@ -122,3 +124,39 @@ def bootstrap() -> BootstrapResult:
         config=cfg,
         errors=errors,
     )
+
+
+async def ensure_xiadan_async(
+    on_event: Callable[[auto_install.InstallerEvent], None],
+) -> Optional[Path]:
+    """
+    异步 ensure_xiadan 流程：检测 / 下载 / 安装。
+    返回 xiadan.exe 路径，或 None 如果用户取消。
+    """
+    if platform.system() != "Windows":
+        logger.warning("ensure_xiadan 仅支持 Windows")
+        return None
+
+    try:
+        xiadan_path = await auto_install.ensure_xiadan(on_event=on_event)
+        return xiadan_path
+    except Exception as e:
+        logger.error("ensure_xiadan 出错：%s", e)
+        on_event(auto_install.InstallerEvent(
+            kind=auto_install.InstallerEventKind.ERROR,
+            payload={"error": str(e)},
+        ))
+        return None
+
+
+async def maybe_upgrade_async(
+    on_event: Callable[[auto_install.InstallerEvent], None],
+) -> None:
+    """异步升级检查"""
+    if platform.system() != "Windows":
+        return
+
+    try:
+        await auto_install.maybe_upgrade(on_event=on_event)
+    except Exception as e:
+        logger.error("升级检查出错：%s", e)

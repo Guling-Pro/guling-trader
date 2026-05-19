@@ -32,6 +32,7 @@ class TrayState(Enum):
     CONNECTED = "connected"
     DISCONNECTED = "disconnected"
     FATAL = "fatal"
+    INSTALLING = "installing"  # 正在安装同花顺
 
 
 def _create_icon_image(state: TrayState) -> "Image.Image":
@@ -43,6 +44,7 @@ def _create_icon_image(state: TrayState) -> "Image.Image":
         TrayState.CONNECTED: (0, 200, 0),
         TrayState.DISCONNECTED: (128, 128, 128),
         TrayState.FATAL: (255, 0, 0),
+        TrayState.INSTALLING: (255, 165, 0),  # 橙色，安装中
     }
     color = colors.get(state, (128, 128, 128))
 
@@ -58,6 +60,7 @@ class TrayConfig:
     on_show_pairing_code: Optional[Callable[[str, int], None]] = None
     on_exit: Optional[Callable[[], None]] = None
     on_show_status: Optional[Callable[[str, str, str], None]] = None
+    on_installer_event: Optional[Callable[[any], None]] = None  # installer 事件回调
 
 
 class TrayManager:
