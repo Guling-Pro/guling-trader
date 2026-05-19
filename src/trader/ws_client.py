@@ -46,6 +46,7 @@ class WsClient:
         self,
         dev_url: Optional[str] = None,
         on_state_change: Optional[Callable[[ConnectionState], None]] = None,
+        on_pair_pending: Optional[Callable[[str, Any], None]] = None,
         backend: Optional[WinThsBackend] = None,
     ):
         self.endpoint = dev_url or WS_ENDPOINT
@@ -54,6 +55,7 @@ class WsClient:
         self.pending_rpcs: dict[str, PendingRPC] = {}
         self.reconnect_delay = 1.0
         self.max_reconnect_delay = 60.0
+        self.on_pair_pending = on_pair_pending
         self.on_state_change = on_state_change
         self.backend = backend or WinThsBackend()
 
@@ -82,6 +84,8 @@ class WsClient:
                     self.reconnect_delay = 1.0
                     logger.info("已连接到服务器")
 
+                    # 记录握手前是否已配对——决定握手成功后的状态
+                    was_paired = cfg.has_paired()
                     result = await handshake.perform_handshake(ws, cfg)
 
                     if not result.success:
@@ -98,7 +102,18 @@ class WsClient:
                         await asyncio.sleep(30)
                         continue
 
-                    self._set_state(ConnectionState.CONNECTED)
+                    # pair_init 成功 → 收到 pair_pending，等 bind_ok 才 CONNECTED
+                    # resume 成功 → 收到 welcome，直接 CONNECTED
+                    if was_paired:
+                        self._set_state(ConnectionState.CONNECTED)
+                    else:
+                        self._set_state(ConnectionState.AWAITING_BIND)
+                        # 把 pair_pending 的 code/expires_at 推给上层（main_window）
+                        if result.pair_pending and self.on_pair_pending:
+                            self.on_pair_pending(
+                                result.pair_pending.get("code"),
+                                result.pair_pending.get("expires_at"),
+                            )
                     logger.info("握手成功，状态：%s", self.state)
 
                     await self._main_loop(ws)

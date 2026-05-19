@@ -23,6 +23,7 @@ class HandshakeResult:
     error: Optional[str] = None
     reason: Optional[str] = None
     should_clear_config: bool = False
+    pair_pending: Optional[dict[str, Any]] = None  # pair_init 成功时含 {code, expires_at}
 
 
 async def perform_handshake(
@@ -66,7 +67,13 @@ async def _pair_init(
         frame_type = response.get("type")
 
         if frame_type == "pair_pending":
-            return HandshakeResult(success=True)
+            return HandshakeResult(
+                success=True,
+                pair_pending={
+                    "code": response.get("code"),
+                    "expires_at": response.get("expires_at"),
+                },
+            )
 
         elif frame_type == "reject":
             reason = response.get("reason", "unknown")

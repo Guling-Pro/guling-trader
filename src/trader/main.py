@@ -172,10 +172,33 @@ async def _async_main(
             except Exception:
                 pass
 
+    def on_pair_pending(code, expires_at) -> None:
+        """收到 pair_pending：把 code + expires_at 推给主窗口显示"""
+        # expires_at 可能是 ISO 字符串或数字时间戳，统一转 unix timestamp
+        from datetime import datetime
+        import time as _time
+
+        exp_ts = None
+        if expires_at:
+            try:
+                if isinstance(expires_at, (int, float)):
+                    exp_ts = float(expires_at)
+                else:
+                    # ISO 字符串如 "2026-05-19T08:05:00.123456Z"
+                    s = str(expires_at).rstrip("Z")
+                    exp_ts = datetime.fromisoformat(s).timestamp()
+            except Exception:
+                # 兜底：当前时间 +5min
+                exp_ts = _time.time() + 300
+
+        state.update(pairing_code=code, pairing_expires_at=exp_ts)
+        state.log(f"✓ 收到配对码：{code}，5 分钟内有效")
+
     state.log("连接 guling.pro...")
     client = ws_client.WsClient(
         dev_url=os.environ.get("YU_TRADER_DEV_URL"),
         on_state_change=on_ws_state_change,
+        on_pair_pending=on_pair_pending,
     )
     try:
         await client.run()
