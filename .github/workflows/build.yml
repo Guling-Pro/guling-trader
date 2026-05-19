@@ -25,45 +25,17 @@ jobs:
           pip install -e .
           pip install pyinstaller
 
-      - name: Download Tesseract for bundling
-        shell: pwsh
-        run: |
-          $TessVersion = "5.4.0.20240606"
-          $TessUrl = "https://digi.bib.uni-mannheim.de/tesseract/tesseract-ocr-w64-setup-v$TessVersion.exe"
-          $TessExe = "tess-setup.exe"
-          $TessBundle = "tess-bundle"
-
-          Write-Host "下载 Tesseract $TessVersion..."
-          $headers = @{"User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-          Invoke-WebRequest -Uri $TessUrl -OutFile $TessExe -Headers $headers
-
-          Write-Host "Silent install 到临时目录..."
-          Start-Process -Wait -FilePath $TessExe -ArgumentList "/S", "/D=$pwd\$TessBundle"
-
-          Write-Host "验证 Tesseract 文件..."
-          if (!(Test-Path "$TessBundle\tesseract.exe")) {
-            throw "tesseract.exe 不存在于 $TessBundle"
-          }
-          if (!(Test-Path "$TessBundle\tessdata\chi_sim.traineddata")) {
-            throw "chi_sim.traineddata 不存在"
-          }
-          if (!(Test-Path "$TessBundle\tessdata\eng.traineddata")) {
-            throw "eng.traineddata 不存在"
-          }
-
-          Write-Host "✓ Tesseract bundle 准备完成"
-
       - name: Build single-file executable
         run: |
           pyinstaller --onefile --windowed `
                       --name guling-trader `
                       --paths src `
                       --collect-submodules trader `
-                      --add-binary "tess-bundle\tesseract.exe;tesseract" `
-                      --add-data "tess-bundle\tessdata\chi_sim.traineddata;tesseract/tessdata" `
-                      --add-data "tess-bundle\tessdata\eng.traineddata;tesseract/tessdata" `
                       run_trader.py
         shell: pwsh
+        # Note: Tesseract bundle deferred (UB-Mannheim 403's GitHub Actions IP).
+        # 用户需要在 bottle 里手动装 Tesseract for Windows（一次性），或等 v0.2.1
+        # 改成 chocolatey / 官方 GitHub release 源。
 
       - name: Verify executable size
         shell: pwsh
