@@ -91,11 +91,15 @@ class MainWindow:
         on_open_xiadan: Optional[Callable[[], None]] = None,
         on_reset_pair: Optional[Callable[[], None]] = None,
         on_exit: Optional[Callable[[], None]] = None,
+        on_redetect_xiadan: Optional[Callable[[], None]] = None,
+        on_set_xiadan_path: Optional[Callable[[str], None]] = None,
     ):
         self.state = state
         self.on_open_xiadan = on_open_xiadan
         self.on_reset_pair = on_reset_pair
         self.on_exit_cb = on_exit
+        self.on_redetect_xiadan = on_redetect_xiadan
+        self.on_set_xiadan_path = on_set_xiadan_path
 
         self.root = tk.Tk()
         self.root.title("guling-trader")
@@ -161,6 +165,20 @@ class MainWindow:
 
         self.xiadan_label = ttk.Label(ths_frame, text="未检测", foreground="#888")
         self.xiadan_label.pack(side="left")
+
+        # 三个按钮：仅在 xiadan 未检测到时显示
+        self.ths_btn_frame = ttk.Frame(ths_frame)
+        self.ths_btn_frame.pack(side="right")
+
+        ttk.Button(self.ths_btn_frame, text="重新检测", command=self._redetect_xiadan).pack(
+            side="right", padx=(4, 0)
+        )
+        ttk.Button(self.ths_btn_frame, text="指定路径...", command=self._pick_xiadan_path).pack(
+            side="right", padx=(4, 0)
+        )
+        ttk.Button(self.ths_btn_frame, text="下载同花顺", command=self._show_download_info).pack(
+            side="right", padx=(4, 0)
+        )
 
         # ---- 安装进度区（仅 INSTALLING 状态显示） ----
         self.install_frame = ttk.LabelFrame(self.root, text="安装进度", padding=(10, 6))
@@ -296,6 +314,50 @@ class MainWindow:
             self.on_reset_pair()
         else:
             self.state.log("⚠ 重新配对：未注册回调")
+
+    def _redetect_xiadan(self) -> None:
+        if self.on_redetect_xiadan:
+            self.on_redetect_xiadan()
+        else:
+            self.state.log("⚠ 重新检测：未注册回调")
+
+    def _pick_xiadan_path(self) -> None:
+        """打开文件对话框让用户选 xiadan.exe"""
+        from tkinter import filedialog
+
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="选择 xiadan.exe（同花顺独立委托客户端）",
+            filetypes=[("xiadan.exe", "xiadan.exe"), ("所有 exe", "*.exe"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        if self.on_set_xiadan_path:
+            self.on_set_xiadan_path(path)
+        else:
+            self.state.log(f"⚠ 路径设置回调未注册（选了 {path}）")
+
+    def _show_download_info(self) -> None:
+        """显示同花顺下载链接弹窗（wine 下 webbrowser 不可靠，改用文字 + 复制按钮）"""
+        from tkinter import Toplevel, messagebox
+
+        url = "https://download.10jqka.com.cn/free/ths/"
+        msg = (
+            "请按以下步骤手动安装同花顺：\n\n"
+            f"1. 浏览器打开：\n   {url}\n\n"
+            "2. 下载「PC 端同花顺」(214MB)\n\n"
+            "3. 双击 setup.exe 安装到 bottle\n   (CrossOver 会问选哪个 bottle — 选 guling-trader)\n\n"
+            "4. 启动同花顺，登录券商账户，**切换到「旧版」交易客户端**\n\n"
+            "5. 回到这里点「重新检测」或「指定路径...」"
+        )
+        # 弹窗里 URL 没法点击（tkinter 限制），但用户可复制
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        messagebox.showinfo(
+            "下载同花顺",
+            msg + f"\n\n（{url} 已复制到剪贴板）",
+            parent=self.root,
+        )
 
     def _on_close(self) -> None:
         """退出按钮 / 关闭按钮触发"""

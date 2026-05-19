@@ -59,42 +59,32 @@ async def resolve_latest_version() -> Optional[str]:
 
 async def ensure_xiadan(
     on_event: Callable[[InstallerEvent], None]
-) -> Path:
+) -> Optional[Path]:
     """
-    确保 xiadan.exe 可用的主函数。
-    优先级：
-    1. 私有目录已有 → 返回
-    2. 检测到已装版本 → 弹窗询问
-    3. 都没有 → 自动下载 + silent install
+    确保 xiadan.exe 可用——纯检测，不自动下载。
+
+    返回 None 时，调用方应该让用户：
+    - 点「下载同花顺」按钮 → 看 README 手动装
+    - 或点「指定路径...」→ 选 xiadan.exe 写到 config
+
+    历史：早期版本 (v0.2.0-v0.2.6) 这里走 ensure_private_install 自动下载 214MB
+    + silent install。实测 HTTP 403（CDN 屏蔽）+ 同花顺 EULA 不允许第三方分发，
+    UX 反而比"手动装"更糟糕。v0.3.0 起改为纯检测，自动安装代码保留在文件下方
+    但不再被调用——未来想换可靠源重启用时再串回来。
     """
-    logger.info("开始 ensure_xiadan 流程")
+    logger.info("开始 ensure_xiadan 流程（检测模式）")
 
-    private_xiadan = PRIVATE_INSTALL_DIR / "xiadan.exe"
-    if private_xiadan.exists():
-        logger.info("✓ 私有目录已有 xiadan：%s", private_xiadan)
-        return private_xiadan
-
-    # 检测已装版本
     detected = detect.find_xiadan()
     if detected:
-        logger.info("检测到已装 xiadan：%s", detected)
+        logger.info("✓ 检测到 xiadan：%s", detected)
         on_event(InstallerEvent(
             kind=InstallerEventKind.DETECTED_EXISTING,
             payload={"detected_path": str(detected)},
         ))
-        # 等待外部（UI）决定是否继续安装
-        # 这里仅返回已检测到的，由上层决策
         return detected
 
-    # 自动下载 + 安装
-    logger.info("未检测到任何 xiadan，开始自动下载 + 安装")
-    await ensure_private_install(on_event=on_event)
-
-    if private_xiadan.exists():
-        logger.info("✓ 私有安装完成：%s", private_xiadan)
-        return private_xiadan
-    else:
-        raise RuntimeError(f"安装完成但 xiadan.exe 不存在于 {PRIVATE_INSTALL_DIR}")
+    logger.info("未检测到 xiadan——等用户在 UI 点「下载同花顺」或「指定路径」")
+    return None
 
 
 async def ensure_private_install(

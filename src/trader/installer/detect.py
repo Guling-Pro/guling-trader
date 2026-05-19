@@ -199,13 +199,31 @@ def find_via_walking() -> Optional[Path]:
     return None
 
 
+def find_via_manual_path() -> Optional[Path]:
+    """用户在 config.xiadan_path_manual 显式指定的路径——优先级最高"""
+    try:
+        from .. import config as trader_config
+
+        cfg = trader_config.load()
+        manual = getattr(cfg, "xiadan_path_manual", None)
+        if manual:
+            p = Path(manual)
+            if p.exists() and p.is_file():
+                return p
+            logger.warning("config.xiadan_path_manual 指定路径不存在：%s", manual)
+    except Exception as e:
+        logger.debug("find_via_manual_path failed: %s", e)
+    return None
+
+
 def find_xiadan() -> Optional[Path]:
     """
-    四层 fallback 查找 xiadan.exe。
-    优先级：registry > process > shortcut > walking
+    五层 fallback 查找 xiadan.exe。
+    优先级：manual > registry > process > shortcut > walking
     """
     return (
-        find_via_registry()
+        find_via_manual_path()
+        or find_via_registry()
         or find_via_process()
         or find_via_shortcut()
         or find_via_walking()

@@ -322,14 +322,55 @@ def run() -> None:
     state.update(xiadan_path=result.found_xiadan_path)
 
     def on_open_xiadan() -> None:
-        if result.found_xiadan_path:
+        # 优先用 state 里的（可能已通过 redetect / set_path 更新），fallback bootstrap result
+        snap = state.snapshot()
+        xiadan = snap.get("xiadan_path") or result.found_xiadan_path
+        if xiadan:
             try:
-                subprocess.Popen([result.found_xiadan_path])
+                subprocess.Popen([xiadan])
                 state.log("已启动同花顺")
             except Exception as e:
                 state.log(f"⚠ 启动同花顺失败: {e}")
         else:
-            state.log("⚠ xiadan 路径未知，无法启动")
+            state.log("⚠ xiadan 路径未知。先点「指定路径...」选 xiadan.exe，或「下载同花顺」装一份")
+
+    def on_redetect_xiadan() -> None:
+        """重新检测 xiadan 路径"""
+        try:
+            from .installer import detect
+
+            found = detect.find_xiadan()
+            if found:
+                state.update(xiadan_path=str(found))
+                result.found_xiadan_path = str(found)
+                state.log(f"✓ 重新检测命中：{found}")
+            else:
+                state.update(xiadan_path=None)
+                state.log("⚠ 重新检测未找到 xiadan。点「下载同花顺」或「指定路径...」")
+        except Exception as e:
+            state.log(f"⚠ 检测异常: {e}")
+
+    def on_set_xiadan_path(path: str) -> None:
+        """用户手动指定 xiadan.exe 路径"""
+        try:
+            from pathlib import Path as _P
+
+            p = _P(path)
+            if not p.exists():
+                state.log(f"⚠ 指定路径不存在：{path}")
+                return
+            if not p.is_file():
+                state.log(f"⚠ 指定路径不是文件：{path}")
+                return
+            # 写入 config
+            result.config.xiadan_path_manual = str(p)
+            trader_config.save(result.config)
+            # 更新 state + bootstrap 缓存
+            state.update(xiadan_path=str(p))
+            result.found_xiadan_path = str(p)
+            state.log(f"✓ 已设置 xiadan 路径：{p}")
+        except Exception as e:
+            state.log(f"⚠ 设置路径失败: {e}")
 
     def on_reset_pair() -> None:
         try:
@@ -376,6 +417,8 @@ def run() -> None:
         on_open_xiadan=on_open_xiadan,
         on_reset_pair=on_reset_pair,
         on_exit=on_main_exit,
+        on_redetect_xiadan=on_redetect_xiadan,
+        on_set_xiadan_path=on_set_xiadan_path,
     )
     try:
         mw.run()
