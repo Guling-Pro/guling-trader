@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-WS_ENDPOINT = "wss://guling.pro/api/trader-tunnel"
+WS_ENDPOINT = "wss://api.guling.pro/api/trader-tunnel"
 WS_ENDPOINT_DEV = "ws://localhost:8000/api/trader-tunnel"
 
 
