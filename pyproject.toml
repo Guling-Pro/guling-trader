@@ -28,10 +28,13 @@ dependencies = [
     "pytesseract>=0.3.10",   # OCR 识别（委托结果解析）
     "numpy>=1.26",           # 数值计算（image processing）
     "python-dotenv>=1.0",    # 环境变量加载（配置管理）
+    "aiohttp>=3.9",          # 异步 HTTP 客户端（xiadan installer 下载）
+    "psutil>=5.9",           # 进程检测（xiadan 查找、冲突检测）
 ]
 
 [project.optional-dependencies]
 build = ["pyinstaller>=6.0"]  # Windows EXE 打包
+test = ["pytest>=7.0", "pytest-asyncio>=0.21", "pytest-mock>=3.10"]  # 测试框架
 
 [project.urls]
 Homepage = "https://github.com/suny911/guling-trader"
