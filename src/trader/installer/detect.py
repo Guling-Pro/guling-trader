@@ -101,7 +101,7 @@ def find_via_process() -> Optional[Path]:
 
 
 def find_via_shortcut() -> Optional[Path]:
-    """
+    r"""
     从快捷方式（.lnk）查找 xiadan。
     扫描 4 个 .lnk 目录：
     - APPDATA\Microsoft\Windows\Start Menu\Programs

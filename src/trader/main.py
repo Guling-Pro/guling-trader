@@ -73,9 +73,10 @@ def _check_xiadan_conflict() -> None:
                         name,
                     )
                     import tkinter as tk
+                    from tkinter import messagebox
                     root = tk.Tk()
                     root.withdraw()
-                    ui_dialogs.messagebox.showwarning(
+                    messagebox.showwarning(
                         "冲突检测",
                         "检测到运行中的同花顺进程，请先关闭再启动 trader，以避免操作冲突。",
                     )
