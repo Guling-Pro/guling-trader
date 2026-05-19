@@ -1,6 +1,6 @@
 [project]
 name = "guling-trader"
-version = "0.3.0"
+version = "0.3.1"
 description = "Windows 桌面客户端：通过 WS 隧道连接 guling.pro / yu-agent 并驱动同花顺独立委托客户端（xiadan.exe）执行 A 股交易"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,6 +30,7 @@ dependencies = [
     "python-dotenv>=1.0",    # 环境变量加载（配置管理）
     "aiohttp>=3.9",          # 异步 HTTP 客户端（xiadan installer 下载）
     "psutil>=5.9",           # 进程检测（xiadan 查找、冲突检测）
+    "certifi>=2024.0",       # CA 证书 bundle（PyInstaller --onefile 必备，否则 wss 证书验证 fail）
 ]
 
 [project.optional-dependencies]

@@ -2,11 +2,23 @@
 import asyncio
 import json
 import logging
+import ssl
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from websockets.asyncio.client import connect
+
+# PyInstaller --onefile 不会自动用 Windows 系统证书 store；Python ssl 模块默认查
+# certifi 包提供的 cacert.pem 来验 wss 证书。这里显式构造 SSL context 指向 certifi
+# 的 CA bundle，绕开 "unable to get local issuer certificate" 错误。
+try:
+    import certifi
+
+    _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    # certifi 没装时 fallback 到系统默认 — 在某些环境（含 macOS dev）够用
+    _SSL_CONTEXT = ssl.create_default_context()
 
 from . import config, dispatcher, handshake
 from .ths.win import WinThsBackend
@@ -79,6 +91,7 @@ class WsClient:
                     self.endpoint,
                     ping_interval=15,
                     ping_timeout=30,
+                    ssl=_SSL_CONTEXT if self.endpoint.startswith("wss://") else None,
                 ) as ws:  # type: ignore
                     self.ws = ws
                     self.reconnect_delay = 1.0

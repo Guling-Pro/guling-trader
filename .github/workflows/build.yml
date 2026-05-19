@@ -31,6 +31,7 @@ jobs:
                       --name guling-trader `
                       --paths src `
                       --collect-submodules trader `
+                      --collect-data certifi `
                       run_trader.py
         shell: pwsh
         # Note: Tesseract bundle deferred (UB-Mannheim 403's GitHub Actions IP).
