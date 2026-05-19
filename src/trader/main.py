@@ -1,18 +1,32 @@
-"""启动入口：bootstrap → 自动安装 xiadan → tray + ws_client 协程"""
+"""启动入口：主窗口（主线程 tk mainloop）+ asyncio 后台线程（bootstrap + ws_client）
+
+为什么主窗口是主线程 + asyncio 后台线程：
+- pystray tray icon 在 wine/CrossOver 下不渲染，所以 tray 不能作为唯一 UI 入口
+- tkinter mainloop 必须主线程跑（tk 限制）
+- asyncio loop 跑在后台 daemon thread，通过 SharedState 跟主线程交换数据
+- tray icon 仍然启动作为辅助（真 Windows 下用户喜欢托盘），但不阻塞 main UI 可见性
+"""
 import argparse
 import asyncio
 import logging
 import os
 import platform
+import subprocess
 import sys
+import threading
 from typing import Optional
 
-from . import bootstrap, ws_client, tray, ui_dialogs
+from . import bootstrap, config as trader_config, tray, ui_dialogs, ws_client
 from .installer import auto_install
-from .ths.win import WinThsBackend
+from .main_window import MainWindow, SharedState
 
 if platform.system() == "Windows":
-    import psutil
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+else:
+    psutil = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,192 +35,242 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _on_installer_event(event: auto_install.InstallerEvent) -> None:
-    """处理 installer 事件"""
-    logger.info("Installer event: kind=%s payload=%s", event.kind, event.payload)
-    # 这里可以用 tray_manager 更新状态，暂时只记日志
+def _make_installer_event_handler(state: SharedState):
+    """生成 installer event 回调，把事件写到 SharedState"""
+
+    def on_event(event: auto_install.InstallerEvent) -> None:
+        kind = event.kind
+        payload = event.payload or {}
+
+        if kind == "download_progress":
+            done = payload.get("bytes_done", 0)
+            total = payload.get("bytes_total", 0)
+            state.update(install_progress=(done, total))
+        elif kind == "install_started":
+            state.update(connection_state="INSTALLING")
+            state.log(f"开始安装同花顺：{payload.get('path', '?')}")
+        elif kind == "install_done":
+            state.update(install_progress=None)
+            state.log(f"✓ 同花顺安装完成：{payload.get('path', '?')}")
+        elif kind == "detected_existing":
+            state.log(f"检测到已有同花顺：{payload.get('path', '?')}")
+        elif kind == "error":
+            state.log(f"⚠ 安装错误：{payload.get('message', '?')}")
+        else:
+            state.log(f"installer event: {kind} {payload}")
+
+    return on_event
 
 
-async def _main_async(
+async def _async_main(
     bootstrap_result: bootstrap.BootstrapResult,
-    tray_manager: tray.TrayManager,
+    state: SharedState,
+    tray_manager: Optional[tray.TrayManager],
 ) -> None:
-    """异步主循环：xiadan ensure → ws_client 连接"""
-    # Step 1: 确保 xiadan 可用（检测 / 下载 / 安装）
-    xiadan_path = await bootstrap.ensure_xiadan_async(
-        on_event=_on_installer_event
-    )
+    """asyncio 后台主循环：xiadan ensure → ws_client 连接"""
+    on_event = _make_installer_event_handler(state)
 
-    if not xiadan_path:
-        logger.warning("无法获取 xiadan，继续启动（功能受限）")
-    else:
-        logger.info("✓ xiadan 已就绪：%s", xiadan_path)
-        bootstrap_result.found_xiadan_path = str(xiadan_path)
+    state.log("启动中...")
+    state.log(f"设备 ID: {bootstrap_result.config.device_id}")
 
-    # Step 2: 检查升级
-    await bootstrap.maybe_upgrade_async(on_event=_on_installer_event)
+    # Step 1: xiadan 检测 / 自动安装
+    try:
+        xiadan_path = await bootstrap.ensure_xiadan_async(on_event=on_event)
+        if xiadan_path:
+            state.update(xiadan_path=str(xiadan_path))
+            state.log(f"✓ xiadan 就绪: {xiadan_path}")
+            bootstrap_result.found_xiadan_path = str(xiadan_path)
+        else:
+            state.log("⚠ xiadan 未找到，交易功能受限")
+    except Exception as e:
+        state.log(f"⚠ xiadan 准备失败: {e}")
+        logger.exception("ensure_xiadan failed")
 
-    # Step 3: 启动 xiadan 前检查冲突
+    # Step 2: 升级检查
+    try:
+        await bootstrap.maybe_upgrade_async(on_event=on_event)
+    except Exception as e:
+        logger.warning("升级检查失败: %s", e)
+
+    # Step 3: 冲突检测
     if platform.system() == "Windows" and bootstrap_result.found_xiadan_path:
-        _check_xiadan_conflict()
+        _check_xiadan_conflict(state)
 
     # Step 4: WS 连接
+    def on_ws_state_change(s) -> None:
+        s_name = s.name if hasattr(s, "name") else str(s)
+        state.update(connection_state=s_name)
+        state.log(f"连接状态: {s_name}")
+        if tray_manager is not None:
+            try:
+                tray_manager.set_state(s)
+            except Exception:
+                pass
+
+    state.log("连接 guling.pro...")
     client = ws_client.WsClient(
         dev_url=os.environ.get("YU_TRADER_DEV_URL"),
-        on_state_change=lambda state: tray_manager.set_state(state),
+        on_state_change=on_ws_state_change,
     )
-    await client.run()
+    try:
+        await client.run()
+    except asyncio.CancelledError:
+        state.log("ws_client 已取消")
+    except Exception as e:
+        state.log(f"⚠ ws_client 异常: {e}")
+        logger.exception("ws_client.run failed")
 
 
-def _check_xiadan_conflict() -> None:
-    """检查是否有手动启动的 xiadan 进程"""
-    if platform.system() != "Windows":
+def _check_xiadan_conflict(state: SharedState) -> None:
+    """检查是否有手动启动的同花顺进程"""
+    if platform.system() != "Windows" or psutil is None:
         return
-
-    if not globals().get("psutil"):
-        logger.debug("psutil not available, skipping conflict check")
-        return
-
     try:
         for proc in psutil.process_iter(["name"]):
             try:
-                name = proc.info.get("name", "").lower()
+                name = (proc.info.get("name") or "").lower()
                 if name in {"xiadan.exe", "hexin.exe", "ths.exe"}:
-                    logger.warning(
-                        "检测到运行中的同花顺进程：%s，请先关闭再启动 trader",
-                        name,
-                    )
-                    import tkinter as tk
-                    from tkinter import messagebox
-                    root = tk.Tk()
-                    root.withdraw()
-                    messagebox.showwarning(
-                        "冲突检测",
-                        "检测到运行中的同花顺进程，请先关闭再启动 trader，以避免操作冲突。",
-                    )
-                    root.destroy()
+                    state.log(f"⚠ 检测到运行中的同花顺进程: {name}，建议先关闭")
                     return
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
                 continue
-    except Exception as e:
-        logger.warning("冲突检测出错：%s", e)
+    except Exception:
+        pass
+
+
+def _run_async_in_thread(coro_factory, state: SharedState) -> threading.Thread:
+    """asyncio loop 跑在后台 daemon thread"""
+
+    def thread_target() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(coro_factory())
+        except Exception as e:
+            state.log(f"⚠ 后台异常: {e}")
+            logger.exception("background async loop crashed")
+        finally:
+            loop.close()
+
+    t = threading.Thread(target=thread_target, daemon=True)
+    t.start()
+    return t
 
 
 async def _diagnose() -> None:
-    """诊断模式：验证环境是否可用"""
-    print("\n=== 诊断报告 ===\n")
+    """诊断模式：纯本地探测，无 WS 连接、无 GUI"""
+    print("=== guling-trader 诊断 ===\n")
 
     result = bootstrap.bootstrap()
-
-    print(f"设备 ID: {result.config.device_id}")
-    print()
+    print(f"设备 ID:    {result.config.device_id}")
+    print(f"已配对:     {result.config.has_paired()}")
 
     if result.errors:
-        print("⚠ 启动警告：")
+        print("\n警告:")
         for err in result.errors:
             print(f"  - {err}")
-        print()
 
+    print()
     if result.found_xiadan_path:
-        print(f"✓ xiadan.exe 找到：{result.found_xiadan_path}")
+        print(f"✓ xiadan:    {result.found_xiadan_path}")
     else:
-        print("✗ xiadan.exe 未找到（需要打开同花顺）")
+        print("✗ xiadan:    未找到")
 
     if result.found_tesseract_cmd is not None:
-        print(f"✓ Tesseract 找到：{result.found_tesseract_cmd or 'PATH'}")
+        print(f"✓ Tesseract: {result.found_tesseract_cmd or '(PATH)'}")
     else:
-        print("✗ Tesseract 未找到（可选，OCR 功能需要）")
+        print("✗ Tesseract: 未找到")
 
     print()
-    print("=== 测试只读操作 ===\n")
+    if platform.system() == "Windows":
+        try:
+            from .ths.win import WinThsBackend
 
-    backend = WinThsBackend()
-    backend.set_tesseract_cmd(result.found_tesseract_cmd or "")
+            backend = WinThsBackend()
+            print("尝试 balance()...")
+            balance = await backend.balance()
+            print(f"  → {balance}")
+        except Exception as e:
+            print(f"  ✗ balance() 失败: {e}")
+    else:
+        print("非 Windows 平台，跳过 Win32 后端测试")
 
-    try:
-        diagnose_result = await backend.diagnose()
-        for key, value in diagnose_result.items():
-            print(f"{key}: {value}")
-    except Exception as e:
-        print(f"✗ 诊断异常: {e}")
-
-    print()
-    print("=== 诊断完成 ===\n")
-    print("提示：wine 用户请参考 README.md 中的兼容性说明")
-    print()
+    print("\n=== 诊断完成 ===")
 
 
 def run() -> None:
-    """主启动函数"""
     parser = argparse.ArgumentParser(description="guling-trader — Windows 交易终端")
-    parser.add_argument("--diagnose", action="store_true", help="诊断模式：验证环境")
+    parser.add_argument("--diagnose", action="store_true", help="诊断模式")
     args = parser.parse_args()
 
     if args.diagnose:
         try:
             asyncio.run(_diagnose())
         except Exception as e:
-            logger.exception("诊断失败：%s", e)
+            logger.exception("诊断失败: %s", e)
             sys.exit(1)
         return
 
     try:
         result = bootstrap.bootstrap()
+    except Exception as e:
+        logger.exception("bootstrap 失败: %s", e)
+        sys.exit(1)
 
-        if result.errors:
-            logger.warning("启动警告：")
-            for err in result.errors:
-                logger.warning("  - %s", err)
+    state = SharedState()
+    state.update(xiadan_path=result.found_xiadan_path)
 
-        logger.info("设备 ID：%s", result.config.device_id)
-        logger.info("已配对：%s", result.config.has_paired())
-
+    def on_open_xiadan() -> None:
         if result.found_xiadan_path:
-            logger.info("已找到 xiadan：%s", result.found_xiadan_path)
+            try:
+                subprocess.Popen([result.found_xiadan_path])
+                state.log("已启动同花顺")
+            except Exception as e:
+                state.log(f"⚠ 启动同花顺失败: {e}")
         else:
-            logger.warning("未找到 xiadan.exe，交易功能将不可用")
+            state.log("⚠ xiadan 路径未知，无法启动")
 
-        if result.found_tesseract_cmd is not None:
-            logger.info("已找到 Tesseract：%s", result.found_tesseract_cmd or "PATH")
-        else:
-            logger.warning("未找到 Tesseract，OCR 功能将不可用")
+    def on_reset_pair() -> None:
+        try:
+            result.config.agent_token = None
+            result.config.account_name = None
+            result.config.paired_at = None
+            trader_config.save(result.config)
+            state.update(pairing_code=None, account_name="", connection_state="UNPAIRED")
+            state.log("已清除配对，请重启 trader 重新配对")
+        except Exception as e:
+            state.log(f"⚠ 重置失败: {e}")
 
-        def on_show_pairing_code(code: str, expires: int) -> None:
-            """显示配对码弹窗"""
-            import tkinter as tk
-            root = tk.Tk()
-            root.withdraw()
-            dialog = ui_dialogs.PairingCodeDialog(root, code, expires)
-            dialog.show()
-            root.mainloop()
+    def on_main_exit() -> None:
+        # asyncio thread 是 daemon，主线程退出它就会停
+        pass
 
-        def on_show_status(state: str, account: str, last_seen: str) -> None:
-            """显示状态窗"""
-            import tkinter as tk
-            root = tk.Tk()
-            root.withdraw()
-            status_win = ui_dialogs.StatusWindow(root)
-            status_win.show(state, account, last_seen)
-            root.mainloop()
-
-        def on_exit() -> None:
-            """退出应用"""
-            sys.exit(0)
-
+    # tray manager（辅助；wine 下可能不可见但不阻塞主流程）
+    tray_mgr: Optional[tray.TrayManager] = None
+    try:
         tray_config = tray.TrayConfig(
             xiadan_path=result.found_xiadan_path,
-            on_show_pairing_code=on_show_pairing_code,
-            on_exit=on_exit,
-            on_show_status=on_show_status,
+            on_exit=on_main_exit,
         )
         tray_mgr = tray.TrayManager(tray_config)
         tray_mgr.start()
-
-        asyncio.run(_main_async(result, tray_mgr))
-
-    except KeyboardInterrupt:
-        logger.info("已中断")
-        sys.exit(0)
     except Exception as e:
-        logger.exception("致命错误：%s", e)
-        sys.exit(1)
+        logger.warning("tray icon 未启动 (wine 下正常): %s", e)
+        state.log("tray icon 未启动（wine 限制，可忽略）")
+
+    # 后台 asyncio loop
+    _run_async_in_thread(lambda: _async_main(result, state, tray_mgr), state)
+
+    # 主线程：MainWindow.mainloop()
+    mw = MainWindow(
+        state=state,
+        on_open_xiadan=on_open_xiadan,
+        on_reset_pair=on_reset_pair,
+        on_exit=on_main_exit,
+    )
+    try:
+        mw.run()
+    except KeyboardInterrupt:
+        pass
+
+    sys.exit(0)
