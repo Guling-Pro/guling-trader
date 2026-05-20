@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>guling-trader 完整改版 v3 — 文案 & 细节校验版</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, 'Segoe UI', sans-serif;
+  background: #13131f; color: #e0e0e0;
+  padding: 28px 16px 56px; min-height: 100vh;
+}
+h1 { text-align: center; font-size: 19px; font-weight: 600; color: #fff; margin-bottom: 6px; }
+.subtitle { text-align: center; color: #555; font-size: 12px; margin-bottom: 10px; }
+.flow-label { text-align: center; color: #444; font-size: 11px; margin-bottom: 30px; }
+
+.stage-row {
+  display: flex; gap: 0; justify-content: center; align-items: flex-start;
+  overflow-x: auto; padding-bottom: 8px; margin-bottom: 32px;
+}
+.stage-unit { display: flex; align-items: flex-start; gap: 0; }
+.arrow { display: flex; align-items: flex-start; padding-top: 46px; color: #2a2a3e; font-size: 22px; padding-left: 6px; padding-right: 6px; flex-shrink: 0; }
+.stage-col { flex-shrink: 0; }
+.sbadge { text-align: center; font-size: 10px; color: #555; margin-bottom: 6px; }
+.stag { display: inline-block; padding: 2px 7px; border-radius: 10px; font-size: 9px; font-weight: 700; }
+.stag-gr { background: #88888820; color: #666; border: 1px solid #88888844; }
+.stag-y  { background: #ffc80018; color: #886600; border: 1px solid #ffc80055; }
+.stag-g  { background: #00c80018; color: #005500; border: 1px solid #00c80055; }
+
+/* Window */
+.window {
+  width: 285px; background: #f0f0f0;
+  border: 1px solid #999; border-radius: 6px 6px 4px 4px;
+  box-shadow: 0 5px 22px rgba(0,0,0,.55);
+  overflow: hidden; font-family: 'Segoe UI', Arial, sans-serif;
+  font-size: 11px; color: #111;
+}
+.win-bar {
+  background: linear-gradient(135deg, #2d6a9f, #1e4d7b);
+  color: #fff; padding: 5px 8px;
+  display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 500;
+}
+.win-title { flex: 1; }
+.wb { width: 22px; height: 17px; display: flex; align-items: center; justify-content: center; font-size: 9px; border-radius: 2px; }
+.wb.x { cursor: pointer; }
+.wb.x:hover { background: #e81123; color: #fff; }
+
+/* DIALING */
+.s-dial { display: flex; align-items: center; gap: 7px; padding: 7px 9px; background: #f5f5f5; border-bottom: 1px solid #e2e2e2; }
+.spin { width: 11px; height: 11px; border-radius: 50%; border: 2px solid #ddd; border-top-color: #0078d4; animation: spin .9s linear infinite; flex-shrink: 0; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.st-gr { font-size: 12px; font-weight: 700; color: #888; }
+
+/* AWAITING_BIND */
+.s-pair { background: linear-gradient(160deg, #fffbe6, #fff5c0); border-bottom: 2px solid #ffc800; padding: 7px 9px 8px; }
+.pair-top { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+.dot-y { width: 11px; height: 11px; border-radius: 50%; background: #ffc800; box-shadow: 0 0 4px #ffc80088; animation: blink 1.2s ease-in-out infinite; flex-shrink: 0; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.35} }
+.pair-st-lbl { font-size: 11px; font-weight: 700; color: #7a5800; flex: 1; }
+.pair-timer { font-size: 9px; color: #aa7800; }
+.pair-code { font-size: 31px; font-weight: 900; letter-spacing: 6px; text-align: center; padding: 2px 0 5px; line-height: 1; font-family: 'Consolas', monospace; color: #1a1a1a; }
+.pair-bottom { display: flex; align-items: center; gap: 6px; }
+.pair-hint { font-size: 9px; color: #7a5800; flex: 1; line-height: 1.4; }
+.btn-copy { padding: 3px 10px; background: #ffc800; border: 1px solid #cc9900; border-radius: 3px; font-size: 9px; font-weight: 700; color: #3a2800; cursor: pointer; flex-shrink: 0; }
+
+/* AWAITING_BIND expired → refreshing */
+.s-pair-refresh { background: linear-gradient(160deg, #f5f5f5, #efefef); border-bottom: 2px solid #0078d4; padding: 7px 9px 8px; }
+.pair-code-exp { font-size: 31px; font-weight: 900; letter-spacing: 6px; text-align: center; padding: 2px 0 3px; line-height: 1; font-family: 'Consolas', monospace; color: #bbb; text-decoration: line-through; }
+.pair-refresh { font-size: 10px; color: #0078d4; text-align: center; padding-bottom: 4px; animation: blink 1s ease-in-out infinite; }
+
+/* CONNECTED */
+.s-conn { background: #f0f0f0; border-bottom: 1px solid #e0e0e0; }
+.conn-row1 { display: flex; align-items: center; gap: 7px; padding: 7px 9px 2px; }
+.dot-g { width: 11px; height: 11px; border-radius: 50%; background: #00c800; box-shadow: 0 0 5px #00c80055; flex-shrink: 0; }
+.st-ok { font-size: 12px; font-weight: 700; flex: 1; }
+.srv-lbl { font-size: 9px; color: #0078d4; }
+.conn-row2 { display: flex; align-items: center; gap: 5px; padding: 0 9px 6px 27px; }
+.acct-nm { font-size: 10px; color: #555; flex: 1; }
+.btn-unbind { padding: 1px 6px; background: #fff0f0; border: 1px solid #dda0a0; border-radius: 3px; font-size: 9px; color: #c04040; cursor: pointer; white-space: nowrap; }
+
+/* THS wizard */
+.ths-card { margin: 0 7px 5px; border: 1px solid #c8c8c8; border-radius: 3px; background: #fff; overflow: hidden; }
+.ths-head { background: #e6e6e6; border-bottom: 1px solid #c8c8c8; padding: 3px 7px; font-size: 10px; color: #444; font-weight: 700; display: flex; align-items: center; gap: 5px; }
+.ths-scan { font-size: 9px; color: #0078d4; font-weight: 400; }
+.ths-body { padding: 5px 7px; }
+.steps { list-style: none; }
+.step { display: flex; align-items: center; gap: 5px; padding: 2px 0; font-size: 10px; }
+.si { width: 14px; height: 14px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 8px; flex-shrink: 0; font-weight: 700; }
+.si-done { background: #00c800; color: #fff; }
+.si-wait { background: #ffc800; color: #000; animation: blink 1.2s ease-in-out infinite; }
+.si-idle { background: #ccc; color: #888; }
+.si-ok   { background: #0078d4; color: #fff; }
+.st-act { color: #000; font-weight: 600; }
+.st-dim { color: #bbb; }
+.hint-line { font-size: 9px; color: #0078d4; margin: -1px 0 2px 19px; font-style: italic; }
+
+/* THS done collapsed */
+.ths-done { padding: 5px 7px; display: flex; align-items: center; gap: 5px; }
+.ths-path { font-size: 9px; color: #060; flex: 1; word-break: break-all; }
+.btn-xs { padding: 1px 5px; background: #e0e0e0; border: 1px solid #aaa; border-radius: 3px; font-size: 9px; cursor: pointer; }
+
+/* Log */
+.log-card { margin: 0 7px 5px; border: 1px solid #c8c8c8; border-radius: 3px; overflow: hidden; }
+.log-head { background: #e6e6e6; border-bottom: 1px solid #c8c8c8; padding: 3px 7px; font-size: 10px; color: #444; font-weight: 700; }
+.log-box { background: #111; color: #ccc; font-family: 'Consolas', monospace; font-size: 9px; padding: 4px 6px; overflow-y: auto; line-height: 1.6; }
+.ts { color: #484848; }
+.li { color: #bbb; }
+.lok { color: #7ddf7d; }
+.ls { color: #7ecfff; font-weight: 700; }
+.lh { color: #e8b86d; }
+.la { color: #7ecfff; }
+
+/* Bottom bar */
+.btn-bar { display: flex; gap: 4px; padding: 5px 7px 7px; background: #f0f0f0; border-top: 1px solid #ccc; }
+.bm { padding: 3px 9px; background: #e0e0e0; border: 1px solid #aaa; border-radius: 3px; font-size: 10px; cursor: pointer; }
+.br { margin-left: auto; }
+
+/* ── Notes panel ── */
+.notes-wrap { max-width: 920px; margin: 0 auto 36px; }
+.notes-title { text-align: center; font-size: 11px; color: #444; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 14px; }
+.notes-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media(max-width:700px){ .notes-grid { grid-template-columns: 1fr; } }
+.note-item { padding: 11px 13px; border-radius: 6px; font-size: 11px; line-height: 1.7; }
+.note-item.ok   { background: #0d1f0d; border: 1px solid #1a4a1a; }
+.note-item.new  { background: #0d0d1f; border: 1px solid #1a1a4a; }
+.note-item.fix  { background: #1f0d0d; border: 1px solid #4a1a1a; }
+.note-label { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 5px; }
+.note-item.ok   .note-label { color: #00a860; }
+.note-item.new  .note-label { color: #0078d4; }
+.note-item.fix  .note-label { color: #e04040; }
+.note-item .note-text { color: #bbb; }
+.code { font-family: 'Consolas', monospace; font-size: 9px; background: #1a1a2a; padding: 1px 4px; border-radius: 2px; color: #aaa; }
+
+/* approve */
+.approve-wrap { max-width: 920px; margin: 0 auto; text-align: center; }
+.approve-q { font-size: 14px; color: #ccc; margin-bottom: 18px; }
+.approve-btns { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.abtn { padding: 10px 26px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; transition: all .15s; }
+.a-ok  { background: #00c87a; color: #fff; } .a-ok:hover { background: #00a860; }
+.a-alt { background: #1e1e30; color: #ccc; border: 1px solid #444; } .a-alt:hover { background: #2a2a40; }
+</style>
+</head>
+<body>
+
+<h1>guling-trader · 完整改版 v3</h1>
+<p class="subtitle">文案已校验 · 技术细节已对齐代码 · 标注新增需求</p>
+<p class="flow-label">① 连接中 → ② 等待配对 → ③ 配对码到期·自动刷新 → ④ 已连接·THS引导 → ⑤ 全部就绪</p>
+
+<div class="stage-row">
+
+  <!-- ① DIALING -->
+  <div class="stage-unit">
+    <div class="stage-col">
+      <div class="sbadge"><span class="stag stag-gr">① 连接中</span></div>
+      <div class="window">
+        <div class="win-bar"><span>🌿</span><span class="win-title">guling-trader</span><div style="display:flex"><div class="wb">—</div><div class="wb">□</div><div class="wb x">✕</div></div></div>
+        <div class="s-dial">
+          <div class="spin"></div>
+          <span class="st-gr">连接中...</span>
+        </div>
+        <div class="ths-card">
+          <div class="ths-head">同花顺配置 <span class="ths-scan">2秒轮询中...</span></div>
+          <div class="ths-body">
+            <ul class="steps">
+              <li class="step"><div class="si si-wait">1</div><span class="st-act">同花顺行情</span></li>
+              <div class="hint-line">→ 请打开同花顺行情软件并登录</div>
+              <li class="step"><div class="si si-idle">2</div><span class="st-dim">委托窗口</span></li>
+              <li class="step"><div class="si si-idle">3</div><span class="st-dim">旧版界面</span></li>
+              <li class="step"><div class="si si-idle">4</div><span class="st-dim">xiadan 就绪</span></li>
+            </ul>
+          </div>
+        </div>
+        <div class="log-card">
+          <div class="log-head">日志</div>
+          <div class="log-box" style="height:60px">
+            <span class="ts">[08:30:01]</span> <span class="ls">─ 同花顺自检开始 ─</span><br>
+            <span class="ts">[08:30:01]</span> <span class="lh">步骤 1/4：请打开同花顺行情并登录</span><br>
+            <span class="ts">[08:30:01]</span> <span class="li">连接 guling.pro...</span>
+          </div>
+        </div>
+        <!-- 「打开同花顺」实际启动 hexin.exe -->
+        <div class="btn-bar"><button class="bm" title="启动 hexin.exe 主程序">打开同花顺</button><button class="bm br">退出</button></div>
+      </div>
+    </div>
+    <div class="arrow">→</div>
+  </div>
+
+  <!-- ② AWAITING_BIND -->
+  <div class="stage-unit">
+    <div class="stage-col">
+      <div class="sbadge"><span class="stag stag-y">② 等待配对</span></div>
+      <div class="window">
+        <div class="win-bar"><span>🌿</span><span class="win-title">guling-trader</span><div style="display:flex"><div class="wb">—</div><div class="wb">□</div><div class="wb x">✕</div></div></div>
+        <div class="s-pair">
+          <div class="pair-top">
+            <div class="dot-y"></div>
+            <span class="pair-st-lbl">等待配对</span>
+            <span class="pair-timer">4:32 后失效</span>
+          </div>
+          <div class="pair-code">653-473</div>
+          <div class="pair-bottom">
+            <!-- ✅ 文案已更正 -->
+            <span class="pair-hint">前往股灵pro聊天窗口<br>输入配对码完成绑定</span>
+            <button class="btn-copy">复制</button>
+          </div>
+        </div>
+        <div class="ths-card">
+          <div class="ths-head">同花顺配置 <span class="ths-scan">2秒轮询中...</span></div>
+          <div class="ths-body">
+            <ul class="steps">
+              <li class="step"><div class="si si-done">✓</div><span>同花顺行情</span></li>
+              <li class="step"><div class="si si-wait">2</div><span class="st-act">委托窗口</span></li>
+              <div class="hint-line">→ 点右上角「委托」按钮</div>
+              <li class="step"><div class="si si-idle">3</div><span class="st-dim">旧版界面</span></li>
+              <li class="step"><div class="si si-idle">4</div><span class="st-dim">xiadan 就绪</span></li>
+            </ul>
+          </div>
+        </div>
+        <div class="log-card">
+          <div class="log-head">日志</div>
+          <div class="log-box" style="height:60px">
+            <span class="ts">[08:31:12]</span> <span class="lok">✓ 步骤1：检测到 hexin.exe</span><br>
+            <span class="ts">[08:31:12]</span> <span class="lh">步骤 2/4：请点击右上角「委托」</span><br>
+            <span class="ts">[08:31:13]</span> <span class="lh">配对码 653-473 · 5分钟内有效</span>
+          </div>
+        </div>
+        <div class="btn-bar"><button class="bm">打开同花顺</button><button class="bm br">退出</button></div>
+      </div>
+    </div>
+    <div class="arrow">→</div>
+  </div>
+
+  <!-- ③ 配对码到期 → 自动刷新 -->
+  <div class="stage-unit">
+    <div class="stage-col">
+      <div class="sbadge"><span class="stag stag-y">③ 到期·自动刷新</span></div>
+      <div class="window">
+        <div class="win-bar"><span>🌿</span><span class="win-title">guling-trader</span><div style="display:flex"><div class="wb">—</div><div class="wb">□</div><div class="wb x">✕</div></div></div>
+        <div class="s-pair-refresh">
+          <div class="pair-top" style="margin-bottom:4px">
+            <div class="spin" style="border-top-color:#0078d4"></div>
+            <span class="pair-st-lbl" style="color:#0078d4">等待配对</span>
+            <span class="pair-timer" style="color:#e04040">已过期</span>
+          </div>
+          <div class="pair-code-exp">653-473</div>
+          <!-- 自动重连刷新，无需用户操作 -->
+          <div class="pair-refresh">正在获取新配对码...</div>
+          <div style="height:6px"></div>
+        </div>
+        <div class="ths-card">
+          <div class="ths-head">同花顺配置 <span class="ths-scan">2秒轮询中...</span></div>
+          <div class="ths-body">
+            <ul class="steps">
+              <li class="step"><div class="si si-done">✓</div><span>同花顺行情</span></li>
+              <li class="step"><div class="si si-wait">2</div><span class="st-act">委托窗口</span></li>
+              <div class="hint-line">→ 点右上角「委托」按钮</div>
+              <li class="step"><div class="si si-idle">3</div><span class="st-dim">旧版界面</span></li>
+              <li class="step"><div class="si si-idle">4</div><span class="st-dim">xiadan 就绪</span></li>
+            </ul>
+          </div>
+        </div>
+        <div class="log-card">
+          <div class="log-head">日志</div>
+          <div class="log-box" style="height:60px">
+            <span class="ts">[08:36:13]</span> <span class="li">配对码 653-473 已过期，重连中...</span><br>
+            <span class="ts">[08:36:14]</span> <span class="lh">新配对码 721-849 · 5分钟内有效</span>
+          </div>
+        </div>
+        <div class="btn-bar"><button class="bm">打开同花顺</button><button class="bm br">退出</button></div>
+      </div>
+    </div>
+    <div class="arrow">→</div>
+  </div>
+
+  <!-- ④ CONNECTED + THS step 3 -->
+  <div class="stage-unit">
+    <div class="stage-col">
+      <div class="sbadge"><span class="stag stag-g">④ 已连接·THS引导</span></div>
+      <div class="window">
+        <div class="win-bar"><span>🌿</span><span class="win-title">guling-trader</span><div style="display:flex"><div class="wb">—</div><div class="wb">□</div><div class="wb x">✕</div></div></div>
+        <div class="s-conn">
+          <div class="conn-row1">
+            <div class="dot-g"></div>
+            <span class="st-ok">已连接</span>
+            <span class="srv-lbl">guling.pro</span>
+          </div>
+          <div class="conn-row2">
+            <!-- 账户名来自 bind_ok 帧的 account_name 字段 -->
+            <span class="acct-nm">孙洋_招商银行</span>
+            <button class="btn-unbind">解除绑定</button>
+          </div>
+        </div>
+        <div class="ths-card">
+          <div class="ths-head">同花顺配置 <span class="ths-scan">2秒轮询中...</span></div>
+          <div class="ths-body">
+            <ul class="steps">
+              <li class="step"><div class="si si-done">✓</div><span>同花顺行情</span></li>
+              <li class="step"><div class="si si-done">✓</div><span>委托窗口</span></li>
+              <li class="step"><div class="si si-wait">3</div><span class="st-act">旧版界面</span></li>
+              <!-- 窗口标题："网上股票交易系统5.0" via Win32 EnumWindows -->
+              <div class="hint-line">→ 点委托窗口内「切换旧版」</div>
+              <li class="step"><div class="si si-idle">4</div><span class="st-dim">xiadan 就绪</span></li>
+            </ul>
+          </div>
+        </div>
+        <div class="log-card">
+          <div class="log-head">日志</div>
+          <div class="log-box" style="height:60px">
+            <span class="ts">[08:32:44]</span> <span class="lok">✓ 步骤2：检测到 xiadan.exe</span><br>
+            <span class="ts">[08:32:44]</span> <span class="lh">步骤 3/4：请切换「旧版」界面</span><br>
+            <span class="ts">[08:32:45]</span> <span class="lok">已连接 guling.pro · 孙洋_招商银行</span>
+          </div>
+        </div>
+        <div class="btn-bar"><button class="bm">打开同花顺</button><button class="bm br">退出</button></div>
+      </div>
+    </div>
+    <div class="arrow">→</div>
+  </div>
+
+  <!-- ⑤ 全部就绪 -->
+  <div class="stage-unit">
+    <div class="stage-col">
+      <div class="sbadge"><span class="stag stag-g">⑤ 全部就绪</span></div>
+      <div class="window">
+        <div class="win-bar"><span>🌿</span><span class="win-title">guling-trader</span><div style="display:flex"><div class="wb">—</div><div class="wb">□</div><div class="wb x">✕</div></div></div>
+        <div class="s-conn">
+          <div class="conn-row1">
+            <div class="dot-g"></div>
+            <span class="st-ok">已连接</span>
+            <span class="srv-lbl">guling.pro</span>
+          </div>
+          <div class="conn-row2">
+            <span class="acct-nm">孙洋_招商银行</span>
+            <button class="btn-unbind">解除绑定</button>
+          </div>
+        </div>
+        <!-- THS 折叠成一行，轮询仍在跑（监听断连） -->
+        <div class="ths-card">
+          <div class="ths-head">同花顺 ✓</div>
+          <div class="ths-done">
+            <span style="color:#080;font-size:9px">✓</span>
+            <span class="ths-path">C:\同花顺软件\同花顺\xiadan.exe</span>
+            <button class="btn-xs">更换</button>
+          </div>
+        </div>
+        <div class="log-card">
+          <div class="log-head">日志</div>
+          <div class="log-box" style="height:60px">
+            <span class="ts">[08:33:07]</span> <span class="lok">✓ 自检完成 · xiadan 就绪</span><br>
+            <span class="ts">[08:42:03]</span> <span class="la">[Agent] balance → 可用 85,234.50</span><br>
+            <span class="ts">[08:43:11]</span> <span class="la">[Agent] buy 600519×100@123.45 → 委托号 001</span>
+          </div>
+        </div>
+        <div class="btn-bar"><button class="bm">打开同花顺</button><button class="bm br">退出</button></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Technical notes ── -->
+<div class="notes-wrap">
+  <div class="notes-title">技术可行性 & 新增需求标注</div>
+  <div class="notes-grid">
+
+    <div class="note-item ok">
+      <div class="note-label">✓ 已有代码支持（可直接用）</div>
+      <div class="note-text">
+        • 步骤1 hexin.exe：<span class="code">detect.find_via_process()</span> psutil 扫描<br>
+        • 步骤2 xiadan.exe：同上，扫 <span class="code">xiadan.exe</span> 进程<br>
+        • 步骤3 旧版窗口：<span class="code">bootstrap._detect_xiadan_window("网上股票交易系统5.0")</span> Win32 EnumWindows<br>
+        • 步骤4 读路径：<span class="code">psutil.Process.exe()</span> 或 GetModuleFileNameEx
+      </div>
+    </div>
+
+    <div class="note-item new">
+      <div class="note-label">＋ 需要新增代码</div>
+      <div class="note-text">
+        • 4步持续轮询 loop（当前一次性，需 asyncio 2秒周期任务）<br>
+        • 配对码到期自动刷新（检测 expires_at，ws.close() → 重连 → 新 pair_init）<br>
+        • THS 区展开/折叠状态联动 SharedState<br>
+        • THS 断连监听（就绪后 xiadan 进程消失 → 重新展开引导）
+      </div>
+    </div>
+
+    <div class="note-item fix">
+      <div class="note-label">✗ 当前代码逻辑需修正</div>
+      <div class="note-text">
+        • 「打开同花顺」按钮当前启动 <span class="code">xiadan.exe</span>，应改为启动 <span class="code">hexin.exe</span>（从 xiadan 路径推断同目录）<br>
+        • 配对码文案：「在股灵 APP 输入」→「前往股灵pro聊天窗口输入配对码完成绑定」
+      </div>
+    </div>
+
+    <div class="note-item ok">
+      <div class="note-label">✓ 账户名来源确认</div>
+      <div class="note-text">
+        • <span class="code">bind_ok</span> 帧的 <span class="code">account_name</span> 字段 → 存入 <span class="code">cfg.account_name</span><br>
+        • 就是股灵账户标识（非券商账户），显示原样即可，不需要额外标注"股灵账户:"
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- approve -->
+<div class="approve-wrap">
+  <p class="approve-q">v3 版本文案和细节是否 OK？可以进入实现阶段了吗？</p>
+  <div class="approve-btns">
+    <button class="abtn a-ok"  onclick="toggleSelect(this)" data-choice="approve">✓ 全部 OK，开始实现</button>
+    <button class="abtn a-alt" onclick="toggleSelect(this)" data-choice="tweak">还需要调整...</button>
+  </div>
+</div>
+
+</body>
+</html>

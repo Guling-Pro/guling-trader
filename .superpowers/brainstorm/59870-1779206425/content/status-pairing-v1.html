@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>状态区 + 配对码 改版</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, 'Segoe UI', sans-serif;
+  background: #13131f; color: #e0e0e0;
+  padding: 28px 20px 48px; min-height: 100vh;
+}
+h1 { text-align: center; font-size: 19px; font-weight: 600; color: #fff; margin-bottom: 6px; }
+.subtitle { text-align: center; color: #666; font-size: 12px; margin-bottom: 36px; }
+
+/* layout */
+.row { display: flex; gap: 28px; justify-content: center; flex-wrap: wrap; margin-bottom: 36px; align-items: flex-start; }
+.col { }
+.col-label { text-align: center; font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+
+/* Window chrome */
+.window {
+  width: 340px; background: #f0f0f0;
+  border: 1px solid #999; border-radius: 6px 6px 4px 4px;
+  box-shadow: 0 6px 28px rgba(0,0,0,.55);
+  overflow: hidden; font-family: 'Segoe UI', Arial, sans-serif;
+  font-size: 12px; color: #111;
+}
+.win-bar {
+  background: linear-gradient(135deg, #2d6a9f, #1e4d7b);
+  color: #fff; padding: 6px 10px;
+  display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 500;
+}
+.win-title { flex: 1; }
+.wb { width: 26px; height: 20px; display: flex; align-items: center; justify-content: center; font-size: 10px; border-radius: 2px; cursor: pointer; }
+.wb:hover { background: rgba(255,255,255,.2); }
+.wb.x:hover { background: #e81123; }
+
+/* ── OLD status row ── */
+.status-old {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px 8px; background: #f0f0f0;
+  border-bottom: 1px solid #ddd;
+}
+.dot { width: 13px; height: 13px; border-radius: 50%; flex-shrink: 0; }
+.d-g  { background: #00c800; box-shadow: 0 0 5px #00c80055; }
+.d-y  { background: #ffc800; box-shadow: 0 0 5px #ffc80055; }
+.d-gr { background: #888; }
+.stext-old { font-size: 13px; font-weight: 700; flex: 1; }
+.acct-old { font-size: 10px; color: #666; }
+
+/* pair section old */
+.pair-sec-old {
+  margin: 0 10px 7px;
+  border: 1px solid #c8c8c8; border-radius: 3px; background: #fff;
+}
+.pair-head { background: #e6e6e6; border-bottom: 1px solid #c8c8c8; padding: 3px 8px; font-size: 11px; color: #444; font-weight: 600; }
+.pair-body-old { padding: 8px 10px; display: flex; align-items: center; gap: 10px; }
+.pair-code-old { font-size: 22px; font-weight: 700; letter-spacing: 2px; color: #111; }
+.pair-timer-old { font-size: 11px; color: #888; flex: 1; }
+.btn-sm { padding: 3px 10px; background: #e0e0e0; border: 1px solid #aaa; border-radius: 3px; font-size: 11px; cursor: pointer; }
+
+/* ── NEW status area: CONNECTED ── */
+.status-new-connected {
+  display: flex; align-items: center; gap: 9px;
+  padding: 10px 12px 9px; background: #f0f0f0;
+  border-bottom: 1px solid #ddd;
+}
+.status-dot-wrap { position: relative; width: 14px; height: 14px; flex-shrink: 0; }
+.dot-ring {
+  width: 14px; height: 14px; border-radius: 50%;
+}
+.stext-cn { font-size: 13px; font-weight: 700; flex: 1; }
+.acct-cn { font-size: 10px; color: #666; }
+
+/* ── NEW status area: AWAITING_BIND ── */
+.status-new-pairing {
+  background: linear-gradient(135deg, #fffbe6, #fff8d0);
+  border-bottom: 2px solid #ffc800;
+  padding: 10px 12px 10px;
+}
+.pair-top-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.pair-dot-y { width: 12px; height: 12px; border-radius: 50%; background: #ffc800; box-shadow: 0 0 6px #ffc80088; animation: blink 1.2s ease-in-out infinite; flex-shrink: 0; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.4} }
+.pair-status-label { font-size: 12px; font-weight: 700; color: #7a5800; flex: 1; }
+.pair-timer-top { font-size: 10px; color: #b07800; }
+
+.pair-code-big {
+  font-size: 34px; font-weight: 900;
+  letter-spacing: 6px; color: #1a1a1a;
+  text-align: center; padding: 4px 0 6px;
+  font-family: 'Consolas', 'Courier New', monospace;
+  text-shadow: 0 1px 3px rgba(0,0,0,.15);
+  line-height: 1;
+}
+.pair-bottom-row { display: flex; align-items: center; gap: 8px; }
+.pair-hint { font-size: 10px; color: #9a6a00; flex: 1; }
+.btn-copy {
+  padding: 4px 14px; background: #ffc800; border: 1px solid #cc9900;
+  border-radius: 4px; font-size: 11px; font-weight: 600; color: #3a2800; cursor: pointer;
+}
+.btn-copy:hover { background: #e6b200; }
+
+/* ── NEW status area: DIALING ── */
+.status-new-dialing {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px 9px; background: #f5f5f5;
+  border-bottom: 1px solid #ddd;
+}
+.dot-spin-wrap { width: 14px; height: 14px; flex-shrink: 0; }
+.dot-spin {
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid #ddd; border-top-color: #0078d4;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.stext-dialing { font-size: 13px; font-weight: 700; flex: 1; color: #555; }
+
+/* sections */
+.section { margin: 0 9px 7px; border: 1px solid #c8c8c8; border-radius: 3px; background: #fff; overflow: hidden; }
+.sec-head { background: #e6e6e6; border-bottom: 1px solid #c8c8c8; padding: 3px 8px; font-size: 11px; color: #444; font-weight: 700; }
+.sec-body { padding: 8px 9px; }
+.ths-row { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.ths-path { color: #080; flex: 1; word-break: break-all; }
+.btn-row { display: flex; gap: 4px; margin-top: 5px; }
+
+.log-box {
+  background: #111; color: #ccc;
+  font-family: 'Consolas', monospace; font-size: 10px;
+  padding: 5px 7px; height: 90px; overflow-y: auto; line-height: 1.6; border: none;
+}
+.ts { color: #555; } .inf { color: #bbb; } .ag { color: #7ecfff; } .ok { color: #7ddf7d; } .stp { color: #7ecfff; font-weight: 700; } .hint { color: #e8b86d; }
+
+.btn-bar { display: flex; gap: 5px; padding: 7px 9px 9px; background: #f0f0f0; border-top: 1px solid #ccc; }
+.bmain { padding: 3px 11px; background: #e0e0e0; border: 1px solid #aaa; border-radius: 3px; font-size: 11px; cursor: pointer; }
+.bright { margin-left: auto; }
+
+/* state map */
+.map-wrap { max-width: 820px; margin: 0 auto 36px; background: #0e0e1e; border: 1px solid #252535; border-radius: 8px; padding: 20px 24px; }
+.map-title { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 14px; text-align: center; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; color: #666; font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; padding: 0 12px 8px; border-bottom: 1px solid #222; }
+td { padding: 7px 12px; border-bottom: 1px solid #1a1a2a; color: #ccc; vertical-align: middle; }
+tr:last-child td { border-bottom: none; }
+.state-en { font-family: 'Consolas', monospace; font-size: 11px; color: #888; }
+.state-cn { font-weight: 700; color: #fff; font-size: 13px; }
+.dot-table { width: 12px; height: 12px; border-radius: 50%; display: inline-block; vertical-align: middle; margin-right: 6px; }
+.badge-change { display: inline-block; background: #0078d4; color: #fff; font-size: 9px; padding: 1px 5px; border-radius: 3px; font-weight: 700; margin-left: 6px; vertical-align: middle; }
+
+/* approve */
+.approve-wrap { max-width: 820px; margin: 0 auto; text-align: center; }
+.approve-q { font-size: 14px; color: #ccc; margin-bottom: 18px; }
+.approve-btns { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.abtn { padding: 10px 26px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; transition: all .15s; }
+.a-ok { background: #00c87a; color: #fff; }
+.a-ok:hover { background: #00a860; }
+.a-alt { background: #1e1e30; color: #ccc; border: 1px solid #444; }
+.a-alt:hover { background: #2a2a40; }
+</style>
+</head>
+<body>
+
+<h1>状态区 + 配对码 改版预览</h1>
+<p class="subtitle">配对码提升到状态区 · 放大突出 · 连接状态全部中文</p>
+
+<!-- ── State: AWAITING_BIND 对比 ── -->
+<div class="row">
+
+  <!-- OLD -->
+  <div class="col">
+    <div class="col-label">改版前 — AWAITING_BIND</div>
+    <div class="window">
+      <div class="win-bar"><span>🌿</span><span class="win-title">guling-trader</span><div style="display:flex"><div class="wb">—</div><div class="wb">□</div><div class="wb x">✕</div></div></div>
+      <div class="status-old">
+        <div class="dot d-y"></div>
+        <span class="stext-old">状态：AWAITING_BIND</span>
+        <span class="acct-old">账户：（空）</span>
+      </div>
+      <div class="pair-sec-old">
+        <div class="pair-head">配对码</div>
+        <div class="pair-body-old">
+          <span class="pair-code-old">653-473</span>
+          <span class="pair-timer-old">4:32 后失效</span>
+          <button class="btn-sm">复制</button>
+        </div>
+      </div>
+      <div class="section">
+        <div class="sec-head">日志</div>
+        <div class="log-box">
+          <span class="ts">[08:30:24]</span> <span class="inf">连接状态: AWAITING_BIND</span><br>
+          <span class="ts">[08:30:24]</span> <span class="inf">✓ 收到配对码：653-473</span>
+        </div>
+      </div>
+      <div class="btn-bar">
+        <button class="bmain">打开同花顺</button>
+        <button class="bmain">重新配对</button>
+        <button class="bmain bright">退出</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- NEW -->
+  <div class="col">
+    <div class="col-label">改版后 — 等待配对（同一状态）</div>
+    <div class="window">
+      <div class="win-bar"><span>🌿</span><span class="win-title">guling-trader</span><div style="display:flex"><div class="wb">—</div><div class="wb">□</div><div class="wb x">✕</div></div></div>
+
+      <!-- 配对码提升到状态区，黄色背景突出 -->
+      <div class="status-new-pairing">
+        <div class="pair-top-row">
+          <div class="pair-dot-y"></div>
+          <span class="pair-status-label">等待配对</span>
+          <span class="pair-timer-top">4:32 后失效</span>
+        </div>
+        <div class="pair-code-big">653-473</div>
+        <div class="pair-bottom-row">
+          <span class="pair-hint">在股灵 APP 输入此配对码完成绑定</span>
+          <button class="btn-copy">复制</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="sec-head">日志</div>
+        <div class="log-box">
+          <span class="ts">[08:30:24]</span> <span class="stp">等待配对</span><br>
+          <span class="ts">[08:30:24]</span> <span class="hint">配对码 653-473 已就绪，5 分钟内有效</span>
+        </div>
+      </div>
+      <div class="btn-bar">
+        <button class="bmain">打开同花顺</button>
+        <button class="bmain">重新配对</button>
+        <button class="bmain bright">退出</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── State: CONNECTED 对比 ── -->
+<div class="row">
+
+  <!-- OLD CONNECTED -->
+  <div class="col">
+    <div class="col-label">改版前 — CONNECTED</div>
+    <div class="window">
+      <div class="win-bar"><span>🌿</span><span class="win-title">guling-trader</span><div style="display:flex"><div class="wb">—</div><div class="wb">□</div><div class="wb x">✕</div></div></div>
+      <div class="status-old">
+        <div class="dot d-g"></div>
+        <span class="stext-old">状态：CONNECTED</span>
+        <span class="acct-old">账户：孙洋_招商银行</span>
+      </div>
+      <div class="section">
+        <div class="sec-head">日志</div>
+        <div class="log-box">
+          <span class="ts">[08:35:17]</span> <span class="inf">连接状态: CONNECTED</span><br>
+          <span class="ts">[08:42:03]</span> <span class="ag">[Agent] balance → 可用 85,234.50</span><br>
+          <span class="ts">[08:43:11]</span> <span class="ag">[Agent] buy 600519×100@123.45 → 委托号 001</span>
+        </div>
+      </div>
+      <div class="btn-bar">
+        <button class="bmain">打开同花顺</button>
+        <button class="bmain">重新配对</button>
+        <button class="bmain bright">退出</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- NEW CONNECTED -->
+  <div class="col">
+    <div class="col-label">改版后 — 已连接</div>
+    <div class="window">
+      <div class="win-bar"><span>🌿</span><span class="win-title">guling-trader</span><div style="display:flex"><div class="wb">—</div><div class="wb">□</div><div class="wb x">✕</div></div></div>
+      <div class="status-new-connected">
+        <div class="dot d-g"></div>
+        <span class="stext-cn">已连接</span>
+        <span class="acct-cn">孙洋_招商银行</span>
+      </div>
+      <div class="section">
+        <div class="sec-head">日志</div>
+        <div class="log-box">
+          <span class="ts">[08:35:17]</span> <span class="ok">已连接</span><br>
+          <span class="ts">[08:42:03]</span> <span class="ag">[Agent] balance → 可用 85,234.50</span><br>
+          <span class="ts">[08:43:11]</span> <span class="ag">[Agent] buy 600519×100@123.45 → 委托号 001</span>
+        </div>
+      </div>
+      <div class="btn-bar">
+        <button class="bmain">打开同花顺</button>
+        <button class="bmain">重新配对</button>
+        <button class="bmain bright">退出</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── State: DIALING ── -->
+<div class="row">
+  <div class="col">
+    <div class="col-label">改版后 — 连接中</div>
+    <div class="window">
+      <div class="win-bar"><span>🌿</span><span class="win-title">guling-trader</span><div style="display:flex"><div class="wb">—</div><div class="wb">□</div><div class="wb x">✕</div></div></div>
+      <div class="status-new-dialing">
+        <div class="dot-spin-wrap"><div class="dot-spin"></div></div>
+        <span class="stext-dialing">连接中...</span>
+      </div>
+      <div class="section">
+        <div class="sec-head">日志</div>
+        <div class="log-box">
+          <span class="ts">[08:30:01]</span> <span class="inf">连接 guling.pro...</span>
+        </div>
+      </div>
+      <div class="btn-bar">
+        <button class="bmain">打开同花顺</button>
+        <button class="bmain">重新配对</button>
+        <button class="bmain bright">退出</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── State mapping table ── -->
+<div class="map-wrap">
+  <div class="map-title">状态文字映射表</div>
+  <table>
+    <tr>
+      <th>英文原始状态</th>
+      <th>中文显示</th>
+      <th>状态色 + 图标</th>
+      <th>备注</th>
+    </tr>
+    <tr>
+      <td class="state-en">UNPAIRED</td>
+      <td class="state-cn">未配对</td>
+      <td><span class="dot-table" style="background:#888"></span>灰色圆点</td>
+      <td style="font-size:11px;color:#777">首次使用，尚未绑定账户</td>
+    </tr>
+    <tr>
+      <td class="state-en">DIALING</td>
+      <td class="state-cn">连接中...</td>
+      <td><span style="display:inline-block;width:12px;height:12px;border-radius:50%;border:2px solid #0078d4;border-top-color:transparent;vertical-align:middle;margin-right:6px;animation:spin .9s linear infinite"></span>蓝色旋转</td>
+      <td style="font-size:11px;color:#777">正在建立 WS 连接</td>
+    </tr>
+    <tr>
+      <td class="state-en">AWAITING_BIND</td>
+      <td class="state-cn">等待配对</td>
+      <td><span class="dot-table" style="background:#ffc800"></span>黄色闪烁 + 配对码大字</td>
+      <td style="font-size:11px;color:#777">配对码提升到状态区 <span class="badge-change">新</span></td>
+    </tr>
+    <tr>
+      <td class="state-en">CONNECTED</td>
+      <td class="state-cn">已连接</td>
+      <td><span class="dot-table" style="background:#00c800"></span>绿色圆点</td>
+      <td style="font-size:11px;color:#777">正常工作状态</td>
+    </tr>
+    <tr>
+      <td class="state-en">DISCONNECTED</td>
+      <td class="state-cn">连接断开</td>
+      <td><span class="dot-table" style="background:#888"></span>灰色圆点</td>
+      <td style="font-size:11px;color:#777">正在重连，自动恢复</td>
+    </tr>
+    <tr>
+      <td class="state-en">FATAL</td>
+      <td class="state-cn">连接失败</td>
+      <td><span class="dot-table" style="background:#e00000"></span>红色圆点</td>
+      <td style="font-size:11px;color:#777">需要用户介入</td>
+    </tr>
+    <tr>
+      <td class="state-en">INSTALLING</td>
+      <td class="state-cn">安装中...</td>
+      <td><span class="dot-table" style="background:#ff9500"></span>橙色圆点</td>
+      <td style="font-size:11px;color:#777">正在自动安装同花顺</td>
+    </tr>
+  </table>
+</div>
+
+<!-- approve -->
+<div class="approve-wrap">
+  <p class="approve-q">配对码的突出方式 + 中文状态是否符合预期？</p>
+  <div class="approve-btns">
+    <button class="abtn a-ok"  onclick="toggleSelect(this)" data-choice="approve">✓ 符合，按此实现</button>
+    <button class="abtn a-alt" onclick="toggleSelect(this)" data-choice="code-larger">配对码还要再大一点</button>
+    <button class="abtn a-alt" onclick="toggleSelect(this)" data-choice="no-yellow-bg">不要黄色背景，用其他方式突出</button>
+    <button class="abtn a-alt" onclick="toggleSelect(this)" data-choice="revise">其他调整...</button>
+  </div>
+</div>
+
+</body>
+</html>
