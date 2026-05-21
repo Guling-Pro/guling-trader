@@ -520,8 +520,11 @@ class WinThsBackend:
         return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
     # --- 交割单（低频，一次性拉一年做分析）----------------------------------
-    def _select_tree_node_by_text(self, target: str) -> bool:
+    def _select_tree_node_by_text(self, target: str, fallback_token: str = "") -> bool:
         """按文字在左侧树（SysTreeView32）找到节点 → 程序化选中 + 真实鼠标点击。
+
+        fallback_token：整串匹配不中时的兜底"独特字"。如交割单传「割」（菜单里仅
+        交割单含「割」；不能用「交」——会撞上 当日成交/历史成交）。
 
         - 读节点文字走 TreeView 跨进程消息（TVM_GETITEM）；定位用文字，缩放无关。
         - **ctypes 指针必须设 restype/argtypes**，否则 64 位地址被截断成 32 位 →
@@ -564,7 +567,9 @@ class WinThsBackend:
                 return s.replace(" ", "").replace("　", "")
 
             target_norm = _norm(target)
+            fallback_norm = _norm(fallback_token)
             visited: list[str] = []
+            fallback_node = 0
 
             def read_text(hitem: int) -> str:
                 item = _TVITEMW()
@@ -580,11 +585,16 @@ class WinThsBackend:
                 return buf.raw.decode("utf-16-le", "ignore").split("\x00", 1)[0]
 
             def walk(hitem: int):
+                nonlocal fallback_node
                 while hitem:
                     txt = read_text(hitem)
                     visited.append(txt)
-                    if target_norm in _norm(txt):
+                    n = _norm(txt)
+                    if target_norm in n:
                         return hitem
+                    # 记住第一个含兜底字的节点（整串没命中时用）
+                    if fallback_norm and fallback_norm in n and not fallback_node:
+                        fallback_node = hitem
                     child = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_CHILD, hitem)
                     if child:
                         found = walk(child)
@@ -594,6 +604,9 @@ class WinThsBackend:
                 return 0
 
             node = walk(win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_ROOT, 0))
+            if not node and fallback_node:
+                logger.info("settlement: 整串未中，用兜底字 %r 命中节点", fallback_token)
+                node = fallback_node
             if not node:
                 try:
                     tree_cls = win32gui.GetClassName(tree)
@@ -687,7 +700,7 @@ class WinThsBackend:
             hot_key(["F4"])  # 打开查询
             time.sleep(sleep_time)
 
-            selected = self._select_tree_node_by_text("交割单")
+            selected = self._select_tree_node_by_text("交割单", fallback_token="割")
             time.sleep(refresh_sleep_time)
             # 时段：尽量点「近一年」；自绘控件取不到文字时跳过（用面板当前默认时段）
             ranged = self._click_button_by_text(date_range)
