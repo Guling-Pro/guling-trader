@@ -39,6 +39,9 @@ class FakeBackend:
     async def orders_filled(self):
         return await self._run("orders_filled")
 
+    async def settlement(self, date_range="近一年"):
+        return await self._run("settlement", date_range)
+
     async def buy(self, stock_no, amount, price, client_order_id):
         return await self._run("buy", stock_no, amount, price)
 
@@ -125,6 +128,24 @@ def test_backend_exception_is_caught():
     assert reply["ok"] is False
     assert "窗口未找到" in reply["error"]
     assert reply["id"] == "id7"
+
+
+def test_settlement_routes_and_forwards_date_range():
+    """交割单：dispatcher 路由到 backend.settlement 并透传 date_range。"""
+    frame = {"type": "call", "id": "s1", "method": "settlement",
+             "params": {"date_range": "近一年"}}
+    reply, backend = _call(frame, {"code": 0, "status": "succeed", "data": [], "count": 0})
+    assert reply["ok"] is True
+    name, args = backend.calls[-1]
+    assert name == "settlement"
+    assert args == ("近一年",)
+
+
+def test_settlement_default_date_range():
+    """不传 date_range 时默认近一年。"""
+    frame = {"type": "call", "id": "s2", "method": "settlement", "params": {}}
+    _, backend = _call(frame, {"code": 0, "data": []})
+    assert backend.calls[-1] == ("settlement", ("近一年",))
 
 
 def test_buy_params_forwarded_to_backend():

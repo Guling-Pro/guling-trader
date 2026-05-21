@@ -7,7 +7,7 @@ from .ths.win import WinThsBackend
 
 logger = logging.getLogger(__name__)
 
-METHOD_WHITELIST = {"balance", "position", "orders_active", "orders_filled", "buy", "sell", "cancel"}
+METHOD_WHITELIST = {"balance", "position", "orders_active", "orders_filled", "settlement", "buy", "sell", "cancel"}
 
 
 async def handle_call(
@@ -37,6 +37,8 @@ async def handle_call(
             result = await backend.orders_active()
         elif method == "orders_filled":
             result = await backend.orders_filled()
+        elif method == "settlement":
+            result = await backend.settlement(params.get("date_range", "近一年"))
         elif method == "buy":
             stock_no = params.get("stock_no")
             amount = params.get("amount")

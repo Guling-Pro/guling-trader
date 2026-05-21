@@ -254,6 +254,36 @@ def parse_table(text):
     return result
 
 
+# --- TreeView (SysTreeView32) 跨进程消息常量 ----------------------------------
+# 用消息按"文字"定位/选中左侧查询树节点（如「交割单」），而非按像素点击 ——
+# 与窗口缩放 / DPI / 行高无关。
+_TV_FIRST = 0x1100
+TVM_GETNEXTITEM = _TV_FIRST + 10
+TVM_GETITEMW = _TV_FIRST + 62
+TVM_SELECTITEM = _TV_FIRST + 11
+TVGN_ROOT = 0x0000
+TVGN_NEXT = 0x0001
+TVGN_CHILD = 0x0004
+TVGN_CARET = 0x0009
+TVIF_TEXT = 0x0001
+
+
+if platform.system() == "Windows":
+    class _TVITEMW(ctypes.Structure):
+        _fields_ = [
+            ("mask", ctypes.c_uint),
+            ("hItem", ctypes.c_ssize_t),       # HTREEITEM（指针大小）
+            ("state", ctypes.c_uint),
+            ("stateMask", ctypes.c_uint),
+            ("pszText", ctypes.c_void_p),
+            ("cchTextMax", ctypes.c_int),
+            ("iImage", ctypes.c_int),
+            ("iSelectedImage", ctypes.c_int),
+            ("cChildren", ctypes.c_int),
+            ("lParam", ctypes.c_ssize_t),
+        ]
+
+
 class WinThsBackend:
     def __init__(self):
         self.hwnd_main = None
@@ -486,6 +516,145 @@ class WinThsBackend:
         if data:
             return {"code": 0, "status": "succeed", "data": parse_table(data)}
         return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
+
+    # --- 交割单（低频，一次性拉一年做分析）----------------------------------
+    def _select_tree_node_by_text(self, target: str) -> bool:
+        """按文字在左侧查询树（SysTreeView32）里找到节点并选中。
+
+        全程走 TreeView 消息（TVM_GETITEM 读文字 / TVM_SELECTITEM 选中），不依赖
+        像素坐标 —— 窗口缩放 / DPI 不影响。跨进程读节点文字需在目标进程分配内存。
+        """
+        tree = self.get_tree_hwnd()
+        if not tree:
+            logger.warning("settlement: tree hwnd not found")
+            return False
+        _, pid = win32process.GetWindowThreadProcessId(tree)
+        PROCESS_VM = 0x0008 | 0x0010 | 0x0020  # OPERATION | READ | WRITE
+        MEM = 0x1000 | 0x2000  # COMMIT | RESERVE
+        PAGE_RW = 0x04
+        MEM_RELEASE = 0x8000
+        k32 = ctypes.windll.kernel32
+        h_proc = win32api.OpenProcess(PROCESS_VM, False, pid)
+        bufsize = 512
+        remote_text = k32.VirtualAllocEx(int(h_proc), 0, bufsize, MEM, PAGE_RW)
+        remote_item = k32.VirtualAllocEx(int(h_proc), 0, ctypes.sizeof(_TVITEMW), MEM, PAGE_RW)
+        try:
+            if not remote_text or not remote_item:
+                logger.warning("settlement: VirtualAllocEx failed")
+                return False
+
+            def read_text(hitem: int) -> str:
+                item = _TVITEMW()
+                item.mask = TVIF_TEXT
+                item.hItem = hitem
+                item.pszText = remote_text
+                item.cchTextMax = bufsize // 2
+                k32.WriteProcessMemory(int(h_proc), remote_item,
+                                       ctypes.byref(item), ctypes.sizeof(item), None)
+                win32gui.SendMessage(tree, TVM_GETITEMW, 0, remote_item)
+                buf = (ctypes.c_char * bufsize)()
+                k32.ReadProcessMemory(int(h_proc), remote_text, buf, bufsize, None)
+                return buf.raw.decode("utf-16-le", "ignore").split("\x00", 1)[0]
+
+            def walk(hitem: int):
+                # 迭代 + 显式栈，避免深树递归
+                while hitem:
+                    txt = read_text(hitem)
+                    if target in txt:
+                        return hitem
+                    child = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_CHILD, hitem)
+                    if child:
+                        found = walk(child)
+                        if found:
+                            return found
+                    hitem = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_NEXT, hitem)
+                return 0
+
+            root = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_ROOT, 0)
+            node = walk(root)
+            if not node:
+                logger.warning("settlement: tree node %r not found", target)
+                return False
+            win32gui.SendMessage(tree, TVM_SELECTITEM, TVGN_CARET, node)
+            logger.info("settlement: selected tree node %r", target)
+            return True
+        finally:
+            if remote_text:
+                k32.VirtualFreeEx(int(h_proc), remote_text, 0, MEM_RELEASE)
+            if remote_item:
+                k32.VirtualFreeEx(int(h_proc), remote_item, 0, MEM_RELEASE)
+            win32api.CloseHandle(h_proc)
+
+    def _click_button_by_text(self, text: str) -> bool:
+        """按 class=Button + 文字 在主窗口后代里找按钮句柄并 BM_CLICK（消息，非坐标）。"""
+        found: list[int] = []
+
+        def walker(h, _):
+            try:
+                if win32gui.GetClassName(h) == "Button" and text in (win32gui.GetWindowText(h) or ""):
+                    found.append(h)
+                    return False
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumChildWindows(self.hwnd_main, walker, None)
+        except Exception as e:
+            logger.warning("settlement: EnumChildWindows failed: %s", e)
+        if not found:
+            logger.warning("settlement: button %r not found (可能是自绘控件)", text)
+            return False
+        win32api.PostMessage(found[0], win32con.BM_CLICK, 0, 0)
+        logger.info("settlement: clicked button %r", text)
+        return True
+
+    def _do_settlement(self, date_range: str = "近一年"):
+        """读取交割单（默认近一年）。低频功能，一次性尽量多拿。
+
+        步骤全部走控件/消息定位（除共享的 switch_to_normal）：
+        F4 打开查询 → TVM 选中「交割单」树节点 → 按文字点时段按钮 → 读 0x417 表格。
+        """
+        try:
+            self.switch_to_normal()
+            _activate_window(self.hwnd_main)
+            hot_key(["F4"])  # 打开查询
+            time.sleep(sleep_time)
+
+            selected = self._select_tree_node_by_text("交割单")
+            time.sleep(refresh_sleep_time)
+            # 时段：尽量点「近一年」；自绘控件取不到文字时跳过（用面板当前默认时段）
+            ranged = self._click_button_by_text(date_range)
+            time.sleep(refresh_sleep_time)
+            self.refresh()
+
+            hwnd = self.get_right_hwnd()
+            ctrl = win32gui.GetDlgItem(hwnd, 0x417)
+            if not ctrl:
+                return {"code": 1, "status": "failed",
+                        "msg": "交割单表格控件(0x417)未找到，可能未切到交割单面板"}
+            self.copy_table(ctrl)
+            data = None
+            for _ in range(retry_time + 3):
+                time.sleep(sleep_time)
+                data = get_clipboard_data()
+                if data:
+                    break
+            if not data:
+                return {"code": 1, "status": "failed",
+                        "msg": "交割单读取为空（树节点选中=%s 时段点击=%s）" % (selected, ranged)}
+            rows = parse_table(data)
+            return {
+                "code": 0,
+                "status": "succeed",
+                "date_range": date_range,
+                "range_applied": ranged,   # False = 用了面板默认时段，需人工确认范围
+                "count": len(rows),
+                "data": rows,
+            }
+        except Exception as e:
+            logger.exception("settlement failed")
+            return {"code": 1, "status": "failed", "msg": f"交割单读取异常: {e}"}
 
     def _lookup_entrust_no(self, stock_no, op_keyword, amount, price, timeout=8.0):
         """After buy/sell submission, find the freshly-placed order in
@@ -1053,6 +1222,12 @@ class WinThsBackend:
         if bound_err:
             return bound_err
         return await asyncio.to_thread(self.get_filled_orders)
+
+    async def settlement(self, date_range: str = "近一年") -> dict[str, Any]:
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
+        return await asyncio.to_thread(self._do_settlement, date_range)
 
     async def buy(
         self,
