@@ -91,7 +91,9 @@ async def ensure_tesseract(
         "--silent",
         "--accept-package-agreements",
         "--accept-source-agreements",
+        "--disable-interactivity",
     ]
+    rc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -99,18 +101,25 @@ async def ensure_tesseract(
             stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await proc.communicate()
+        rc = proc.returncode
         out = (stdout or b"").decode("utf-8", errors="ignore")
-        logger.info("winget 退出码=%s\n%s", proc.returncode, out[-1500:])
+        logger.info("winget 退出码=%s\n%s", rc, out[-1500:])
     except Exception as e:
         logger.exception("winget 安装 Tesseract 失败")
         log(f"⚠ Tesseract 自动安装失败：{e}")
         return None
 
-    # 以重新检测为准（不看退出码）。
-    found = detect_tesseract()
-    if found is not None:
-        log("✓ Tesseract OCR 安装完成")
-        return found
+    # 重试检测：winget 可能装到固定目录但 PATH 还没刷新，或安装收尾稍慢。
+    for _ in range(5):
+        found = detect_tesseract()
+        if found is not None:
+            log("✓ Tesseract OCR 安装完成")
+            return found
+        await asyncio.sleep(1.5)
 
-    log("⚠ Tesseract 安装后仍未检测到，可能需要重启 trader 或手动安装")
+    # 仍没有：多半是 winget 静默安装需要管理员权限（UB-Mannheim 是 per-machine 装），
+    # 无提权时静默失败。明确引导手动安装。
+    log(f"⚠ Tesseract 自动安装未成功（winget rc={rc}）。请用【管理员】PowerShell 运行："
+        f"winget install -e --id {WINGET_PACKAGE_ID}  装好后重启 trader。"
+        "（在此之前下单验证码需手动输入）")
     return None

@@ -167,43 +167,37 @@ async def _ths_polling_task(state: SharedState) -> None:
             if snap["connection_state"] in ("DISCONNECTED", "FATAL"):
                 continue
 
-            # Step 1: hexin
-            step1 = _check_hexin_running()
-            if not step1:
-                if snap["ths_steps_complete"] != 0:
-                    state.update(ths_steps_complete=0, ths_expanded=True)
-                continue
-
-            # Step 2: xiadan
-            xiadan_path = _check_xiadan_running()
-            if not xiadan_path:
-                if snap["ths_steps_complete"] != 1:
-                    state.update(ths_steps_complete=1, ths_expanded=True)
-                continue
-
-            # Step 3: 旧版窗口
+            # 真正需要的是 xiadan「网上股票交易系统5.0」窗口——交易/查询全靠它。
+            # hexin（行情软件）并非必需：用户独立打开 xiadan 也能交易。所以优先检测
+            # 窗口，窗口在就判就绪，不再卡在 hexin 那步（新机上独立开 xiadan 时 hexin
+            # 可能没跑 → 之前向导永远停在 Step 1）。
             if platform.system() == "Windows":
                 win_result = bootstrap._detect_xiadan_window("网上股票交易系统5.0")
             else:
                 win_result = None
-            if not win_result:
-                if snap["ths_steps_complete"] != 2:
-                    state.update(ths_steps_complete=2, ths_expanded=True)
+            if win_result:
+                if not snap.get("xiadan_path"):
+                    xp = _check_xiadan_running()
+                    if xp:
+                        state.update(xiadan_path=xp)
+                        state.log(f"✓ 检测到 xiadan：{xp}")
+                if snap["ths_steps_complete"] < 4:
+                    state.update(ths_steps_complete=4, ths_expanded=False)
+                    state.log("✓ 自检完成 · xiadan 就绪")
                 continue
 
-            # Step 4: 路径有效
-            if snap["ths_steps_complete"] < 3:
-                state.update(ths_steps_complete=3, ths_expanded=True)
-            # 更新 xiadan_path 如果还没有
-            if not snap.get("xiadan_path"):
-                state.update(xiadan_path=xiadan_path)
-                state.log(f"✓ 检测到 xiadan：{xiadan_path}")
-
-            if snap["ths_steps_complete"] < 4:
-                state.update(ths_steps_complete=4, ths_expanded=False)
-                state.log("✓ 自检完成 · xiadan 就绪")
-
-            # 已折叠后继续轮询监听进程断连（loop 继续）
+            # 窗口还没出来 → 按 hexin → xiadan 进程 → 窗口 给引导步骤
+            if not _check_hexin_running():
+                if snap["ths_steps_complete"] != 0:
+                    state.update(ths_steps_complete=0, ths_expanded=True)
+                continue
+            if not _check_xiadan_running():
+                if snap["ths_steps_complete"] != 1:
+                    state.update(ths_steps_complete=1, ths_expanded=True)
+                continue
+            # 进程在、窗口还没出来
+            if snap["ths_steps_complete"] != 2:
+                state.update(ths_steps_complete=2, ths_expanded=True)
 
         except asyncio.CancelledError:
             break
