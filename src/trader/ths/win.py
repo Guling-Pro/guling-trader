@@ -679,20 +679,52 @@ class WinThsBackend:
                 k32.VirtualFreeEx(int(h_proc), remote_item, 0, MEM_RELEASE)
             win32api.CloseHandle(h_proc)
 
-    def _click_button_by_text(self, text: str) -> bool:
-        """在主窗口后代里找含 `text` 的控件并点击（时段 tab）。
+    def _real_click_hwnd(self, h: int) -> None:
+        """对控件做一次真实鼠标点击（取窗口中心 → SetCursorPos → 按下抬起）。
 
-        诊断增强：枚举所有含该文字的控件并打印 hwnd/类名/真实文字（之前只打"请求的
-        文字"，无法确认到底点中了什么、时段 tab 是不是标准 Button、BM_CLICK 有没有生效）。
-        优先 Button 类用 BM_CLICK；命中其它类也尝试点（仍 BM_CLICK，多半无害）。
+        在 Per-Monitor-V2 DPI 上下文里取坐标，HiDPI 下也准。比 BM_CLICK 更接近用户
+        操作，对自绘 tab / 需要真实点击才切换的控件更稳。
         """
-        matches: list[tuple[int, str, str]] = []
+        u32 = ctypes.windll.user32
+        DPI_PMv2 = ctypes.c_void_p(-4)
+        old = None
+        if hasattr(u32, "SetThreadDpiAwarenessContext"):
+            try:
+                old = u32.SetThreadDpiAwarenessContext(DPI_PMv2)
+            except Exception:
+                old = None
+        try:
+            l, t, r, b = win32gui.GetWindowRect(h)
+            cx, cy = (l + r) // 2, (t + b) // 2
+            win32api.SetCursorPos((cx, cy))
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        finally:
+            if old is not None:
+                try:
+                    u32.SetThreadDpiAwarenessContext(old)
+                except Exception:
+                    pass
+        time.sleep(sleep_time)
+
+    def _click_button_by_text(self, text: str) -> bool:
+        """找含 `text` 的时段按钮并真实点击。
+
+        实测：交割单/资金股票/历史成交 等多个查询子面板各有一套时段按钮，含同名
+        「近三月」的 Button 有 5 个，其中只有交割单面板那个是可见+可用的。必须只点
+        **可见且可用**的那个，否则点的是隐藏副本、时段不切（停在默认近一周）。
+        """
+        cands: list[tuple[int, str, str, bool, bool]] = []
 
         def walker(h, _):
             try:
                 wt = win32gui.GetWindowText(h) or ""
                 if text in wt:
-                    matches.append((h, win32gui.GetClassName(h), wt))
+                    cands.append((
+                        h, win32gui.GetClassName(h), wt,
+                        bool(win32gui.IsWindowVisible(h)),
+                        bool(win32gui.IsWindowEnabled(h)),
+                    ))
             except Exception:
                 pass
             return True
@@ -701,16 +733,20 @@ class WinThsBackend:
             win32gui.EnumChildWindows(self.hwnd_main, walker, None)
         except Exception as e:
             logger.warning("settlement: EnumChildWindows failed: %s", e)
-        if not matches:
-            logger.warning("settlement: 时段 %r 未找到任何含该文字的控件（可能是自绘 tab）", text)
+        logger.info("settlement: 时段 %r 候选=%r",
+                    text, [(c, t, v, e) for _, c, t, v, e in cands])
+        if not cands:
+            logger.warning("settlement: 时段 %r 未找到", text)
             return False
-        btns = [m for m in matches if m[1] == "Button"]
-        h, cls, wt = (btns or matches)[0]
-        win32api.PostMessage(h, win32con.BM_CLICK, 0, 0)
-        logger.info(
-            "settlement: 点击时段 hwnd=%s cls=%s text=%r；全部候选=%r",
-            hex(h), cls, wt, [(c, t) for _, c, t in matches],
-        )
+        # 只点可见+可用的（避开隐藏副本）；优先 Button 类
+        usable = [m for m in cands if m[3] and m[4]]
+        pick = [m for m in usable if m[1] == "Button"] or usable
+        if not pick:
+            logger.warning("settlement: 时段 %r 有候选但无可见可用项", text)
+            return False
+        h = pick[0][0]
+        self._real_click_hwnd(h)
+        logger.info("settlement: 真实点击时段 hwnd=%s text=%r", hex(h), pick[0][2])
         return True
 
     # 交割单是「查询(F4)」展开后 资金股票 往下数第 8 个子节点：
