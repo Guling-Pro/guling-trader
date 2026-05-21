@@ -124,12 +124,27 @@ def find_window_by_title_prefix(prefix: str) -> int:
 
 
 def get_clipboard_data():
-    win32clipboard.OpenClipboard()
+    """读剪贴板文本。永不抛异常——失败返回 None，让调用方的重试循环继续。
+
+    OpenClipboard 在别的进程占用剪贴板时会抛（拷贝表格 + 拷贝数据验证码弹窗期间
+    尤其常见）；GetClipboardData 在 CF_UNICODETEXT 格式还没就绪时也会抛。这些都不
+    该让整个读取崩掉（之前交割单近三月就是崩在这里）。
+    """
     try:
-        data = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+        win32clipboard.OpenClipboard()
+    except Exception:
+        return None
+    try:
+        if not win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
+            return None
+        return win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+    except Exception:
+        return None
     finally:
-        win32clipboard.CloseClipboard()
-    return data
+        try:
+            win32clipboard.CloseClipboard()
+        except Exception:
+            pass
 
 
 def hot_key(keys):
@@ -665,14 +680,19 @@ class WinThsBackend:
             win32api.CloseHandle(h_proc)
 
     def _click_button_by_text(self, text: str) -> bool:
-        """按 class=Button + 文字 在主窗口后代里找按钮句柄并 BM_CLICK（消息，非坐标）。"""
-        found: list[int] = []
+        """在主窗口后代里找含 `text` 的控件并点击（时段 tab）。
+
+        诊断增强：枚举所有含该文字的控件并打印 hwnd/类名/真实文字（之前只打"请求的
+        文字"，无法确认到底点中了什么、时段 tab 是不是标准 Button、BM_CLICK 有没有生效）。
+        优先 Button 类用 BM_CLICK；命中其它类也尝试点（仍 BM_CLICK，多半无害）。
+        """
+        matches: list[tuple[int, str, str]] = []
 
         def walker(h, _):
             try:
-                if win32gui.GetClassName(h) == "Button" and text in (win32gui.GetWindowText(h) or ""):
-                    found.append(h)
-                    return False
+                wt = win32gui.GetWindowText(h) or ""
+                if text in wt:
+                    matches.append((h, win32gui.GetClassName(h), wt))
             except Exception:
                 pass
             return True
@@ -681,11 +701,16 @@ class WinThsBackend:
             win32gui.EnumChildWindows(self.hwnd_main, walker, None)
         except Exception as e:
             logger.warning("settlement: EnumChildWindows failed: %s", e)
-        if not found:
-            logger.warning("settlement: button %r not found (可能是自绘控件)", text)
+        if not matches:
+            logger.warning("settlement: 时段 %r 未找到任何含该文字的控件（可能是自绘 tab）", text)
             return False
-        win32api.PostMessage(found[0], win32con.BM_CLICK, 0, 0)
-        logger.info("settlement: clicked button %r", text)
+        btns = [m for m in matches if m[1] == "Button"]
+        h, cls, wt = (btns or matches)[0]
+        win32api.PostMessage(h, win32con.BM_CLICK, 0, 0)
+        logger.info(
+            "settlement: 点击时段 hwnd=%s cls=%s text=%r；全部候选=%r",
+            hex(h), cls, wt, [(c, t) for _, c, t in matches],
+        )
         return True
 
     # 交割单是「查询(F4)」展开后 资金股票 往下数第 8 个子节点：
@@ -737,24 +762,38 @@ class WinThsBackend:
             self._goto_settlement_panel()
             # 时段：按文字点「近一年」等按钮（真实 Button，可命中）
             ranged = self._click_button_by_text(date_range)
+            # 点完时段，表格要重新查询+刷新，多等一会儿再读，否则会读到过滤前/不完整
+            # 的数据（实测近一月只读到 2 条）。
             time.sleep(refresh_sleep_time)
             self.refresh()
+            time.sleep(refresh_sleep_time)
 
             hwnd = self.get_right_hwnd()
             ctrl = win32gui.GetDlgItem(hwnd, 0x417)
             if not ctrl:
                 return {"code": 1, "status": "failed",
                         "msg": "交割单表格控件(0x417)未找到，可能未切到交割单面板"}
-            self.copy_table(ctrl)
-            data = None
-            for _ in range(retry_time + 3):
-                time.sleep(sleep_time)
-                data = get_clipboard_data()
+            # 拷表 + 读剪贴板可能拿到不完整快照（过滤未落定/竞态）。重拷几次取行数最多
+            # 的那次为准。get_clipboard_data 已永不抛异常（失败返回 None）。
+            rows: list[dict] = []
+            for attempt in range(3):
+                self.copy_table(ctrl)
+                data = None
+                for _ in range(retry_time + 2):
+                    time.sleep(sleep_time)
+                    data = get_clipboard_data()
+                    if data:
+                        break
                 if data:
+                    parsed = parse_table(data)
+                    if len(parsed) > len(rows):
+                        rows = parsed
+                # 行数已稳定（这次没读到更多）就不必再拷
+                if attempt >= 1 and data and len(parse_table(data)) <= len(rows):
                     break
-            if not data:
+                time.sleep(refresh_sleep_time)
+            if not rows:
                 return {"code": 1, "status": "failed", "msg": "交割单读取为空"}
-            rows = parse_table(data)
 
             # 列名校验：确认确实是交割单面板，避免把资金股票/持仓数据误当交割单返回。
             cols = set(rows[0].keys()) if rows else set()
