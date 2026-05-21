@@ -558,6 +558,14 @@ class WinThsBackend:
                 logger.warning("settlement: VirtualAllocEx failed")
                 return False
 
+            def _norm(s: str) -> str:
+                # THS 把「交 割 单」「对 帐 单」用空格拉开对齐 → 树节点文字含空格。
+                # 匹配前去掉半角/全角空格，否则 "交割单" in "交 割 单" = False。
+                return s.replace(" ", "").replace("　", "")
+
+            target_norm = _norm(target)
+            visited: list[str] = []
+
             def read_text(hitem: int) -> str:
                 item = _TVITEMW()
                 item.mask = TVIF_TEXT
@@ -573,7 +581,9 @@ class WinThsBackend:
 
             def walk(hitem: int):
                 while hitem:
-                    if target in read_text(hitem):
+                    txt = read_text(hitem)
+                    visited.append(txt)
+                    if target_norm in _norm(txt):
                         return hitem
                     child = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_CHILD, hitem)
                     if child:
@@ -585,7 +595,15 @@ class WinThsBackend:
 
             node = walk(win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_ROOT, 0))
             if not node:
-                logger.warning("settlement: tree node %r not found", target)
+                try:
+                    tree_cls = win32gui.GetClassName(tree)
+                except Exception:
+                    tree_cls = "?"
+                # 诊断：dump 实际读到的节点文字，区分"空格没去净 / 读到空 / 树不对"
+                logger.warning(
+                    "settlement: tree node %r not found; tree=%s cls=%s visited(%d)=%r",
+                    target, hex(tree), tree_cls, len(visited), visited[:40],
+                )
                 return False
 
             win32gui.SendMessage(tree, TVM_SELECTITEM, TVGN_CARET, node)
