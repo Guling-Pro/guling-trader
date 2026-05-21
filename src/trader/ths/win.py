@@ -25,11 +25,12 @@ import os
 import platform
 import re
 import sys
+import tempfile
 import time
 from typing import Any, Optional
 
 import pytesseract
-from PIL import Image, ImageFilter, ImageGrab
+from PIL import Image, ImageFilter
 
 if platform.system() == "Windows":
     import win32api
@@ -63,17 +64,28 @@ retry_time = 1
 # config through every method.
 window_title: str = "网上股票交易系统5.0"
 
+# OCR 临时截图的落地目录。默认系统临时目录；setup() 可改成 exe 同级的 tmp/，
+# 避免在 exe 当前目录乱丢 ocr.png / ocr_proc.png。
+work_dir: str = tempfile.gettempdir()
 
-def setup(window_title_value: str, tesseract_cmd: str) -> None:
-    """Apply runtime configuration. Call once at server startup before using ThsAuto."""
-    global window_title
+
+def setup(window_title_value: str, tesseract_cmd: str, work_dir_value: str = "") -> None:
+    """Apply runtime configuration. Call once at server startup before using the backend."""
+    global window_title, work_dir
     window_title = window_title_value
+    if work_dir_value:
+        work_dir = work_dir_value
+        try:
+            os.makedirs(work_dir, exist_ok=True)
+        except Exception as e:
+            logger.warning("create work_dir %r failed: %s", work_dir, e)
     if tesseract_cmd:
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
     logger.info(
-        "thsauto setup: window_title=%r tesseract_cmd=%r",
+        "thsauto setup: window_title=%r tesseract_cmd=%r work_dir=%r",
         window_title,
         tesseract_cmd or "<from PATH>",
+        work_dir,
     )
 
 
@@ -108,27 +120,6 @@ def find_window_by_title_prefix(prefix: str) -> int:
     hwnd, full = matches[0]
     logger.info("matched window prefix=%r → full_title=%r hwnd=%s", prefix, full, hwnd)
     return hwnd
-
-
-def ocr_rect(bbox):
-    img = ImageGrab.grab(bbox=bbox)
-    img.save("ret.png")
-    import cv2
-
-    image = cv2.imread("ret.png")
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    scale_factor = 2
-    resized_img = cv2.resize(gray, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_CUBIC)
-    pil_img = Image.fromarray(resized_img)
-    smoothed_img = pil_img.filter(ImageFilter.GaussianBlur(radius=1))
-    sharpened_img = smoothed_img.filter(ImageFilter.SHARPEN)
-    import numpy as np
-
-    processed_img = np.array(sharpened_img)
-    cv2.imwrite("ret1.png", processed_img)
-    text = pytesseract.image_to_string(Image.fromarray(processed_img), lang=r"chi_sim+eng")
-    return text.strip()
 
 
 def get_clipboard_data():
@@ -927,14 +918,16 @@ class WinThsBackend:
             # every retry OCRs the same image and gets the same wrong answer.
             if attempt > 1:
                 self._refresh_captcha(captcha_static)
-            self.capture_window(captcha_static, "ocr.png")
+            ocr_png = os.path.join(work_dir, "ocr.png")
+            ocr_proc_png = os.path.join(work_dir, "ocr_proc.png")
+            self.capture_window(captcha_static, ocr_png)
             try:
-                raw_image = Image.open("ocr.png")
+                raw_image = Image.open(ocr_png)
                 image = self._preprocess_captcha(raw_image)
-                image.save("ocr_proc.png")
+                image.save(ocr_proc_png)
             except Exception:
                 logger.exception("ocr attempt=%d preprocess failed", attempt)
-                image = Image.open("ocr.png")
+                image = Image.open(ocr_png)
             try:
                 text = pytesseract.image_to_string(image, config=ocr_config)
             except Exception:

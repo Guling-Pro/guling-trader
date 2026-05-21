@@ -25,11 +25,8 @@ from typing import Optional
 # 这是 wine/CrossOver 用户的唯一诊断渠道——异常 traceback 也会写进去。
 
 def _setup_file_logging() -> Path:
-    if platform.system() == "Windows":
-        log_dir = Path(os.environ.get("APPDATA", "")) / "guling-trader"
-    else:
-        log_dir = Path.home() / ".config" / "guling-trader"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    from . import config as _config  # 延迟导入：本函数在模块顶层 import 之前就被调用
+    log_dir = _config.app_data_dir()  # frozen → exe 同级 guling-trader-data/
 
     log_file = log_dir / "trader.log"
     # 'w' 每次启动新建——避免日志无限增长
@@ -260,7 +257,7 @@ async def _async_main(
             if tesseract_cmd is None:
                 tesseract_cmd = await ensure_tesseract(on_log=state.log)
                 bootstrap_result.found_tesseract_cmd = tesseract_cmd
-            ths_setup("网上股票交易系统5.0", tesseract_cmd or "")
+            ths_setup("网上股票交易系统5.0", tesseract_cmd or "", str(trader_config.tmp_dir()))
             if tesseract_cmd is None:
                 state.log("⚠ Tesseract 仍不可用，下单验证码无法自动识别")
             else:
@@ -541,15 +538,24 @@ def run() -> None:
             state.log(f"⚠ 重置失败: {e}")
 
     def on_main_exit() -> None:
-        # asyncio thread 是 daemon，主线程退出它就会停
+        # 主窗口自身关闭时的清理钩子；asyncio thread 是 daemon，进程退它就停。
         pass
+
+    def on_tray_exit() -> None:
+        # 托盘「退出」从托盘线程触发：调度到 tk 主线程真正销毁窗口 →
+        # mainloop 返回 → run() 末尾 sys.exit(0) → 进程退出。
+        # 旧实现只 stop 托盘图标、不关 mainloop，导致进程残留、只能任务管理器查杀。
+        try:
+            mw.root.after(0, mw.root.destroy)
+        except Exception:
+            os._exit(0)
 
     # tray manager（辅助；wine 下可能不可见但不阻塞主流程）
     tray_mgr: Optional[tray.TrayManager] = None
     try:
         tray_config = tray.TrayConfig(
             xiadan_path=result.found_xiadan_path,
-            on_exit=on_main_exit,
+            on_exit=on_tray_exit,
         )
         tray_mgr = tray.TrayManager(tray_config)
         tray_mgr.start()

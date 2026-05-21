@@ -130,11 +130,11 @@ class TrayManager:
                     self._on_show_window_menu,
                     default=True,  # 双击托盘图标触发此项
                 ),
-                pystray.MenuItem.SEPARATOR,  # type: ignore
+                pystray.Menu.SEPARATOR,  # type: ignore
                 pystray.MenuItem("配对码...", self._on_show_pairing_code),  # type: ignore
                 pystray.MenuItem("连接状态", self._on_show_status),  # type: ignore
                 pystray.MenuItem("打开 xiadan", self._on_open_xiadan),  # type: ignore
-                pystray.MenuItem.SEPARATOR,  # type: ignore
+                pystray.Menu.SEPARATOR,  # type: ignore
                 pystray.MenuItem("退出", self._on_exit),  # type: ignore
             )
 
