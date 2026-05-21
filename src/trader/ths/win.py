@@ -445,7 +445,7 @@ class WinThsBackend:
             if data:
                 return {"code": 0, "status": "succeed", "data": parse_table(data)}
             time.sleep(sleep_time)
-        return {"code": 1, "status": "failed"}
+        return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
     def get_gupiao(self):
         for retry in range(retry_time):
@@ -459,7 +459,7 @@ class WinThsBackend:
             if data:
                 return {"code": 0, "status": "succeed", "data": parse_table(data)}
             time.sleep(sleep_time)
-        return {"code": 1, "status": "failed"}
+        return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
     def get_active_orders(self):
         for retry in range(retry_time):
@@ -475,7 +475,7 @@ class WinThsBackend:
             if data:
                 return {"code": 0, "status": "succeed", "data": parse_table(data)}
             time.sleep(sleep_time)
-        return {"code": 1, "status": "failed"}
+        return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
     def get_filled_orders(self):
         self.switch_to_normal()
@@ -494,9 +494,9 @@ class WinThsBackend:
             data = get_clipboard_data()
         if data:
             return {"code": 0, "status": "succeed", "data": parse_table(data)}
-        return {"code": 1, "status": "failed"}
+        return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
-    def _lookup_entrust_no(self, stock_no, op_keyword, amount, price, timeout=4.0):
+    def _lookup_entrust_no(self, stock_no, op_keyword, amount, price, timeout=8.0):
         """After buy/sell submission, find the freshly-placed order in
         orders/active by matching (code, op, qty, price). Returns entrust_no
         string or None if not found within timeout.
@@ -573,11 +573,16 @@ class WinThsBackend:
         ctrl = win32gui.GetDlgItem(hwnd, 0x40A)
         set_text(ctrl, str(amount))
         time.sleep(sleep_time)
-        # Three Enters: form-submit + confirm dialog + dismiss result popup.
-        # Kept verbatim from upstream — empirical across xiadan versions.
-        hot_key(["enter"])
-        hot_key(["enter"])
-        hot_key(["enter"])
+        # Submit form → 确认买卖 dialog → confirm. THS may then pop an anti-bot
+        # captcha that blocks the whole window; input_ocr() solves it (and is a
+        # no-op when no popup is present). Only after the captcha clears does the
+        # "已成功提交" result popup show, so handle the captcha BETWEEN the confirm
+        # Enter and the final dismiss — three blind Enters alone can't dismiss a
+        # captcha (it needs the actual code typed) and leave the order stuck.
+        hot_key(["enter"])   # submit form → 确认买卖 dialog
+        hot_key(["enter"])   # confirm → 提交委托（可能弹验证码）
+        self.input_ocr()     # 处理反机器人验证码（无弹窗立即返回）
+        hot_key(["enter"])   # dismiss 结果弹窗
         time.sleep(sleep_time)
         entrust_no = self._lookup_entrust_no(stock_no, op_keyword, amount, price)
         if entrust_no:
@@ -1066,9 +1071,10 @@ class WinThsBackend:
         bound_err = self._ensure_bound()
         if bound_err:
             return bound_err
-        return await asyncio.to_thread(
-            self._do_buy, stock_no, amount, price if price is not None else 0
-        )
+        # price=None ⇒ 市价单：保持 None 透传，让 _submit_trade 跳过价格框，
+        # 沿用 xiadan 按股票代码自动带出的对手价。强转 0 会把价格框写成 "0.000"，
+        # 同花顺无法以 0.00 挂单。
+        return await asyncio.to_thread(self._do_buy, stock_no, amount, price)
 
     async def sell(
         self,
@@ -1080,9 +1086,8 @@ class WinThsBackend:
         bound_err = self._ensure_bound()
         if bound_err:
             return bound_err
-        return await asyncio.to_thread(
-            self._do_sell, stock_no, amount, price if price is not None else 0
-        )
+        # price=None ⇒ 市价单：保持 None 透传（见 buy 注释）。
+        return await asyncio.to_thread(self._do_sell, stock_no, amount, price)
 
     async def cancel(self, entrust_no: str) -> dict[str, Any]:
         bound_err = self._ensure_bound()

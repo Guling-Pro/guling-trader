@@ -2,7 +2,6 @@
 import asyncio
 import logging
 import platform
-import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,11 +19,6 @@ if platform.system() == "Windows":
 logger = logging.getLogger(__name__)
 
 DEFAULT_XIADAN_WINDOW_TITLE = "网上股票交易系统5.0"
-
-TESSERACT_COMMON_PATHS = [
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-]
 
 
 @dataclass
@@ -73,13 +67,9 @@ def _detect_xiadan_window(prefix: str) -> Optional[tuple[str, str, int]]:
 
 
 def _detect_tesseract_path() -> Optional[str]:
-    """查找 tesseract，返回路径或 None"""
-    if shutil.which("tesseract"):
-        return ""
-    for p in TESSERACT_COMMON_PATHS:
-        if Path(p).exists():
-            return p
-    return None
+    """查找 tesseract，返回 ""（PATH）/路径/None。委托 installer.tesseract（单一真源）。"""
+    from .installer.tesseract import detect_tesseract
+    return detect_tesseract()
 
 
 def bootstrap() -> BootstrapResult:

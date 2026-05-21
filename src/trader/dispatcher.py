@@ -55,12 +55,31 @@ async def handle_call(
         else:
             result = {"code": 1, "error": "内部错误"}
 
-        if isinstance(result, dict) and result.get("code") == 0:
+        if not isinstance(result, dict):
+            reply["ok"] = False
+            reply["error"] = "未知错误"
+            return reply
+
+        code = result.get("code")
+        if code == 0:
             reply["ok"] = True
             reply["result"] = result
         else:
             reply["ok"] = False
-            reply["error"] = result.get("error", "未知错误")
+            # 透传后端的 code/status/msg，让上层能区分"已提交未确认(code=2)"和真失败，
+            # 而不是把一切塌缩成"未知错误"。
+            reply["result"] = result
+            if code == 2:
+                # 委托已提交但未能在委托列表回查确认（验证码/刷新延迟常见）。
+                # 这不是下单失败——必须明确告知，避免上层重复下单造成双倍成交。
+                reply["error"] = (
+                    result.get("msg")
+                    or "委托可能已提交但未确认，请勿重复下单，需人工或查询确认状态"
+                )
+            else:
+                reply["error"] = (
+                    result.get("error") or result.get("msg") or "未知错误"
+                )
 
     except Exception as e:
         logger.error("处理 RPC '%s' 出错：%s", method, e)

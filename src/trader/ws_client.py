@@ -246,30 +246,26 @@ class WsClient:
             method = frame.get("method")
             params = frame.get("params", {})
             logger.info("收到 RPC call：id=%s, method=%s", rpc_id, method)
-            reply = {"type": "reply", "id": rpc_id}
             try:
-                result = await self._dispatch_call(method, params)
-                reply["ok"] = True
-                reply["result"] = result
+                # dispatcher.handle_call 已返回完整 reply 帧（type/id/ok/result|error）。
+                # 直接转发，不要再包一层 {ok:true, result:...}——否则外层永远 ok:true，
+                # 真实失败被掩盖，成功结果也多嵌一层导致下游解析错位。
+                reply = await dispatcher.handle_call(frame, self.backend)
                 if self.on_rpc_log:
-                    self.on_rpc_log(_format_rpc_log(method, params, result=result))
+                    if reply.get("ok"):
+                        self.on_rpc_log(
+                            _format_rpc_log(method, params, result=reply.get("result"))
+                        )
+                    else:
+                        self.on_rpc_log(
+                            _format_rpc_log(method, params, error=reply.get("error"))
+                        )
             except Exception as e:
-                reply["ok"] = False
-                reply["error"] = str(e)
+                reply = {"type": "reply", "id": rpc_id, "ok": False, "error": str(e)}
                 if self.on_rpc_log:
                     self.on_rpc_log(_format_rpc_log(method, params, error=str(e)))
             if self.ws:
                 await self.ws.send(json.dumps(reply, ensure_ascii=False))
-
-    async def _dispatch_call(
-        self,
-        method: str,
-        params: dict[str, Any],
-    ) -> Any:
-        """分派 RPC 调用到后端"""
-        frame = {"method": method, "params": params}
-        result = await dispatcher.handle_call(frame, self.backend)
-        return result
 
     async def send_frame(self, frame: dict[str, Any]) -> None:
         """发送帧"""

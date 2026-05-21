@@ -1,0 +1,116 @@
+"""Tesseract OCR 自动安装（winget 静默）。
+
+下单验证码的自动识别依赖 Tesseract。Win11 自带 winget，UB-Mannheim 包已含
+eng 语言数据（验证码是字母数字，只需 eng），所以"自动安装"一步到位，无需另外
+下载模型。
+
+设计要点：
+- 不靠 winget 退出码判断成败（"已安装"也可能返回非 0），一律以安装后重新检测为准。
+- UB-Mannheim 默认装到 ``C:\\Program Files\\Tesseract-OCR``，即使当前进程 PATH
+  没刷新，detect 也能按固定路径命中。
+- 任何失败都优雅降级为 None + 日志，绝不抛断启动。
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import platform
+import shutil
+from pathlib import Path
+from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+WINGET_PACKAGE_ID = "UB-Mannheim.TesseractOCR"
+
+TESSERACT_COMMON_PATHS = [
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+]
+
+
+def detect_tesseract() -> Optional[str]:
+    """查找 tesseract。
+
+    返回：
+    - ``""``  → 在 PATH 上（pytesseract 用默认命令名即可）
+    - 具体路径 → 在固定安装目录命中
+    - ``None`` → 未安装
+    """
+    if shutil.which("tesseract"):
+        return ""
+    for p in TESSERACT_COMMON_PATHS:
+        if Path(p).exists():
+            return p
+    return None
+
+
+def verify_ocr_runnable() -> tuple[bool, str]:
+    """启动自检：真跑一次 ``tesseract --version``，确认 OCR 可用（而非只是文件在）。
+
+    捕获"装坏 / 缺 DLL / 路径没接通"等只会在下单那一刻才暴露的问题。
+    需在 ``win.setup()`` 之后调用（那时 pytesseract.tesseract_cmd 已配好）。
+    返回 ``(ok, info)``：ok=True 时 info 是版本号；否则 info 是错误原因。
+    """
+    try:
+        import pytesseract
+        return True, str(pytesseract.get_tesseract_version())
+    except Exception as e:
+        return False, str(e)
+
+
+async def ensure_tesseract(
+    on_log: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
+    """确保 Tesseract 可用：已装→返回 ``""``/路径；未装→winget 静默安装后重检测。
+
+    返回 ``None`` 表示不可用（非 Windows / 无 winget / 安装失败）。
+    """
+    def log(msg: str) -> None:
+        if on_log:
+            try:
+                on_log(msg)
+            except Exception:
+                pass
+
+    if platform.system() != "Windows":
+        return None
+
+    existing = detect_tesseract()
+    if existing is not None:
+        return existing
+
+    if not shutil.which("winget"):
+        log("⚠ 未找到 winget，无法自动安装 Tesseract（手动：winget install "
+            f"{WINGET_PACKAGE_ID}）")
+        return None
+
+    log("正在通过 winget 安装 Tesseract OCR（首次约 1-2 分钟）...")
+    cmd = [
+        "winget", "install", "-e", "--id", WINGET_PACKAGE_ID,
+        "--silent",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        out = (stdout or b"").decode("utf-8", errors="ignore")
+        logger.info("winget 退出码=%s\n%s", proc.returncode, out[-1500:])
+    except Exception as e:
+        logger.exception("winget 安装 Tesseract 失败")
+        log(f"⚠ Tesseract 自动安装失败：{e}")
+        return None
+
+    # 以重新检测为准（不看退出码）。
+    found = detect_tesseract()
+    if found is not None:
+        log("✓ Tesseract OCR 安装完成")
+        return found
+
+    log("⚠ Tesseract 安装后仍未检测到，可能需要重启 trader 或手动安装")
+    return None

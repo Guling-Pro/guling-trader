@@ -248,6 +248,32 @@ async def _async_main(
     if platform.system() == "Windows" and bootstrap_result.found_xiadan_path:
         _check_xiadan_conflict(state)
 
+    # Step 3.5: 确保 Tesseract OCR 就绪（缺则 winget 静默安装），再喂给 OCR 后端。
+    # 旧架构在 server.py 启动时调 thsauto_setup(window_title, tesseract_cmd)；PH-061
+    # 迁到本仓库时这步丢了 → pytesseract 只认 PATH，验证码识别静默失效。这里恢复该
+    # setup 调用，并补上旧版没有的"自动安装"。None=没装→装；""=在 PATH；具体路径=已应用。
+    if platform.system() == "Windows":
+        try:
+            from .installer.tesseract import ensure_tesseract
+            from .ths.win import setup as ths_setup
+            tesseract_cmd = bootstrap_result.found_tesseract_cmd
+            if tesseract_cmd is None:
+                tesseract_cmd = await ensure_tesseract(on_log=state.log)
+                bootstrap_result.found_tesseract_cmd = tesseract_cmd
+            ths_setup("网上股票交易系统5.0", tesseract_cmd or "")
+            if tesseract_cmd is None:
+                state.log("⚠ Tesseract 仍不可用，下单验证码无法自动识别")
+            else:
+                # 启动自检：确认 OCR 真能跑，而不只是文件在。
+                from .installer.tesseract import verify_ocr_runnable
+                ocr_ok, ocr_info = verify_ocr_runnable()
+                if ocr_ok:
+                    state.log(f"✓ OCR 就绪（Tesseract {ocr_info}）")
+                else:
+                    state.log(f"⚠ OCR 自检失败：{ocr_info}（下单验证码可能无法识别）")
+        except Exception as e:
+            logger.warning("Tesseract 准备失败: %s", e)
+
     # Step 4: WS 连接
     def on_ws_state_change(s) -> None:
         s_name = s.name if hasattr(s, "name") else str(s)
