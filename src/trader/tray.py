@@ -36,20 +36,9 @@ class TrayState(Enum):
 
 
 def _create_icon_image(state: TrayState) -> "Image.Image":
-    """生成 tray 图标（16x16 像素的色块）"""
-    colors = {
-        TrayState.UNPAIRED: (128, 128, 128),
-        TrayState.DIALING: (255, 200, 0),
-        TrayState.AWAITING_BIND: (255, 200, 0),
-        TrayState.CONNECTED: (0, 200, 0),
-        TrayState.DISCONNECTED: (128, 128, 128),
-        TrayState.FATAL: (255, 0, 0),
-        TrayState.INSTALLING: (255, 165, 0),  # 橙色，安装中
-    }
-    color = colors.get(state, (128, 128, 128))
-
-    img = Image.new("RGB", (16, 16), color)
-    return img
+    """生成 tray 图标：股灵 brand mark + 右下角状态色圆点。"""
+    from .brand import render_tray_icon
+    return render_tray_icon(64, state.value)
 
 
 @dataclass

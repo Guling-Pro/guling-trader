@@ -122,6 +122,14 @@ class MainWindow:
 
         self.root = tk.Tk()
         self.root.title("guling-trader")
+        # 窗口图标统一用股灵 brand mark（与官网 favicon / 托盘一致）
+        try:
+            from PIL import ImageTk
+            from .brand import render_logo
+            self._icon_photo = ImageTk.PhotoImage(render_logo(64))
+            self.root.iconphoto(True, self._icon_photo)
+        except Exception:
+            pass
         # 显式 +200+200 位置防止 wine 把窗口扔到屏外
         self.root.geometry("520x540+200+200")
         self.root.minsize(420, 400)

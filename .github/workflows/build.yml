@@ -30,6 +30,7 @@ jobs:
           pyinstaller --onefile --windowed `
                       --name guling-trader `
                       --paths src `
+                      --icon src/trader/assets/icon.ico `
                       --collect-submodules trader `
                       --collect-data certifi `
                       run_trader.py
