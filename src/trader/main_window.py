@@ -130,6 +130,19 @@ class MainWindow:
             self.root.iconphoto(True, self._icon_photo)
         except Exception:
             pass
+        # Windows 标题栏 + 任务栏图标：iconphoto 在 Windows 上对这两个槽位不可靠，
+        # 必须用原生 .ico + iconbitmap 才稳（任务栏还需 main.py 设 AppUserModelID）。
+        import platform as _platform
+        if _platform.system() == "Windows":
+            try:
+                from . import config as _config
+                from .brand import save_ico
+                ico_path = _config.app_data_dir() / "icon.ico"
+                if not ico_path.exists():
+                    save_ico(str(ico_path))
+                self.root.iconbitmap(default=str(ico_path))
+            except Exception as e:
+                logger.debug("set window iconbitmap failed: %s", e)
         # 显式 +200+200 位置防止 wine 把窗口扔到屏外
         self.root.geometry("520x540+200+200")
         self.root.minsize(420, 400)

@@ -446,6 +446,16 @@ async def _diagnose() -> None:
 
 
 def run() -> None:
+    # Windows 任务栏图标：不设 AppUserModelID 时，任务栏按钮认的是 python 进程图标，
+    # 而非窗口/exe 图标。早于任何窗口创建前设置，配合 main_window 的 iconbitmap，
+    # 标题栏 + 任务栏才会显示 brand 图标。
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("guling.trader")
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(description="guling-trader — Windows 交易终端")
     parser.add_argument("--diagnose", action="store_true", help="诊断模式")
     args = parser.parse_args()

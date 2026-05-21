@@ -1,6 +1,6 @@
 [project]
 name = "guling-trader"
-version = "0.4.3"
+version = "0.4.4"
 description = "Windows 桌面客户端：通过 WS 隧道连接 guling.pro / yu-agent 并驱动同花顺独立委托客户端（xiadan.exe）执行 A 股交易"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1168,28 +1168,52 @@ class WinThsBackend:
         logger.warning("ocr gave up after %d attempts", max_retries)
 
     def capture_window(self, hwnd, file_name):
-        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-        width = right - left
-        height = bottom - top
+        # HiDPI 修复（Retina / Parallels 200% 缩放）：进程"部分 DPI 感知"时
+        # GetWindowRect 返回逻辑像素，但窗口 DC 的 BitBlt 按物理像素复制 → 只截到
+        # 验证码左上一块（半张图），OCR 必错。临时把线程切到 Per-Monitor-V2 DPI
+        # 感知，使 GetWindowRect 也返回物理像素，截全图后还原（只影响这次截图）。
+        user32 = ctypes.windll.user32
+        DPI_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+        old_ctx = None
+        if hasattr(user32, "SetThreadDpiAwarenessContext"):
+            try:
+                old_ctx = user32.SetThreadDpiAwarenessContext(
+                    DPI_CONTEXT_PER_MONITOR_AWARE_V2
+                )
+            except Exception as e:
+                logger.debug("SetThreadDpiAwarenessContext failed: %s", e)
+                old_ctx = None
+        try:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            width = right - left
+            height = bottom - top
 
-        hdc = win32gui.GetWindowDC(hwnd)
-        dc = win32ui.CreateDCFromHandle(hdc)
-        cdc = dc.CreateCompatibleDC()
-        bmp = win32ui.CreateBitmap()
-        bmp.CreateCompatibleBitmap(dc, width, height)
-        cdc.SelectObject(bmp)
-        cdc.BitBlt((0, 0), (width, height), dc, (0, 0), win32con.SRCCOPY)
+            hdc = win32gui.GetWindowDC(hwnd)
+            dc = win32ui.CreateDCFromHandle(hdc)
+            cdc = dc.CreateCompatibleDC()
+            bmp = win32ui.CreateBitmap()
+            bmp.CreateCompatibleBitmap(dc, width, height)
+            cdc.SelectObject(bmp)
+            cdc.BitBlt((0, 0), (width, height), dc, (0, 0), win32con.SRCCOPY)
 
-        info = bmp.GetInfo()
-        bits = bmp.GetBitmapBits(True)
-        img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), bits, "raw", "BGRX", 0, 1)
+            info = bmp.GetInfo()
+            bits = bmp.GetBitmapBits(True)
+            img = Image.frombuffer(
+                "RGB", (info["bmWidth"], info["bmHeight"]), bits, "raw", "BGRX", 0, 1
+            )
 
-        win32gui.DeleteObject(bmp.GetHandle())
-        dc.DeleteDC()
-        cdc.DeleteDC()
-        win32gui.ReleaseDC(hwnd, hdc)
+            win32gui.DeleteObject(bmp.GetHandle())
+            dc.DeleteDC()
+            cdc.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hdc)
 
-        img.save(file_name)
+            img.save(file_name)
+        finally:
+            if old_ctx is not None:
+                try:
+                    user32.SetThreadDpiAwarenessContext(old_ctx)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Async surface for PH-061 dispatcher.
