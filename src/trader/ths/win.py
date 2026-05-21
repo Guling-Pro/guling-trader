@@ -688,21 +688,54 @@ class WinThsBackend:
         logger.info("settlement: clicked button %r", text)
         return True
 
-    def _do_settlement(self, date_range: str = "近一年"):
-        """读取交割单（默认近一年）。低频功能，一次性尽量多拿。
+    # 交割单是「查询(F4)」展开后 资金股票 往下数第 8 个子节点：
+    #   资金股票(0) 当日委托 当日成交 历史委托 历史成交 历史持仓 资金明细 对帐单 交割单(8)
+    # THS 左树文字是回调式，跨进程 TVM_GETITEM 读不到（实测全空），所以不靠文字定位，
+    # 改用「F4 落到资金股票 → 给树发 8 次 Down 键消息」走结构定位，纯键盘、无坐标、
+    # 无 DPI 问题。最后用列名校验确认确实切到了交割单，绝不把资金股票数据当交割单返回。
+    _SETTLEMENT_DOWN_FROM_F4 = 8
+    # 交割单独有、资金股票/持仓没有的列，用来校验面板切对了
+    _SETTLEMENT_MARKER_COLS = ("发生金额", "成交编号", "印花税", "成交日期")
 
-        步骤全部走控件/消息定位（除共享的 switch_to_normal）：
-        F4 打开查询 → TVM 选中「交割单」树节点 → 按文字点时段按钮 → 读 0x417 表格。
-        """
+    def _goto_settlement_panel(self) -> None:
+        """F4 进查询（落 资金股票）→ 给左树发 N 次 Down 键 → 选中交割单（触发面板切换）。"""
+        self.switch_to_normal()
+        _activate_window(self.hwnd_main)
+        hot_key(["F4"])  # 查询：默认选中并显示 资金股票
+        time.sleep(refresh_sleep_time)
+        tree = self.get_tree_hwnd()
+        if not tree:
+            logger.warning("settlement: tree hwnd not found")
+            return
+        # 先让左树拿到键盘焦点（跨线程需 AttachThreadInput），方向键才稳被处理。
         try:
-            self.switch_to_normal()
-            _activate_window(self.hwnd_main)
-            hot_key(["F4"])  # 打开查询
-            time.sleep(sleep_time)
+            user32 = ctypes.windll.user32
+            my_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            tgt_tid, _ = win32process.GetWindowThreadProcessId(tree)
+            attached = False
+            if my_tid != tgt_tid and user32.AttachThreadInput(my_tid, tgt_tid, True):
+                attached = True
+            try:
+                user32.SetFocus(tree)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(my_tid, tgt_tid, False)
+        except Exception as e:
+            logger.debug("settlement: focus tree failed: %s", e)
+        # 给树发 WM_KEYDOWN/UP：每次 Down 下移一项，选中变化触发右侧面板切换
+        # （与用户按方向键等效）。无需坐标，DPI 无关。
+        for _ in range(self._SETTLEMENT_DOWN_FROM_F4):
+            win32gui.SendMessage(tree, win32con.WM_KEYDOWN, win32con.VK_DOWN, 0)
+            win32gui.SendMessage(tree, win32con.WM_KEYUP, win32con.VK_DOWN, 0)
+            time.sleep(short_sleep_time)
+        time.sleep(sleep_time)
+        logger.info("settlement: F4 + %d×Down 切到交割单", self._SETTLEMENT_DOWN_FROM_F4)
 
-            selected = self._select_tree_node_by_text("交割单", fallback_token="割")
-            time.sleep(refresh_sleep_time)
-            # 时段：尽量点「近一年」；自绘控件取不到文字时跳过（用面板当前默认时段）
+    def _do_settlement(self, date_range: str = "近一年"):
+        """读取交割单（默认近一年）。低频功能，一次性尽量多拿。"""
+        try:
+            self._goto_settlement_panel()
+            # 时段：按文字点「近一年」等按钮（真实 Button，可命中）
             ranged = self._click_button_by_text(date_range)
             time.sleep(refresh_sleep_time)
             self.refresh()
@@ -720,9 +753,17 @@ class WinThsBackend:
                 if data:
                     break
             if not data:
-                return {"code": 1, "status": "failed",
-                        "msg": "交割单读取为空（树节点选中=%s 时段点击=%s）" % (selected, ranged)}
+                return {"code": 1, "status": "failed", "msg": "交割单读取为空"}
             rows = parse_table(data)
+
+            # 列名校验：确认确实是交割单面板，避免把资金股票/持仓数据误当交割单返回。
+            cols = set(rows[0].keys()) if rows else set()
+            is_settlement = any(m in c for m in self._SETTLEMENT_MARKER_COLS for c in cols)
+            if rows and not is_settlement:
+                logger.warning("settlement: 面板列名不像交割单，cols=%r", list(cols))
+                return {"code": 1, "status": "failed",
+                        "msg": "未能切到交割单面板（读到的是其它面板），请重试或人工确认",
+                        "got_columns": list(cols)}
             return {
                 "code": 0,
                 "status": "succeed",
