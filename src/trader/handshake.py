@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-CLIENT_VERSION = "0.4.4"
+CLIENT_VERSION = "0.4.5"
 
 
 @dataclass

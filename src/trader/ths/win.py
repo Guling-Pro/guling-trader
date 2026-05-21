@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+from ctypes import wintypes
 import logging
 import os
 import platform
@@ -261,6 +262,7 @@ _TV_FIRST = 0x1100
 TVM_GETNEXTITEM = _TV_FIRST + 10
 TVM_GETITEMW = _TV_FIRST + 62
 TVM_SELECTITEM = _TV_FIRST + 11
+TVM_GETITEMRECT = _TV_FIRST + 4
 TVGN_ROOT = 0x0000
 TVGN_NEXT = 0x0001
 TVGN_CHILD = 0x0004
@@ -519,10 +521,14 @@ class WinThsBackend:
 
     # --- 交割单（低频，一次性拉一年做分析）----------------------------------
     def _select_tree_node_by_text(self, target: str) -> bool:
-        """按文字在左侧查询树（SysTreeView32）里找到节点并选中。
+        """按文字在左侧树（SysTreeView32）找到节点 → 程序化选中 + 真实鼠标点击。
 
-        全程走 TreeView 消息（TVM_GETITEM 读文字 / TVM_SELECTITEM 选中），不依赖
-        像素坐标 —— 窗口缩放 / DPI 不影响。跨进程读节点文字需在目标进程分配内存。
+        - 读节点文字走 TreeView 跨进程消息（TVM_GETITEM）；定位用文字，缩放无关。
+        - **ctypes 指针必须设 restype/argtypes**，否则 64 位地址被截断成 32 位 →
+          跨进程读到的全是空文字 → 永远 "not found"（2026-05-21 实测的真因）。
+        - 选中后还做一次真实鼠标点击（TVM_GETITEMRECT 取矩形 → 屏幕坐标 → 点击）：
+          TVM_SELECTITEM 不一定触发 THS 右侧面板切换，真实点击才稳（对齐 click_kc_*）。
+        - 点击坐标在 Per-Monitor-V2 DPI 上下文里换算，HiDPI（Retina/Parallels）下也准。
         """
         tree = self.get_tree_hwnd()
         if not tree:
@@ -534,10 +540,19 @@ class WinThsBackend:
         PAGE_RW = 0x04
         MEM_RELEASE = 0x8000
         k32 = ctypes.windll.kernel32
+        u32 = ctypes.windll.user32
+        # 64 位指针截断防护（关键）：不设这些，VirtualAllocEx 返回值 / Read/Write 的
+        # 地址参数都会被 ctypes 当 32 位 int 处理 → 高位丢失 → 读到错误内存。
+        k32.VirtualAllocEx.restype = ctypes.c_void_p
+        k32.VirtualAllocEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+        k32.VirtualFreeEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD]
+        k32.WriteProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        k32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+
         h_proc = win32api.OpenProcess(PROCESS_VM, False, pid)
         bufsize = 512
-        remote_text = k32.VirtualAllocEx(int(h_proc), 0, bufsize, MEM, PAGE_RW)
-        remote_item = k32.VirtualAllocEx(int(h_proc), 0, ctypes.sizeof(_TVITEMW), MEM, PAGE_RW)
+        remote_text = k32.VirtualAllocEx(int(h_proc), None, bufsize, MEM, PAGE_RW)
+        remote_item = k32.VirtualAllocEx(int(h_proc), None, ctypes.sizeof(_TVITEMW), MEM, PAGE_RW)
         try:
             if not remote_text or not remote_item:
                 logger.warning("settlement: VirtualAllocEx failed")
@@ -557,10 +572,8 @@ class WinThsBackend:
                 return buf.raw.decode("utf-16-le", "ignore").split("\x00", 1)[0]
 
             def walk(hitem: int):
-                # 迭代 + 显式栈，避免深树递归
                 while hitem:
-                    txt = read_text(hitem)
-                    if target in txt:
+                    if target in read_text(hitem):
                         return hitem
                     child = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_CHILD, hitem)
                     if child:
@@ -570,13 +583,48 @@ class WinThsBackend:
                     hitem = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_NEXT, hitem)
                 return 0
 
-            root = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_ROOT, 0)
-            node = walk(root)
+            node = walk(win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_ROOT, 0))
             if not node:
                 logger.warning("settlement: tree node %r not found", target)
                 return False
+
             win32gui.SendMessage(tree, TVM_SELECTITEM, TVGN_CARET, node)
-            logger.info("settlement: selected tree node %r", target)
+
+            # 取节点矩形：把 HTREEITEM 写进 RECT 头 8 字节，再发 TVM_GETITEMRECT。
+            k32.WriteProcessMemory(int(h_proc), remote_text,
+                                   ctypes.byref(ctypes.c_ssize_t(node)),
+                                   ctypes.sizeof(ctypes.c_ssize_t), None)
+            got = win32gui.SendMessage(tree, TVM_GETITEMRECT, 0, remote_text)
+            if not got:
+                logger.info("settlement: selected (no rect, 程序化) tree node %r", target)
+                return True
+            rect = (wintypes.LONG * 4)()
+            k32.ReadProcessMemory(int(h_proc), remote_text, ctypes.byref(rect),
+                                  ctypes.sizeof(rect), None)
+            cx = (rect[0] + rect[2]) // 2
+            cy = (rect[1] + rect[3]) // 2
+
+            DPI_PMv2 = ctypes.c_void_p(-4)
+            old_ctx = None
+            if hasattr(u32, "SetThreadDpiAwarenessContext"):
+                try:
+                    old_ctx = u32.SetThreadDpiAwarenessContext(DPI_PMv2)
+                except Exception:
+                    old_ctx = None
+            try:
+                pt = wintypes.POINT(cx, cy)
+                u32.ClientToScreen(tree, ctypes.byref(pt))
+                win32api.SetCursorPos((pt.x, pt.y))
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            finally:
+                if old_ctx is not None:
+                    try:
+                        u32.SetThreadDpiAwarenessContext(old_ctx)
+                    except Exception:
+                        pass
+            time.sleep(sleep_time)
+            logger.info("settlement: clicked tree node %r at client(%d,%d)", target, cx, cy)
             return True
         finally:
             if remote_text:

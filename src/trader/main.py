@@ -445,7 +445,42 @@ async def _diagnose() -> None:
     print("\n=== 诊断完成 ===")
 
 
+_SINGLETON_MUTEX = None  # 持有命名 mutex 句柄，进程存活期间不释放（防单例锁失效）
+
+
+def _enforce_single_instance() -> bool:
+    """Windows 单例锁：已有实例在跑则返回 False。
+
+    重复打开两个 trader 会各自连服务端 → 互相把对方的 session 踢下线
+    （evicted_by_other_session 死循环）→ 隧道不稳 → 用户侧报错。用命名 mutex 防呆。
+    """
+    if platform.system() != "Windows":
+        return True
+    try:
+        import ctypes
+        global _SINGLETON_MUTEX
+        # session-local 命名空间（无 Global\ 前缀），单桌面会话足够，免提权
+        _SINGLETON_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "guling-trader-singleton")
+        ERROR_ALREADY_EXISTS = 183
+        return ctypes.windll.kernel32.GetLastError() != ERROR_ALREADY_EXISTS
+    except Exception:
+        return True  # 锁机制本身异常不阻断启动
+
+
 def run() -> None:
+    # 单例：已有实例则提示并退出，避免双 trader 互踢导致隧道不稳。
+    if not _enforce_single_instance():
+        if platform.system() == "Windows":
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    0, "guling-trader 已在运行，请勿重复打开。", "guling-trader", 0x40
+                )
+            except Exception:
+                pass
+        logger.warning("已有 guling-trader 实例在运行，退出本次启动")
+        sys.exit(0)
+
     # Windows 任务栏图标：不设 AppUserModelID 时，任务栏按钮认的是 python 进程图标，
     # 而非窗口/exe 图标。早于任何窗口创建前设置，配合 main_window 的 iconbitmap，
     # 标题栏 + 任务栏才会显示 brand 图标。
