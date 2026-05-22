@@ -10,9 +10,9 @@
 
 > 📦 **[下载最新版 guling-trader.exe](https://github.com/suny911/guling-trader/releases/latest)**　|　🌐 **[股灵官网 guling.pro](https://guling.pro)**
 
-**让 AI 直接帮你炒 A 股。** —— 同花顺 (THS) A 股实盘的 **MCP 交易 Skill**，把券商下单变成 **AI Agent** 可直接调用的工具，一套面向实盘的 **trading harness**。
+**让 AI 直接帮你炒 A 股。** —— 同花顺 (THS) A 股实盘的 **MCP 交易 Skill**，把券商下单变成 **AI Agent** 可直接调用的工具，一套面向实盘的 **Harness-Trading**。
 
-> 🔑 关键词：同花顺 · THS · xiadan.exe · A股实盘 · MCP · AI Agent · Trading Skill · harness-trading · 自动交易
+> 🔑 关键词：同花顺 · THS · xiadan.exe · A股实盘 · MCP · AI Agent · Trading Skill · Harness-Trading · 自动交易
 
 `guling-trader` 是跑在 Windows 上的**交易执行端**：它通过模拟键鼠自动控制你已登录的同花顺独立委托客户端（`xiadan.exe`），把买入、卖出、查持仓、查资金等操作，变成 AI 可以直接调用的标准 MCP 工具。它本身不是 AI、也不碰你的密码——只负责"听 AI 指令、去同花顺上点鼠标"。
 
