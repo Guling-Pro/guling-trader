@@ -28,8 +28,53 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-WS_ENDPOINT = "wss://api.guling.pro/api/trader-tunnel"
+WS_ENDPOINT = "wss://mcp.guling.pro/api/trader-tunnel"
 WS_ENDPOINT_DEV = "ws://localhost:8000/api/trader-tunnel"
+
+
+def _normalize_endpoint(value: Optional[str]) -> Optional[str]:
+    """把用户填的"域名 / IP"补全成完整 WS 连接地址。
+
+    用户只需填 ``mcp.guling.pro`` 或 ``192.168.1.10:8080``——无需关心 ``ws/wss``
+    协议、``/api/trader-tunnel`` 内部路径，多打或漏打斜杠也无所谓。
+
+    规则：域名 → ``wss://``，IP / localhost → ``ws://``（想强制协议就自带前缀）；
+    路径一律重置为 ``/api/trader-tunnel``。
+    """
+    if not value:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+
+    # 1. 取出用户可能显式指定的协议
+    scheme = ""
+    if "://" in v:
+        scheme, v = v.split("://", 1)
+        scheme = scheme.lower()
+
+    # 2. 只保留 host[:port]，丢掉用户多打的路径与斜杠
+    host = v.split("/", 1)[0].strip().strip("/")
+    if not host:
+        return None
+
+    # 3. 未显式指定协议时按 host 类型推断：IP / localhost 用 ws，域名用 wss
+    if scheme not in ("ws", "wss"):
+        bare_host = host.split(":", 1)[0]
+        is_ip_or_local = bare_host == "localhost" or all(
+            c.isdigit() or c == "." for c in bare_host
+        )
+        scheme = "ws" if is_ip_or_local else "wss"
+
+    return f"{scheme}://{host}/api/trader-tunnel"
+
+
+class SessionRejectedException(Exception):
+    """会话运行中收到服务端的拒绝（如踢出、被限流锁死、Token失效）"""
+
+    def __init__(self, reason: str):
+        super().__init__(f"Session rejected: {reason}")
+        self.reason = reason
 
 
 class ConnectionState(str, Enum):
@@ -101,7 +146,13 @@ class WsClient:
         on_rpc_log: Optional[Callable[[str], None]] = None,
         backend: Optional[WinThsBackend] = None,
     ):
-        self.endpoint = dev_url or WS_ENDPOINT
+        self.dev_url = dev_url
+        cfg = config.load()
+        self.endpoint = (
+            _normalize_endpoint(self.dev_url)
+            or _normalize_endpoint(cfg.ws_endpoint)
+            or WS_ENDPOINT
+        )
         self.state = ConnectionState.UNPAIRED
         self.ws: Optional[Any] = None
         self.pending_rpcs: dict[str, PendingRPC] = {}
@@ -124,14 +175,19 @@ class WsClient:
         while True:
             # 每次重连都重新读 config——支持运行期清 config 触发 pair_init
             cfg = config.load()
+            self.endpoint = (
+                _normalize_endpoint(self.dev_url)
+                or _normalize_endpoint(cfg.ws_endpoint)
+                or WS_ENDPOINT
+            )
             try:
                 self._set_state(ConnectionState.DIALING)
                 logger.info("正在连接到 %s...", self.endpoint)
 
                 async with connect(
                     self.endpoint,
-                    ping_interval=15,
-                    ping_timeout=30,
+                    ping_interval=30,
+                    ping_timeout=60,
                     ssl=_SSL_CONTEXT if self.endpoint.startswith("wss://") else None,
                 ) as ws:  # type: ignore
                     self.ws = ws
@@ -146,14 +202,9 @@ class WsClient:
                         logger.error("握手失败：%s", result.error)
                         self._set_state(ConnectionState.UNPAIRED)
                         if result.should_clear_config:
-                            config.TraderConfig(device_id=cfg.device_id)
                             config.save(config.TraderConfig(device_id=cfg.device_id))
-                        await asyncio.sleep(30)
-                        continue
-
-                    if result.reason == "evicted_by_other_session":
-                        logger.warning("被其他设备会话踢出，冷却 30 秒...")
-                        await asyncio.sleep(30)
+                        # 握手失败（如网络、服务不可用）退避 5 秒重试
+                        await asyncio.sleep(5)
                         continue
 
                     # pair_init 成功 → 收到 pair_pending，等 bind_ok 才 CONNECTED
@@ -175,6 +226,19 @@ class WsClient:
             except asyncio.CancelledError:
                 logger.info("WS 客户端已取消")
                 break
+            except SessionRejectedException as e:
+                reason = e.reason
+                logger.error("会话连接运行中被拒绝（reason=%s），进入冷却...", reason)
+                self._set_state(ConnectionState.DISCONNECTED)
+                
+                if reason == "evicted_by_other_session":
+                    logger.warning("被其他设备会话踢出，冷却 30 秒...")
+                    await asyncio.sleep(30)
+                elif reason == "brute_force_blocked":
+                    logger.warning("因配对码多次校验失败被锁定，冷却 60 秒...")
+                    await asyncio.sleep(60)
+                else:
+                    await asyncio.sleep(30)
             except Exception as e:
                 logger.error("连接出错：%s，%d 秒后重连...", e, self.reconnect_delay)
                 self._set_state(ConnectionState.DISCONNECTED)
@@ -190,9 +254,13 @@ class WsClient:
                 try:
                     frame = json.loads(raw_msg)
                     await self._handle_frame(frame)
+                except SessionRejectedException:
+                    raise
                 except Exception as e:
                     logger.error("处理帧出错：%s，原始数据：%s", e, raw_msg)
         except asyncio.CancelledError:
+            raise
+        except SessionRejectedException:
             raise
         except Exception as e:
             logger.error("主循环出错：%s", e)
@@ -239,7 +307,15 @@ class WsClient:
 
         elif frame_type == "reject":
             reason = frame.get("reason")
-            logger.warning("握手被拒绝：%s", reason)
+            logger.warning("会话连接被服务器拒绝（reason=%s）", reason)
+            
+            # 立即清理无效凭证，防止重连循环 (PROTOCOL.md §2)
+            if reason in ("token_invalid", "account_removed"):
+                cfg = config.load()
+                logger.warning("Token 失效或账户已移除，清空本地 agent_token 配置...")
+                config.save(config.TraderConfig(device_id=cfg.device_id))
+                
+            raise SessionRejectedException(reason)
 
         elif frame_type == "call":
             rpc_id = frame.get("id")

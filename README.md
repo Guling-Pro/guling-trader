@@ -1,157 +1,191 @@
-# guling-trader
+# 📈 guling-trader (股灵交易助手)
 
-Windows 桌面客户端：通过 WS 隧道连接 [guling.pro](https://guling.pro) 后端 agent，驱动同花顺独立委托客户端 `xiadan.exe` 执行 A 股交易。
+[![GPL-3.0 License](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](https://github.com/suny911/guling-trader/blob/main/LICENSE)
+[![Python Version](https://img.shields.io/badge/Python-3.11+-brightgreen.svg)](https://python.org)
+[![OS Support](https://img.shields.io/badge/OS-Windows-blue.svg)](#)
+[![Virtual Machine](https://img.shields.io/badge/Mac--VM-Parallels%20Compatible-green.svg)](#)
+[![Model Context Protocol](https://img.shields.io/badge/MCP-Compatible-orange.svg)](#)
 
-GPL-3.0 · [Releases](https://github.com/suny911/guling-trader/releases) · [Issues](https://github.com/suny911/guling-trader/issues)
+**让 AI 直接帮你炒 A 股。**
 
----
+`guling-trader` 是跑在 Windows 上的**交易执行端**：它通过模拟键鼠自动控制你已登录的同花顺独立委托客户端（`xiadan.exe`），把买入、卖出、查持仓、查资金等操作，变成 AI 可以直接调用的标准 MCP 工具。它本身不是 AI、也不碰你的密码——只负责"听 AI 指令、去同花顺上点鼠标"。
 
-## 架构
+接入后，你可以直接对 AI 说：
 
-trader 出站 wss 连 `guling.pro/api/trader-tunnel`，认证后服务器侧的 LLM tool 调用通过这根隧道下行。**trader 端无任何监听端口**——不需要公网入站、不需要端口转发。
-
-```
-Windows / wine 任意主机                     guling.pro (yu-agent server)
-┌─────────────────────────────────┐         ┌──────────────────────────────────┐
-│ xiadan.exe（已登录同花顺）        │         │ FastAPI                          │
-│  ↑ Win32 / pywin32              │         │  /api/trader-tunnel  (WS)         │
-│ ths/win.py                      │         │    ↓                              │
-│  ↑                              │         │  ConnectionRegistry              │
-│ dispatcher / ws_client          │ ◀ wss ▶ │  (user, account) → ws            │
-│  ↑                              │         │    ↓                              │
-│ tray (pystray) / 配对码弹窗      │         │  trade_ths tool handlers          │
-│                                 │         │    ↓                              │
-│ guling-trader.exe (PyInstaller) │         │  LLM agent                        │
-└─────────────────────────────────┘         └──────────────────────────────────┘
-```
+> "帮我对手价买入 100 股贵州茅台。"
+>
+> "看一下我现在持仓，盈亏怎么样？"
+>
+> "把没成交的招商银行买单撤了。"
 
 ---
 
-## 用户安装与配对
+## 🧭 我该走哪条路？
 
-### 1. 准备环境（Windows 真机或 wine）
+三条路殊途同归，按门槛从低到高选一条即可：
+
+| 你的情况 | 路径 | 数据走向 | 难度 |
+|---|---|---|---|
+| 想最省事，且有 guling.pro 内测邀请 | [**A · 托管版**](#路径-a--gulingpro-托管版最简单) | 经 guling.pro 云 | ★ |
+| 用 openclaw / Cursor / Claude 等任意 AI | [**B · 云端自助**](#路径-b--openclaw--任意-ai-客户端云端自助) | 经 mcp.guling.pro 云 | ★★ |
+| 极客，要数据 100% 不出自己设备 | [**C · 本地直连**](#路径-c--本地直连stdio--tailscale--进阶预览--设计中) 🚧 | 仅你自己的设备 | ★★★ |
+
+> 三条路的**第一步完全一样**：先把 Windows 交易端跑起来（下一节）。之后再按你选的路径继续。
+
+---
+
+## 第一步（所有路径通用）：配好 Windows 交易端
+
+> 你需要一台 **7×24 运行的 Windows 机器**：物理机、云 VPS，或 Mac 上的虚拟机（强烈推荐 **Parallels Desktop**，极其稳定）。
+
+1. **登录同花顺**：打开同花顺独立委托客户端（`xiadan.exe`），登录你的证券账户，**界面切到"旧版"风格**，停留在下单主页面（请勿最小化窗口）。
+2. **运行交易助手**：从 [GitHub Releases](https://github.com/suny911/guling-trader/releases) 下载 `guling-trader.exe`（单文件免安装），双击运行。
+   * 首次启动会**自动静默安装图形识别环境**（Tesseract OCR），全程无感。
+   * 启动后屏幕会展示一个 **6 位数配对码**（5 分钟有效）。**记住这个码**，下一步要用。
+3. **把屏幕缩放设为 100%**：Windows 的 DPI 缩放若是 125%/150%，可能导致助手点错位置。
+
+✅ 现在交易端已在线、等待配对。往下选你的路径。
+
+---
+
+## 路径 A · guling.pro 托管版（最简单）
+
+> ⚠️ guling.pro 目前**内测中，需邀请码**。请 **私信作者** 获取邀请资格。
+
+拿到邀请、登录 guling.pro 之后，把 Windows 屏幕上的 **6 位配对码**连同一句话发给 guling.pro 的助手，例如：
+
+> "帮我绑定交易助手，配对码是 482-739。"
+
+绑定成功即可直接用自然语言交易。**你不需要自己配置任何 MCP 客户端**——托管助手已经接好了一切。
+
+---
+
+## 路径 B · openclaw / 任意 AI 客户端（云端自助）
+
+适用于 openclaw、Cursor、Claude Desktop 等任何支持 MCP 的 AI。你几乎不用动手——把活交给 AI：
+
+把下面这个网址连同一句话发给你的 AI 助手：
+
+> `https://mcp.guling.pro`
+>
+> "照这个文档帮我接入股灵交易。"
+
+AI 会自动抓取该网址里的安装向导，一步步带你完成：**用 6 位码换永久凭证 → 把 MCP 服务器挂到你的客户端 → 跑通验证**。这个网址就是唯一入口和权威步骤来源，README 不再重复细节（以免过时）。
+
+> **背后原理（一句话）**：向 `https://mcp.guling.pro/pair` 用 6 位码换一个永久 `agent_token`，再带请求头 `Authorization: Bearer <token>` 把 MCP 服务器 `https://mcp.guling.pro` 挂上，即已配对。
+>
+> **为什么要经过 `mcp.guling.pro`？** 你家里的 Windows 交易端和你的 AI 客户端通常各自在内网，彼此找不到对方——需要一台**有公网地址的服务器**当"汇合中转点"。自己买公网服务器对多数人太麻烦，所以 **guling.pro 免费提供了这条中转隧道**（`mcp.guling.pro`）当现成的汇合点，方便大家直接用：它只**加密转发**你的鼠标键盘操作指令，让你免去自建公网服务器，开箱即用、安全又简单。
+>
+> 如果连这条公益隧道也不想经过、要数据 **100% 不出自己设备**，请走下面的 [路径 C](#路径-c--本地直连stdio--tailscale--进阶预览--设计中)。
+
+---
+
+## 路径 C · 本地直连（stdio + Tailscale）— 🚧 进阶预览 / 设计中
+
+> **状态：设计已定，relay 代码尚未入库。** 本节为预览，落地后转正。完整设计见 [`docs/local_only_stdio_mcp_setup.md`](docs/local_only_stdio_mcp_setup.md)。
+
+面向对隐私要求最高的用户：**交易数据全程不经过任何云服务器**。
+
+* **拓扑**：Windows 交易端 ↔ 你的 Mac（通过 [Tailscale](https://tailscale.com/) 私有内网直连）；Mac 上的 AI（Cursor / Claude / openclaw）通过本地 **stdio** 与一个轻量 relay 进程通信，全程不出你的设备。
+* **我们提供**：一个 `mcp/` 文件夹 + Python relay 脚本（`mcp_local_relay.py`），帮你在本地把 stdio ↔ WS 桥接起来。
+* **你需要自己做**：安装并组好 Tailscale 网络；编辑交易端配置文件（正式 exe 在**与 `guling-trader.exe` 同级**的 `guling-trader-data\config.json`），把 `ws_endpoint` 填成你 Mac 的 Tailscale 地址即可——**只填域名或 IP[:端口]，无需写协议和路径**，例如：
+  ```json
+  { "ws_endpoint": "100.x.x.x:8080" }
+  ```
+
+### TODO（路径 C 落地清单）
+
+- [ ] 新增 `mcp/` 目录与 `mcp_local_relay.py`（stdio ↔ 本地 WS 桥接）
+- [ ] relay 的安装/运行说明，以及与 Cursor / Claude / openclaw 的 stdio 对接示例
+- [ ] Tailscale 内网端到端联调，并把本节从"预览"转正
+
+---
+
+## 🔒 安全设计
+
+* **🔑 不碰密码**：你在同花顺官方软件上自行登录，本助手仅模拟键鼠操作，不接触任何账号和交易密码。
+* **🛡️ 纯主动连出**：不监听任何端口、不需要端口转发，像浏览器一样主动向外建立加密连接，防范外界入侵。
+* **⏹️ 一键切断**：随时关闭同花顺或本助手，或右键托盘选择"解除配对"，即可彻底断开 AI 控制。
+
+---
+
+## ⚠️ 常见问题
+
+<details>
+<summary><b>验证码识别失败？</b></summary>
+
+首次启动会自动安装 Tesseract OCR。若自动安装因网络问题失败，手动在 PowerShell（管理员）中执行：
 
 ```powershell
-winget install Python.Python.3.11
 winget install UB-Mannheim.TesseractOCR
 ```
 
-mac mini / Linux 用户：装 [CrossOver](https://www.codeweavers.com/crossover) 或 wine，在 wine prefix 里完成上面两步。**不保证所有 wine 配置都能跑 xiadan.exe**——用 `--diagnose` 模式自验（下方）。
+然后重启交易助手。
 
-### 2. 下载 guling-trader.exe
+</details>
 
-从 [GitHub Releases](https://github.com/suny911/guling-trader/releases) 拿最新版本（每个 tag 自动 build）。
+<details>
+<summary><b>发了交易命令同花顺没反应？</b></summary>
 
-或本地编译：
+请确认 Windows 的**屏幕 DPI 缩放比例为 100%**。125% 或 150% 的放大可能导致助手点错位置。
+
+</details>
+
+<details>
+<summary><b>可以锁屏或最小化远程桌面窗口吗？</b></summary>
+
+不可以。如果使用 RDP 远程桌面，关闭/最小化窗口会导致 Windows 停止屏幕渲染，助手无法截图和模拟点击。请保持远程桌面窗口处于打开状态。
+
+</details>
+
+<details>
+<summary><b>AI 客户端重启后又要重新配对？</b></summary>
+
+说明永久凭证没写进配置。确保 MCP 配置里带上了 `Authorization: Bearer <你的 agent_token>` 请求头（路径 B 的换码返回里会给到），而不是只在某次会话里临时生效。
+
+</details>
+
+---
+
+<details>
+<summary>💻 开发者附录 (Developer's Annex — 点击展开)</summary>
+
+### MCP 工具接口
+
+结构定义见 `docs/tools_schema.json`；配对成功后解锁全部 8 个交易工具：
+
+| 工具 | 说明 | 关键参数 |
+|------|------|---------|
+| `balance` | 查询资金余额 | — |
+| `position` | 获取持仓列表 | — |
+| `orders_active` | 当日未成交委托 | — |
+| `orders_filled` | 当日已成交记录 | — |
+| `settlement` | 交割单 | `date_range`: 近一周/近一月/近三月/近一年 |
+| `buy` | **买入（实盘）** | `stock_no`, `amount`, `price`(可选), `client_order_id`(可选) |
+| `sell` | **卖出（实盘）** | `stock_no`, `amount`, `price`(可选), `client_order_id`(可选) |
+| `cancel` | 撤销未成交单 | `entrust_no` |
+
+> 未配对状态下仅暴露 `pair_with_code` 一个工具（聊天内配对的后备方式）；路径 B 推荐用 `/pair` 换码在前的方式。完整帧协议（握手 / call / reply / reject / 心跳）见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
+
+### 本地编译与打包
 
 ```powershell
-git clone https://github.com/suny911/guling-trader.git
-cd guling-trader
 pip install -e .[build]
 pyinstaller --onefile --windowed --name guling-trader -m trader
-# 产物：dist\guling-trader.exe
+# 产物输出于 dist\guling-trader.exe
 ```
 
-### 3. 登录同花顺
-
-启动 xiadan.exe → 登录你的券商账户 → 切换到「旧版」交易客户端（控件 ID 是按旧版逆向的）→ 停在主页。
-
-### 4. 启动 trader 并配对
-
-```powershell
-.\guling-trader.exe
-```
-
-托盘右下角出现 guling-trader 图标，状态色：
-- 灰 = UNPAIRED / DISCONNECTED
-- 黄 = DIALING / AWAITING_BIND
-- 绿 = CONNECTED
-- 红 = fatal（token 被 reject / account 被远程 remove / xiadan 进程异常）
-
-**首次配对**：
-
-1. 右键 tray → 「配对码...」→ 弹窗显示 6 位码 `XXX-YYY` + 5 分钟倒计时 + 一键复制
-2. 复制码到 [guling.pro](https://guling.pro) 对话窗，告诉 agent：
-   ```
-   加交易终端 482-739
-   或：加交易终端 482-739，名字叫 主账户
-   ```
-3. agent 调 `add_trading_account` tool → 服务器派 agent_token → trader 转绿
-4. 之后任何调下单 / 查询 tool（`ths_buy / ths_balance / ths_position` 等）都通过这台 trader
-
-**重启**：trader 重启后自动用持久化的 `agent_token` resume，**不再需要重新配对**。
-
-### 5. 验证
-
-guling.pro 对话窗问 agent：
-```
-列出我的交易账户
-查我账户1的余额
-```
-
-应能看到账户在线状态 + 余额数字。
+</details>
 
 ---
 
-## --diagnose 模式（wine 兼容性自验）
+## 🤝 致谢与开源协议
 
-```powershell
-.\guling-trader.exe --diagnose
-```
-
-不连服务器，只跑本地 Win32 检测：
-
-- ✓/✗ xiadan.exe 窗口是否找到
-- ✓/✗ tesseract 是否可调
-- ✓/✗ balance() 是否能返回数据（验证基础 Win32 控件可达）
-- ✓/✗ position() 是否能返回数据
-
-常见问题：
-- xiadan.exe 找不到 → 确认登录 + 切到「旧版」 + 主页面 active
-- tesseract 找不到 → `winget install UB-Mannheim.TesseractOCR` 或手动指定路径
-- 控件 ID 不匹配 → 你不是申万宏源券商，需要对照 `ths/const.py` 调整
+* 基于 **GPL-3.0-or-later** 协议开源，继承上游 [crazyAttributor/ths-auto-trade](https://github.com/crazyAttributor/ths-auto-trade) 协议约束。
+* 核心控制库 `src/trader/ths/win.py` 中对同花顺 `xiadan.exe` 经数万次试错摸索出的控件序列、句柄哈希及 OCR 偏移坐标，**全部完整保留并致以最高敬意**。
 
 ---
 
-## 风险与限制
+## ⚠️ 风险免责声明
 
-- **控件 ID 强绑定**：基于申万宏源 + 同花顺旧版 xiadan 验证。换券商 / 新版客户端会失效
-- **OCR 弹窗坐标**：写死在 `ths/win.py`，DPI 必须 100%
-- **RDP 锁屏 = 失效**：保持 RDP 窗口不最小化，或用 `tscon` 把 session 转 console
-- **agent_token**：明文存在你机器的 `%APPDATA%\guling-trader\config.json`，机器被入侵即泄露
-- **Mac 原生不支持**：trader 跑 mac 显示 tray 但 ths backend 抛 NotImplementedError。Mac 用户走 wine（CrossOver / wine prefix）
-
----
-
-## 开发
-
-```
-src/trader/
-├── main.py            # 启动入口 + argparse
-├── config.py          # config.json 读写
-├── bootstrap.py       # 首次启动：生成 device_id、找 xiadan/tesseract
-├── ws_client.py       # WebSocket 客户端 + 状态机 + 重连
-├── handshake.py       # pair_init / resume 握手
-├── dispatcher.py      # 收 server call frame → backend method → 发 reply
-├── tray.py            # pystray Icon + 菜单 + 状态色
-├── ui_dialogs.py      # tkinter 配对码弹窗 / 状态窗
-└── ths/
-    ├── const.py       # 按键码表 + 控件 ID 常量
-    └── win.py         # WinThsBackend：994 行 Win32 实装 + async wrapper
-```
-
-### CI
-
-`.github/workflows/build.yml` — push tag `v*` 自动在 windows-latest runner 上 PyInstaller 打包 + 发 GitHub Release（含 sha256）。手动触发用 workflow_dispatch（仅产 artifact，不发 release）。
-
-### 协议契约
-
-trader ↔ server 信道协议（hello/pair_init/bind_ok/welcome/reject/call/reply/event 帧格式）定义在 server 侧的 [PH-061 spec](https://github.com/suny911/guling-trader/blob/main/docs/PROTOCOL.md)（待提取）。本仓只实现 client 端，server 端独立维护。
-
----
-
-## License & 致谢
-
-**GPL-3.0-or-later** — 与上游 [crazyAttributor/ths-auto-trade](https://github.com/crazyAttributor/ths-auto-trade) 保持一致（GPL 传染性）。
-
-`src/trader/ths/win.py` 的 Win32 控件 ID、F1/F2/F8 热键序列、OCR 截图坐标全部来自上游——这些是作者对着申万宏源 xiadan.exe 试错试出来的经验数据，是这套代码真正的价值，我们没有重写也无意 reinvent。换券商可能需要调整控件 ID。
+**本软件仅供技术交流及模拟测试使用**，不构成任何投资建议。用户因配置不当、DPI 缩放偏移、网络延迟、大模型幻觉下单等导致的任何资产亏损，**作者及开源贡献者不承担任何责任**。实盘前请务必使用 `--diagnose` 诊断命令自验，并在小资金账户完成充分测试。

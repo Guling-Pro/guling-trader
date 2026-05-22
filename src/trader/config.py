@@ -16,6 +16,7 @@ class TraderConfig:
     account_name: Optional[str] = None
     paired_at: Optional[str] = None
     xiadan_path_manual: Optional[str] = None  # 用户手动指定的 xiadan.exe 路径
+    ws_endpoint: Optional[str] = None  # 自定义中转地址：只填域名或 IP[:端口]，协议和路径自动补全
 
     def has_paired(self) -> bool:
         """检查是否已配对"""
@@ -102,6 +103,7 @@ def save(config: TraderConfig) -> None:
         "account_name": config.account_name,
         "paired_at": config.paired_at,
         "xiadan_path_manual": config.xiadan_path_manual,
+        "ws_endpoint": config.ws_endpoint,
     }
 
     with open(config_path, "w", encoding="utf-8") as f:

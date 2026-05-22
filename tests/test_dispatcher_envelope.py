@@ -156,3 +156,48 @@ def test_buy_params_forwarded_to_backend():
     name, args = backend.calls[-1]
     assert name == "sell"
     assert args == ("300459", 100, None)   # price 缺省 → None（市价语义）
+
+
+def test_tools_list_returns_correct_schema():
+    """验证 tools/list 返回完整的工具 Schema。"""
+    frame = {"type": "call", "id": "t1", "method": "tools/list", "params": {}}
+    reply, backend = _call(frame, {"code": 0})
+    
+    assert reply["ok"] is True
+    assert reply["id"] == "t1"
+    assert "tools" in reply["result"]
+    
+    tools = reply["result"]["tools"]
+    assert len(tools) > 0
+    # 验证 whitelisted 方法在 tools 中都有对应项
+    tool_names = {t["name"] for t in tools}
+    assert "balance" in tool_names
+    assert "position" in tool_names
+    assert "orders_active" in tool_names
+    assert "orders_filled" in tool_names
+    assert "settlement" in tool_names
+    assert "buy" in tool_names
+    assert "sell" in tool_names
+    assert "cancel" in tool_names
+    
+    # 确保没有多余的 code 字段嵌套在 result 中
+    assert "code" not in reply["result"]
+
+
+def test_fallback_schema_matches_file_schema():
+    """验证内置的 FALLBACK_TOOLS_SCHEMA 与 docs/tools_schema.json 完全一致，防止三源漂移"""
+    import json
+    from pathlib import Path
+    
+    root = Path(__file__).resolve().parent.parent
+    schema_path = root / "docs" / "tools_schema.json"
+    
+    assert schema_path.exists(), "docs/tools_schema.json 文件不存在！"
+    
+    with open(schema_path, "r", encoding="utf-8") as f:
+        file_schema = json.load(f)
+        
+    assert dispatcher.FALLBACK_TOOLS_SCHEMA["tools"] == file_schema["tools"], (
+        "内置 FALLBACK_TOOLS_SCHEMA 的 tools 列表与 docs/tools_schema.json 的 tools 列表不一致！"
+        "更新接口定义时请确保两处同步修改。"
+    )

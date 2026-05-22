@@ -21,6 +21,7 @@ build/
 *.swp
 *~
 .DS_Store
+.superpowers/
 
 # Local config (contains agent_token plaintext per PH-061)
 # Users' personal install state — never committed

@@ -39,6 +39,7 @@ class SharedState:
     ths_steps_complete: int = 0  # [0..4] 已完成的 THS 步数
     ths_expanded: bool = True  # THS 区展开/折叠
     ths_refreshing: bool = False  # 配对码过期·正在刷新中
+    agent_token: Optional[str] = None  # 永久凭证（仅 CONNECTED 时有用）
     log_messages: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=500))
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -61,6 +62,7 @@ class SharedState:
                 "ths_steps_complete": self.ths_steps_complete,
                 "ths_expanded": self.ths_expanded,
                 "ths_refreshing": self.ths_refreshing,
+                "agent_token": self.agent_token,
             }
 
     def log(self, message: str) -> None:
@@ -185,6 +187,12 @@ class MainWindow:
             status_frame, text="解除绑定", command=self._unbind_account
         )
         self.btn_unbind.pack(side="right")
+
+        # 「复制 Token」按钮（仅 CONNECTED 且有 token 时可见）
+        self.btn_copy_token = ttk.Button(
+            status_frame, text="复制 Token", command=self._copy_agent_token
+        )
+        self.btn_copy_token.pack(side="right", padx=(0, 6))
 
         # ---- 配对码区（两个互斥视图）----
         # 容器 frame，用于 pack_forget/pack
@@ -395,11 +403,17 @@ class MainWindow:
         # 账户名
         self.account_label.config(text=f"账户：{snap['account_name']}" if snap["account_name"] else "")
 
-        # 「解除绑定」仅 CONNECTED 时可见
-        if cs == "CONNECTED" and not self.btn_unbind.winfo_ismapped():
-            self.btn_unbind.pack(side="right")
-        elif cs != "CONNECTED" and self.btn_unbind.winfo_ismapped():
-            self.btn_unbind.pack_forget()
+        # 「解除绑定」与「复制 Token」仅 CONNECTED 时可见
+        if cs == "CONNECTED":
+            if not self.btn_unbind.winfo_ismapped():
+                self.btn_unbind.pack(side="right")
+            if snap.get("agent_token") and not self.btn_copy_token.winfo_ismapped():
+                self.btn_copy_token.pack(side="right", padx=(0, 6))
+        else:
+            if self.btn_unbind.winfo_ismapped():
+                self.btn_unbind.pack_forget()
+            if self.btn_copy_token.winfo_ismapped():
+                self.btn_copy_token.pack_forget()
 
         # 配对码区显示/隐藏（用 winfo_ismapped 避免依赖 boolean flag）
         is_connected = (cs == "CONNECTED")
@@ -526,6 +540,16 @@ class MainWindow:
         self.root.clipboard_clear()
         self.root.clipboard_append(snap["pairing_code"])
         self.state.log(f"已复制配对码 {snap['pairing_code']} 到剪贴板")
+
+    def _copy_agent_token(self) -> None:
+        """复制 agent_token 到剪贴板"""
+        snap = self.state.snapshot()
+        token = snap.get("agent_token")
+        if not token:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(token)
+        self.state.log("已复制持久凭证 Token 到剪贴板")
 
     def _unbind_account(self) -> None:
         """解除绑定按钮回调"""

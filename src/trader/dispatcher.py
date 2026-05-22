@@ -1,13 +1,165 @@
 """RPC 分派：call frame → backend method → reply frame"""
 import json
 import logging
+from pathlib import Path
 from typing import Any, Optional
 
 from .ths.win import WinThsBackend
 
 logger = logging.getLogger(__name__)
 
-METHOD_WHITELIST = {"balance", "position", "orders_active", "orders_filled", "settlement", "buy", "sell", "cancel"}
+# Fallback tools schema in case the external JSON file cannot be found (e.g., in a packaged PyInstaller environment)
+FALLBACK_TOOLS_SCHEMA = {
+  "tools": [
+    {
+      "name": "balance",
+      "description": "查询资金账户余额（包括资金余额、可用资金、可取资金、股票市值、总资产、当日盈亏等）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False
+      }
+    },
+    {
+      "name": "position",
+      "description": "查询当前股票持仓。返回持仓列表，包含证券代码、证券名称、股票余额、可用余额、成本价、市价、盈亏等字段。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False
+      }
+    },
+    {
+      "name": "orders_active",
+      "description": "查询当日未成交的委托单列表（可用于撤单），包含委托编号(entrust_no)、证券代码、证券名称、委托数量、委托价格、委托方向、委托状态等字段。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False
+      }
+    },
+    {
+      "name": "orders_filled",
+      "description": "查询当日已成交的委托单历史记录，包含委托编号、成交编号、证券代码、证券名称、成交数量、成交均价、成交金额等字段。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False
+      }
+    },
+    {
+      "name": "settlement",
+      "description": "查询交割单（历史成交结算记录，含更完整的日期、代码、名称、操作、数量、均价、金额、发生金额、手续费、印花税等）。数据量可能较大，适合偶尔做整体盈亏/交易复盘分析。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "date_range": {
+            "type": "string",
+            "description": "查询的时间跨度，可选值：近一周、近一月、近三月、近一年；默认近一年",
+            "enum": ["近一周", "近一月", "近三月", "近一年"],
+            "default": "近一年"
+          }
+        },
+        "additionalProperties": False
+      }
+    },
+    {
+      "name": "buy",
+      "description": "下买入委托单。**会真实下单**，慎重调用。返回包含委托编号 entrust_no。不传 price 则按市价下单。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "stock_no": {
+            "type": "string",
+            "description": "6位数字股票代码，如 600000"
+          },
+          "amount": {
+            "type": "integer",
+            "description": "买入股数（必须为 100 股的整数倍）"
+          },
+          "price": {
+            "type": "number",
+            "description": "限价买入价格。不传则按同花顺客户端对手价市价单执行"
+          },
+          "client_order_id": {
+            "type": "string",
+            "description": "可选的客户端自定义订单 ID"
+          }
+        },
+        "required": ["stock_no", "amount"],
+        "additionalProperties": False
+      }
+    },
+    {
+      "name": "sell",
+      "description": "下卖出委托单。**会真实下单**，慎重调用。返回包含委托编号 entrust_no。不传 price 则按市价下单。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "stock_no": {
+            "type": "string",
+            "description": "6位数字股票代码，如 600000"
+          },
+          "amount": {
+            "type": "integer",
+            "description": "卖出股数"
+          },
+          "price": {
+            "type": "number",
+            "description": "限价卖出价格。不传则按同花顺客户端对手价市价单执行"
+          },
+          "client_order_id": {
+            "type": "string",
+            "description": "可选的客户端自定义订单 ID"
+          }
+        },
+        "required": ["stock_no", "amount"],
+        "additionalProperties": False
+      }
+    },
+    {
+      "name": "cancel",
+      "description": "撤销指定委托编号的未成交订单。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "entrust_no": {
+            "type": "string",
+            "description": "要撤销的委托编号（从 orders_active 中获取）"
+          }
+        },
+        "required": ["entrust_no"],
+        "additionalProperties": False
+      }
+    }
+  ]
+}
+
+def load_tools_schema() -> dict[str, Any]:
+    """尝试从 docs/tools_schema.json 加载工具定义，如失败则使用内置 Fallback 保证打包后的 .exe 也能正常运行"""
+    try:
+        # __file__ 是 src/trader/dispatcher.py，项目根目录是其三级父目录
+        root = Path(__file__).resolve().parent.parent.parent
+        schema_path = root / "docs" / "tools_schema.json"
+        if schema_path.exists():
+            with open(schema_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning("从文件系统加载 tools_schema.json 失败（可能在 PyInstaller 打包环境中运行）：%s", e)
+    
+    return FALLBACK_TOOLS_SCHEMA
+
+METHOD_WHITELIST = {
+    "tools/list",
+    "balance",
+    "position",
+    "orders_active",
+    "orders_filled",
+    "settlement",
+    "buy",
+    "sell",
+    "cancel",
+}
 
 
 async def handle_call(
@@ -24,6 +176,13 @@ async def handle_call(
     if method not in METHOD_WHITELIST:
         reply["ok"] = False
         reply["error"] = f"方法 '{method}' 不支持"
+        return reply
+
+    if method == "tools/list":
+        logger.info("[RPC] method=tools/list, frame_id=%s", frame_id)
+        schema = load_tools_schema()
+        reply["ok"] = True
+        reply["result"] = {"tools": schema.get("tools", [])}
         return reply
 
     try:

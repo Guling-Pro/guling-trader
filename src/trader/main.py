@@ -268,7 +268,12 @@ async def _async_main(
     # Step 4: WS 连接
     def on_ws_state_change(s) -> None:
         s_name = s.name if hasattr(s, "name") else str(s)
-        state.update(connection_state=s_name)
+        cfg = trader_config.load()
+        state.update(
+            connection_state=s_name,
+            account_name=cfg.account_name or "",
+            agent_token=cfg.agent_token or None,
+        )
         state.log(f"连接状态: {s_name}")
         if tray_manager is not None:
             try:
@@ -304,7 +309,7 @@ async def _async_main(
         state.update(pairing_code=code, pairing_expires_at=exp_ts, ths_refreshing=False)
         state.log(f"✓ 收到配对码：{code}，5 分钟内有效")
 
-    state.log("连接 guling.pro...")
+    state.log("连接服务器...")
     client = ws_client.WsClient(
         dev_url=os.environ.get("YU_TRADER_DEV_URL"),
         on_state_change=on_ws_state_change,
@@ -504,7 +509,11 @@ def run() -> None:
         sys.exit(1)
 
     state = SharedState()
-    state.update(xiadan_path=result.found_xiadan_path)
+    state.update(
+        xiadan_path=result.found_xiadan_path,
+        account_name=result.config.account_name or "",
+        agent_token=result.config.agent_token or None,
+    )
 
     def on_open_xiadan() -> None:
         # 优先用 state 里的（可能已通过 redetect / set_path 更新），fallback bootstrap result

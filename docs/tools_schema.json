@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12",
+  "version": "1.0.0",
+  "tools": [
+    {
+      "name": "balance",
+      "description": "查询资金账户余额（包括资金余额、可用资金、可取资金、股票市值、总资产、当日盈亏等）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "position",
+      "description": "查询当前股票持仓。返回持仓列表，包含证券代码、证券名称、股票余额、可用余额、成本价、市价、盈亏等字段。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "orders_active",
+      "description": "查询当日未成交的委托单列表（可用于撤单），包含委托编号(entrust_no)、证券代码、证券名称、委托数量、委托价格、委托方向、委托状态等字段。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "orders_filled",
+      "description": "查询当日已成交的委托单历史记录，包含委托编号、成交编号、证券代码、证券名称、成交数量、成交均价、成交金额等字段。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "settlement",
+      "description": "查询交割单（历史成交结算记录，含更完整的日期、代码、名称、操作、数量、均价、金额、发生金额、手续费、印花税等）。数据量可能较大，适合偶尔做整体盈亏/交易复盘分析。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "date_range": {
+            "type": "string",
+            "description": "查询的时间跨度，可选值：近一周、近一月、近三月、近一年；默认近一年",
+            "enum": ["近一周", "近一月", "近三月", "近一年"],
+            "default": "近一年"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "buy",
+      "description": "下买入委托单。**会真实下单**，慎重调用。返回包含委托编号 entrust_no。不传 price 则按市价下单。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "stock_no": {
+            "type": "string",
+            "description": "6位数字股票代码，如 600000"
+          },
+          "amount": {
+            "type": "integer",
+            "description": "买入股数（必须为 100 股的整数倍）"
+          },
+          "price": {
+            "type": "number",
+            "description": "限价买入价格。不传则按同花顺客户端对手价市价单执行"
+          },
+          "client_order_id": {
+            "type": "string",
+            "description": "可选的客户端自定义订单 ID"
+          }
+        },
+        "required": ["stock_no", "amount"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "sell",
+      "description": "下卖出委托单。**会真实下单**，慎重调用。返回包含委托编号 entrust_no。不传 price 则按市价下单。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "stock_no": {
+            "type": "string",
+            "description": "6位数字股票代码，如 600000"
+          },
+          "amount": {
+            "type": "integer",
+            "description": "卖出股数"
+          },
+          "price": {
+            "type": "number",
+            "description": "限价卖出价格。不传则按同花顺客户端对手价市价单执行"
+          },
+          "client_order_id": {
+            "type": "string",
+            "description": "可选的客户端自定义订单 ID"
+          }
+        },
+        "required": ["stock_no", "amount"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "cancel",
+      "description": "撤销指定委托编号的未成交订单。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "entrust_no": {
+            "type": "string",
+            "description": "要撤销的委托编号（从 orders_active 中获取）"
+          }
+        },
+        "required": ["entrust_no"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
