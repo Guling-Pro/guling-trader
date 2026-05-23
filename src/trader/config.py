@@ -1,8 +1,5 @@
 """配置文件读写：device_id, agent_token, account_name, paired_at"""
 import json
-import os
-import platform
-import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,14 +24,14 @@ def app_data_dir() -> Path:
     """便携式数据根目录（config / log / tmp 都放这里，统一管理、便于删除）。
 
     打包成 exe（PyInstaller frozen）时放在 **exe 同级** 的 ``guling-trader-data/``，
-    不再散落到系统目录或 exe 当前目录。源码运行时回退 %APPDATA%（Win）/ ~/.config。
+    源码运行时锁定在项目根目录同级的 ``guling-trader-data/``。
+    完全不进入 Windows 全局 %APPDATA% 或 ~/.config，保证极佳的可调试性与单一真相源。
     """
     if getattr(sys, "frozen", False):
         base = Path(sys.executable).resolve().parent / "guling-trader-data"
-    elif platform.system() == "Windows":
-        base = Path(os.environ.get("APPDATA", str(Path.home()))) / "guling-trader"
     else:
-        base = Path.home() / ".config" / "guling-trader"
+        # 锁定在项目根目录同级（config.py 文件的上三级，即 /Users/sunyang/Documents/Projects/guling-trader/guling-trader-data）
+        base = Path(__file__).resolve().parents[2] / "guling-trader-data"
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -44,14 +41,6 @@ def tmp_dir() -> Path:
     d = app_data_dir() / "tmp"
     d.mkdir(parents=True, exist_ok=True)
     return d
-
-
-def _legacy_config_path() -> Optional[Path]:
-    """旧版本散落在系统目录的 config.json，用于一次性迁移（保留已配对 token）。"""
-    if platform.system() == "Windows":
-        appdata = os.environ.get("APPDATA")
-        return Path(appdata) / "guling-trader" / "config.json" if appdata else None
-    return Path.home() / ".config" / "guling-trader" / "config.json"
 
 
 def _get_config_dir() -> Path:
@@ -64,22 +53,8 @@ def _get_config_path() -> Path:
     return _get_config_dir() / "config.json"
 
 
-def _maybe_migrate_legacy() -> None:
-    """新位置无 config.json 但旧系统目录有 → 复制过来，避免升级后被迫重新配对。"""
-    new_path = _get_config_path()
-    if new_path.exists():
-        return
-    legacy = _legacy_config_path()
-    if legacy and legacy.exists() and legacy.resolve() != new_path.resolve():
-        try:
-            shutil.copy2(legacy, new_path)
-        except Exception:
-            pass
-
-
 def load() -> TraderConfig:
     """从本地加载配置，如果不存在返回空配置"""
-    _maybe_migrate_legacy()
     config_path = _get_config_path()
 
     if not config_path.exists():

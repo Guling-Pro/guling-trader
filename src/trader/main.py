@@ -21,7 +21,7 @@ from typing import Optional
 
 # ---- 文件日志 + stderr/stdout 重定向 ----
 # PyInstaller --windowed 模式 stdout/stderr 被吞掉，wine 下 print 全部消失。
-# 启动期就把所有输出写到 %APPDATA%\guling-trader\trader.log（每次启动覆盖）。
+# 启动期就把所有输出写到本地配置目录下的 trader.log（每次启动覆盖）。
 # 这是 wine/CrossOver 用户的唯一诊断渠道——异常 traceback 也会写进去。
 
 def _setup_file_logging() -> Path:

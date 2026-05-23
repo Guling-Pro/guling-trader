@@ -30,36 +30,17 @@ def test_frozen_uses_exe_sibling_dir(monkeypatch, tmp_path):
 
 
 def test_non_frozen_falls_back(monkeypatch, tmp_path):
+    from pathlib import Path
     monkeypatch.setattr(sys, "frozen", False, raising=False)
-    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     config = _reload_config()
     base = config.app_data_dir()
-    # 非 frozen：不在 exe 同级，而在系统配置目录
-    assert base != tmp_path / "guling-trader-data"
+    # 非 frozen 源码开发状态：锁定在项目根目录同级
+    expected = Path(config.__file__).resolve().parents[2] / "guling-trader-data"
+    assert base == expected
     assert base.is_dir()
 
 
-def test_legacy_config_migrated_on_frozen(monkeypatch, tmp_path):
-    # 旧系统目录有 config.json（带 agent_token），新位置没有 → 应迁移
-    appdata = tmp_path / "appdata"
-    legacy_dir = appdata / "guling-trader"
-    legacy_dir.mkdir(parents=True)
-    (legacy_dir / "config.json").write_text(
-        json.dumps({"device_id": "dev-1", "agent_token": "tok-abc"}), encoding="utf-8"
-    )
 
-    exe = tmp_path / "guling-trader.exe"
-    exe.write_text("x")
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "executable", str(exe), raising=False)
-    monkeypatch.setattr("platform.system", lambda: "Windows")
-    monkeypatch.setenv("APPDATA", str(appdata))
-
-    config = _reload_config()
-    cfg = config.load()
-    assert cfg.device_id == "dev-1"
-    assert cfg.agent_token == "tok-abc"   # 配对没丢
-    assert (tmp_path / "guling-trader-data" / "config.json").exists()
 
 
 def test_setup_routes_ocr_temp_to_work_dir(monkeypatch, tmp_path):
