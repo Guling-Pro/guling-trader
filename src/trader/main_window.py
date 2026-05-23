@@ -24,6 +24,14 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 
+def _format_pair_code(code: Optional[str]) -> str:
+    """显示用：6 位纯数字配对码 → XXX-XXX（便于与 6 位邀请码区分）。
+    存储与传输始终用纯数字；网关 /pair 与 pair_with_code 入口已统一去横杠。"""
+    if code and len(code) == 6 and code.isdigit():
+        return f"{code[:3]}-{code[3:]}"
+    return code or ""
+
+
 @dataclass
 class SharedState:
     """主线程 + asyncio 线程共享状态。需要 lock 才能安全修改。"""
@@ -463,7 +471,7 @@ class MainWindow:
                     self.pair_refreshing_frame.pack(fill="x")
                 # 更新旧配对码
                 if snap["pairing_code"]:
-                    self.pair_refresh_old_code.config(text=snap["pairing_code"])
+                    self.pair_refresh_old_code.config(text=_format_pair_code(snap["pairing_code"]))
             else:
                 # 视图 A：等待配对
                 if self.pair_refreshing_frame.winfo_ismapped():
@@ -472,9 +480,9 @@ class MainWindow:
                     self.pair_awaiting_frame.pack(fill="x")
                 # 更新配对码、倒计时和指令
                 if snap["pairing_code"]:
-                    self.pair_await_code_label.config(text=snap["pairing_code"])
-                    code = snap["pairing_code"]
-                    instruction_text = f"打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 {code}"
+                    display_code = _format_pair_code(snap["pairing_code"])
+                    self.pair_await_code_label.config(text=display_code)
+                    instruction_text = f"打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 {display_code}"
                     self.instruction_label.config(text=instruction_text)
                     if exp_at:
                         remaining = max(0, int(exp_at - now))
@@ -571,7 +579,7 @@ class MainWindow:
             self.state.log("⚠ 配对码暂无，无法复制指令")
             return
 
-        instruction = f"打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 {code}"
+        instruction = f"打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 {_format_pair_code(code)}"
         self.root.clipboard_clear()
         self.root.clipboard_append(instruction)
         self.state.log(f"已复制接入指令到剪贴板：{instruction}")
