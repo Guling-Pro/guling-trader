@@ -4,7 +4,7 @@ version = "0.4.13"
 description = "Windows 桌面客户端：通过 WS 隧道连接 guling.pro / yu-agent 并驱动同花顺独立委托客户端（xiadan.exe）执行 A 股交易"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "GPL-3.0-or-later"}
+license = {text = "AGPL-3.0-or-later"}
 authors = [
     {name = "孙洋", email = "suny911@gmail.com"},
 ]
@@ -13,7 +13,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Win32 (MS Windows)",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -38,9 +38,9 @@ build = ["pyinstaller>=6.0"]  # Windows EXE 打包
 test = ["pytest>=7.0", "pytest-asyncio>=0.21", "pytest-mock>=3.10"]  # 测试框架
 
 [project.urls]
-Homepage = "https://github.com/suny911/guling-trader"
-Repository = "https://github.com/suny911/guling-trader"
-Issues = "https://github.com/suny911/guling-trader/issues"
+Homepage = "https://github.com/Guling-Pro/guling-trader"
+Repository = "https://github.com/Guling-Pro/guling-trader"
+Issues = "https://github.com/Guling-Pro/guling-trader/issues"
 
 [project.scripts]
 guling-trader = "trader.main:run"
