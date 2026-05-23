@@ -123,6 +123,7 @@ class TrayManager:
                 pystray.MenuItem("配对码...", self._on_show_pairing_code),  # type: ignore
                 pystray.MenuItem("连接状态", self._on_show_status),  # type: ignore
                 pystray.MenuItem("打开 xiadan", self._on_open_xiadan),  # type: ignore
+                pystray.MenuItem("访问 股灵官网", self._on_visit_website),  # type: ignore
                 pystray.Menu.SEPARATOR,  # type: ignore
                 pystray.MenuItem("退出", self._on_exit),  # type: ignore
             )
@@ -172,6 +173,11 @@ class TrayManager:
                 subprocess.Popen([self.config.xiadan_path])
         except Exception as e:
             logger.error("启动 xiadan 失败：%s", e)
+
+    def _on_visit_website(self, icon: "pystray.Icon", item: "pystray.MenuItem") -> None:  # type: ignore
+        """菜单：访问官网"""
+        import webbrowser
+        webbrowser.open("https://guling.pro")
 
     def _on_exit(self, icon: "pystray.Icon", item: "pystray.MenuItem") -> None:  # type: ignore
         """菜单：退出"""

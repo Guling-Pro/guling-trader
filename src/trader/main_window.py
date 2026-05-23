@@ -251,6 +251,19 @@ class MainWindow:
         )
         ttk.Button(btn_frame, text="退出", command=self._on_close).pack(side="right")
 
+        # ---- Footer ----
+        footer_frame = ttk.Frame(self.root, padding=(12, 4, 12, 6))
+        footer_frame.pack(fill="x")
+
+        # 左侧：版本号标签
+        version_label = ttk.Label(footer_frame, text="股灵交易助手", foreground="#999", font=("Helvetica", 9))
+        version_label.pack(side="left")
+
+        # 右侧：可点击官网链接
+        website_link = ttk.Label(footer_frame, text="股灵 guling.pro ↗", foreground="#4a90e2", cursor="hand2")
+        website_link.pack(side="right")
+        website_link.bind("<Button-1>", self._on_footer_link_click)
+
     def _build_pair_awaiting_view(self, container: tk.Frame) -> None:
         """配对码区视图 A：等待配对（黄底）"""
         # 顶边线
@@ -282,18 +295,31 @@ class MainWindow:
         )
         self.pair_await_code_label.pack(pady=(6, 8))
 
-        # 底行：提示 + 复制按钮
-        bottom_row = tk.Frame(content, bg="#fffbe6")
-        bottom_row.pack(fill="x")
-
+        # 底行：新增指令区域
+        # Caption 小字
         ttk.Label(
-            bottom_row,
-            text="前往股灵pro聊天窗口输入配对码完成绑定",
+            content,
+            text="复制发给你的 AI 助手（Claude / Cursor / codex / openclaw 等），它会自动帮你接入：",
             foreground="#666",
-        ).pack(side="left", padx=(4, 0))
+            font=("Helvetica", 9),
+        ).pack(anchor="w", padx=(4, 0), pady=(4, 2))
 
+        # 指令行容器
+        instruction_row = tk.Frame(content, bg="#fffbe6")
+        instruction_row.pack(fill="x", pady=4)
+
+        # 指令标签（等宽字体）
+        self.instruction_label = ttk.Label(
+            instruction_row,
+            text="打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 （暂无）",
+            font=("Menlo", 10),
+            foreground="#222",
+        )
+        self.instruction_label.pack(side="left", padx=(4, 0))
+
+        # 复制按钮
         ttk.Button(
-            bottom_row, text="复制", command=self._copy_pairing_code
+            instruction_row, text="复制", command=self._copy_instruction_command
         ).pack(side="right")
 
     def _build_pair_refreshing_view(self, container: tk.Frame) -> None:
@@ -444,15 +470,19 @@ class MainWindow:
                     self.pair_refreshing_frame.pack_forget()
                 if not self.pair_awaiting_frame.winfo_ismapped():
                     self.pair_awaiting_frame.pack(fill="x")
-                # 更新配对码和倒计时
+                # 更新配对码、倒计时和指令
                 if snap["pairing_code"]:
                     self.pair_await_code_label.config(text=snap["pairing_code"])
+                    code = snap["pairing_code"]
+                    instruction_text = f"打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 {code}"
+                    self.instruction_label.config(text=instruction_text)
                     if exp_at:
                         remaining = max(0, int(exp_at - now))
                         m, s = divmod(remaining, 60)
                         self.pair_await_countdown.config(text=f"{m}:{s:02d} 后失效")
                 else:
                     self.pair_await_code_label.config(text="（暂无）")
+                    self.instruction_label.config(text="打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 （暂无）")
                     self.pair_await_countdown.config(text="")
 
         # THS 区视图切换（wizard/done）+ 4 步更新
@@ -533,13 +563,18 @@ class MainWindow:
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
-    def _copy_pairing_code(self) -> None:
+    def _copy_instruction_command(self) -> None:
+        """复制完整指令到剪贴板"""
         snap = self.state.snapshot()
-        if not snap["pairing_code"]:
+        code = snap.get("pairing_code", "")
+        if not code:
+            self.state.log("⚠ 配对码暂无，无法复制指令")
             return
+
+        instruction = f"打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 {code}"
         self.root.clipboard_clear()
-        self.root.clipboard_append(snap["pairing_code"])
-        self.state.log(f"已复制配对码 {snap['pairing_code']} 到剪贴板")
+        self.root.clipboard_append(instruction)
+        self.state.log(f"已复制接入指令到剪贴板：{instruction}")
 
     def _copy_agent_token(self) -> None:
         """复制 agent_token 到剪贴板"""
@@ -610,6 +645,12 @@ class MainWindow:
             msg + f"\n\n（{url} 已复制到剪贴板）",
             parent=self.root,
         )
+
+    def _on_footer_link_click(self, event=None) -> None:
+        """Footer 中的官网链接点击处理"""
+        import webbrowser
+        webbrowser.open("https://guling.pro")
+        self.state.log("打开官网：https://guling.pro")
 
     def _on_close(self) -> None:
         """关闭按钮触发：Windows tray 模式下最小化到托盘，否则真退出"""
