@@ -135,19 +135,54 @@ FALLBACK_TOOLS_SCHEMA = {
   ]
 }
 
+XUEQIU_RPA_TOOL = {
+  "name": "xueqiu_publish_review",
+  "description": "通过本地已登录的浏览器（Edge/Chrome），在雪球网发布实盘复盘、调仓日志或运营推文（安全拟真，免账号密码）",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "content": {
+        "type": "string",
+        "description": "发布的内容文案。支持包含 $个股名称(代码)$ 格式的雪球 Hashtag 标签。"
+      },
+      "semi_manual": {
+        "type": "boolean",
+        "default": True,
+        "description": "是否开启半人工模式。为 true 时在发帖框填入文案后悬停并弹窗提示用户确认；为 false 时自动点击发布。"
+      }
+    },
+    "required": ["content"],
+    "additionalProperties": False
+  }
+}
+
+from . import config as _config
+
 def load_tools_schema() -> dict[str, Any]:
     """尝试从 docs/tools_schema.json 加载工具定义，如失败则使用内置 Fallback 保证打包后的 .exe 也能正常运行"""
+    cfg = _config.load()
+    schema = None
     try:
         # __file__ 是 src/trader/dispatcher.py，项目根目录是其三级父目录
         root = Path(__file__).resolve().parent.parent.parent
         schema_path = root / "docs" / "tools_schema.json"
         if schema_path.exists():
             with open(schema_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                schema = json.load(f)
     except Exception as e:
         logger.warning("从文件系统加载 tools_schema.json 失败（可能在 PyInstaller 打包环境中运行）：%s", e)
     
-    return FALLBACK_TOOLS_SCHEMA
+    if schema is None:
+        schema = json.loads(json.dumps(FALLBACK_TOOLS_SCHEMA))
+
+    if not cfg.enable_ths_plugin:
+        trading_names = {"balance", "position", "orders_active", "orders_filled", "settlement", "buy", "sell", "cancel"}
+        schema["tools"] = [t for t in schema["tools"] if t.get("name") not in trading_names]
+
+    if cfg.enable_rpa_suite:
+        schema["tools"].append(XUEQIU_RPA_TOOL)
+
+    return schema
 
 METHOD_WHITELIST = {
     "tools/list",
@@ -159,6 +194,7 @@ METHOD_WHITELIST = {
     "buy",
     "sell",
     "cancel",
+    "xueqiu_publish_review",
 }
 
 
@@ -183,6 +219,23 @@ async def handle_call(
         schema = load_tools_schema()
         reply["ok"] = True
         reply["result"] = {"tools": schema.get("tools", [])}
+        return reply
+
+    # 针对插件禁用状态的请求拦截
+    cfg = _config.load()
+    trading_methods = {
+        "balance",
+        "position",
+        "orders_active",
+        "orders_filled",
+        "settlement",
+        "buy",
+        "sell",
+        "cancel",
+    }
+    if method in trading_methods and not cfg.enable_ths_plugin:
+        reply["ok"] = False
+        reply["error"] = "同花顺实盘交易插件已被禁用，请在客户端界面中开启该插件模块！"
         return reply
 
     try:
@@ -213,6 +266,15 @@ async def handle_call(
         elif method == "cancel":
             entrust_no = params.get("entrust_no")
             result = await backend.cancel(entrust_no)
+        elif method == "xueqiu_publish_review":
+            if not cfg.enable_rpa_suite:
+                result = {"code": 1, "error": "RPA 模块未启用，请先开启配置中的 enable_rpa_suite 开关"}
+            else:
+                from .rpa.xueqiu import XueqiuRpaBackend
+                content = params.get("content")
+                semi_manual = params.get("semi_manual", True)
+                rpa_backend = XueqiuRpaBackend()
+                result = await rpa_backend.publish_review(content, semi_manual)
         else:
             result = {"code": 1, "error": "内部错误"}
 

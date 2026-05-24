@@ -11,13 +11,32 @@ async def test_resolve_redirect_with_location():
     """测试重定向解析"""
     from trader.installer import download
 
-    mock_resp = AsyncMock()
-    mock_resp.status = 302
-    mock_resp.headers = {"Location": "https://sp.thsi.cn/THS_v9.50.90_build.exe"}
+    class MockResponse:
+        def __init__(self):
+            self.status = 302
+            self.headers = {"Location": "https://sp.thsi.cn/THS_v9.50.90_build.exe"}
 
-    mock_session = AsyncMock()
-    mock_session.head.return_value.__aenter__.return_value = mock_resp
-    mock_session.head.return_value.__aexit__.return_value = None
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    class MockSession:
+        def __init__(self, resp):
+            self.resp = resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        def head(self, *args, **kwargs):
+            return self.resp
+
+    mock_resp = MockResponse()
+    mock_session = MockSession(mock_resp)
 
     with patch("aiohttp.ClientSession", return_value=mock_session):
         result = await download.resolve_redirect("https://download.10jqka.com.cn/index/download/id/7/")
@@ -29,13 +48,32 @@ async def test_resolve_redirect_no_redirect():
     """测试无重定向情况"""
     from trader.installer import download
 
-    mock_resp = AsyncMock()
-    mock_resp.status = 200
-    mock_resp.headers = {}
+    class MockResponse:
+        def __init__(self):
+            self.status = 200
+            self.headers = {}
 
-    mock_session = AsyncMock()
-    mock_session.head.return_value.__aenter__.return_value = mock_resp
-    mock_session.head.return_value.__aexit__.return_value = None
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    class MockSession:
+        def __init__(self, resp):
+            self.resp = resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        def head(self, *args, **kwargs):
+            return self.resp
+
+    mock_resp = MockResponse()
+    mock_session = MockSession(mock_resp)
 
     with patch("aiohttp.ClientSession", return_value=mock_session):
         result = await download.resolve_redirect("https://example.com/file.exe")
@@ -53,20 +91,37 @@ async def test_download_with_progress():
     def on_progress(done, total):
         progress_calls.append((done, total))
 
-    mock_resp = AsyncMock()
-    mock_resp.status = 200
-    mock_resp.headers = {"Content-Length": "100"}
+    class MockResponse:
+        def __init__(self):
+            self.status = 200
+            self.headers = {"Content-Length": "100"}
+            self.content = self
 
-    async def mock_iter_chunked(size):
-        yield b"x" * 50
-        yield b"x" * 50
+        async def iter_chunked(self, size):
+            yield b"x" * 50
+            yield b"x" * 50
 
-    mock_resp.content = AsyncMock()
-    mock_resp.content.iter_chunked = mock_iter_chunked
+        async def __aenter__(self):
+            return self
 
-    mock_session = AsyncMock()
-    mock_session.get.return_value.__aenter__.return_value = mock_resp
-    mock_session.get.return_value.__aexit__.return_value = None
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    class MockSession:
+        def __init__(self, resp):
+            self.resp = resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        def get(self, *args, **kwargs):
+            return self.resp
+
+    mock_resp = MockResponse()
+    mock_session = MockSession(mock_resp)
 
     with patch("aiohttp.ClientSession", return_value=mock_session), \
          patch("builtins.open", create=True) as mock_open:
@@ -94,10 +149,11 @@ async def test_verify_sha256_match():
 
     test_file = Path("/tmp/test.exe")
 
-    with patch("pathlib.Path.open", create=True) as mock_open, \
+    with patch("builtins.open", create=True) as mock_open, \
          patch("hashlib.sha256") as mock_hash:
 
         mock_file = MagicMock()
+        mock_file.read.return_value = b""
         mock_open.return_value.__enter__.return_value = mock_file
         mock_open.return_value.__exit__.return_value = None
 
@@ -120,8 +176,13 @@ async def test_verify_sha256_mismatch():
 
     test_file = Path("/tmp/test.exe")
 
-    with patch("pathlib.Path.open", create=True), \
+    with patch("builtins.open", create=True) as mock_open, \
          patch("hashlib.sha256") as mock_hash:
+
+        mock_file = MagicMock()
+        mock_file.read.return_value = b""
+        mock_open.return_value.__enter__.return_value = mock_file
+        mock_open.return_value.__exit__.return_value = None
 
         mock_hash_obj = MagicMock()
         mock_hash_obj.hexdigest.return_value = "abc123"

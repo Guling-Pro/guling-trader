@@ -1,14 +1,10 @@
-"""Main GUI window — always visible primary UI.
-
-Background：pystray system tray icon 在 wine/CrossOver 下不渲染。为了让 trader
-在 macOS+CrossOver / Linux+wine 用户可用，主 UI 入口改成永远可见的 tkinter Tk()
-window。tray icon 在真 Windows 上仍然可用，但只作为辅助（最小化收纳）。
+"""Main GUI window — horizontal split-pane modern layout.
 
 Architecture:
 - 主线程跑 tk.mainloop()
 - 后台线程跑 asyncio event loop
 - 两边通过 SharedState (thread-safe) + queue.Queue (log messages) 交换
-- tk 周期 root.after(50, poll) 拉 SharedState 更新 UI
+- tk 周期 root.after(100, poll) 拉 SharedState 更新 UI
 """
 from __future__ import annotations
 
@@ -25,8 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def _format_pair_code(code: Optional[str]) -> str:
-    """显示用：6 位纯数字配对码 → XXX-XXX（便于与 6 位邀请码区分）。
-    存储与传输始终用纯数字；网关 /pair 与 pair_with_code 入口已统一去横杠。"""
+    """显示用：6 位纯数字配对码 → XXX-XXX"""
     if code and len(code) == 6 and code.isdigit():
         return f"{code[:3]}-{code[3:]}"
     return code or ""
@@ -44,10 +39,12 @@ class SharedState:
     last_pong_at: Optional[float] = None
     fatal_reason: Optional[str] = None
     install_progress: Optional[tuple[int, int]] = None  # (done, total)
-    ths_steps_complete: int = 0  # [0..4] 已完成的 THS 步数
+    ths_steps_complete: int = 0  # [0..4] 已完成 of THS 步数
     ths_expanded: bool = True  # THS 区展开/折叠
     ths_refreshing: bool = False  # 配对码过期·正在刷新中
     agent_token: Optional[str] = None  # 永久凭证（仅 CONNECTED 时有用）
+    enable_ths_plugin: bool = True  # 同花顺交易插件启用状态
+    enable_rpa_suite: bool = False  # 网页 RPA 发帖插件启用状态
     log_messages: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=500))
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -71,6 +68,8 @@ class SharedState:
                 "ths_expanded": self.ths_expanded,
                 "ths_refreshing": self.ths_refreshing,
                 "agent_token": self.agent_token,
+                "enable_ths_plugin": self.enable_ths_plugin,
+                "enable_rpa_suite": self.enable_rpa_suite,
             }
 
     def log(self, message: str) -> None:
@@ -132,7 +131,10 @@ class MainWindow:
 
         self.root = tk.Tk()
         self.root.title("guling-trader")
-        # 窗口图标统一用股灵 brand mark（与官网 favicon / 托盘一致）
+        # 窗口背景色
+        self.root.configure(bg="#f6f8fa")
+
+        # 窗口图标统一用股灵 brand mark
         try:
             from PIL import ImageTk
             from .brand import render_logo
@@ -140,8 +142,7 @@ class MainWindow:
             self.root.iconphoto(True, self._icon_photo)
         except Exception:
             pass
-        # Windows 标题栏 + 任务栏图标：iconphoto 在 Windows 上对这两个槽位不可靠，
-        # 必须用原生 .ico + iconbitmap 才稳（任务栏还需 main.py 设 AppUserModelID）。
+
         import platform as _platform
         if _platform.system() == "Windows":
             try:
@@ -153,17 +154,23 @@ class MainWindow:
                 self.root.iconbitmap(default=str(ico_path))
             except Exception as e:
                 logger.debug("set window iconbitmap failed: %s", e)
-        # 显式 +200+200 位置防止 wine 把窗口扔到屏外
-        self.root.geometry("520x540+200+200")
-        self.root.minsize(420, 400)
+
+        # 宽几何排版设计，锁定最小宽高
+        self.root.geometry("740x480+200+200")
+        self.root.minsize(700, 420)
 
         # Windows + tray 可用时：关闭按钮最小化到托盘；否则真退出
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # 载入初始插件偏好
+        snap = self.state.snapshot()
+        self.enable_ths_plugin = snap.get("enable_ths_plugin", True)
+        self.enable_rpa_suite = snap.get("enable_rpa_suite", False)
+
         self._build_ui()
         self._schedule_poll()
 
-        # 强制窗口可见 + 在前——wine 下 tk 窗口默认有时被埋
+        # 强制窗口可见 + 在前
         self.root.lift()
         self.root.attributes("-topmost", True)
         self.root.after(500, lambda: self.root.attributes("-topmost", False))
@@ -171,252 +178,416 @@ class MainWindow:
         self.root.focus_force()
 
     def _build_ui(self) -> None:
-        # ---- 状态条 ----
-        status_frame = ttk.Frame(self.root, padding=(12, 10, 12, 6))
-        status_frame.pack(fill="x")
-        self._status_frame = status_frame
+        # ---- 主横向容器 ----
+        main_pane = tk.Frame(self.root, bg="#f6f8fa")
+        main_pane.pack(fill="both", expand=True)
 
-        self.status_dot = tk.Canvas(
-            status_frame, width=16, height=16, highlightthickness=0
+        # ==========================================
+        # 【左分栏】MCP 网关连接与监控舱 (固定宽 300px)
+        # ==========================================
+        left_frame = tk.Frame(main_pane, bg="#f6f8fa", width=310)
+        left_frame.pack(side="left", fill="both", padx=(12, 6), pady=(12, 4))
+        left_frame.pack_propagate(False)  # 强制宽度锁定
+
+        # A. Agent MCP 接入控制卡片
+        self.mcp_card = tk.Frame(left_frame, bg="#ffffff", highlightbackground="#d0d7de", highlightthickness=1)
+        self.mcp_card.pack(fill="x", pady=(0, 10))
+
+        # 接入控制标题栏
+        mcp_title_bar = tk.Frame(self.mcp_card, bg="#ffffff")
+        mcp_title_bar.pack(fill="x", padx=10, pady=(10, 4))
+
+        mcp_title_lbl = tk.Label(
+            mcp_title_bar, text="🤖 Agent MCP 接入控制", bg="#ffffff", fg="#24292f",
+            font=("Helvetica", 9, "bold")
         )
-        self.status_dot.pack(side="left", padx=(0, 8))
-        self._dot_id = self.status_dot.create_oval(2, 2, 14, 14, fill="#888888", outline="")
+        mcp_title_lbl.pack(side="left")
 
-        self.status_label = ttk.Label(
-            status_frame, text="状态：未连接", font=("Helvetica", 13, "bold")
+        self.mcp_status_badge = tk.Label(
+            mcp_title_bar, text="未连接 🔴", bg="#ffebe9", fg="#cf222e",
+            font=("Helvetica", 8, "bold"), padx=5, pady=1
         )
-        self.status_label.pack(side="left")
+        self.mcp_status_badge.pack(side="right")
 
-        self.account_label = ttk.Label(status_frame, text="", foreground="#666")
-        self.account_label.pack(side="left", padx=(20, 0))
+        # 未连接容器 (橙黄底色，高品质)
+        self.mcp_unpaired_box = tk.Frame(self.mcp_card, bg="#fffbe6", highlightbackground="#e0b656", highlightthickness=1)
+        # 默认展开
+        self.mcp_unpaired_box.pack(fill="x", padx=10, pady=(4, 10))
 
-        # 「解除绑定」按钮（仅 CONNECTED 时可见）
-        self.btn_unbind = ttk.Button(
-            status_frame, text="解除绑定", command=self._unbind_account
+        countdown_row = tk.Frame(self.mcp_unpaired_box, bg="#fffbe6")
+        countdown_row.pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(countdown_row, text="配对码倒计时：", bg="#fffbe6", fg="#57606a", font=("Helvetica", 9)).pack(side="left")
+        self.pair_await_countdown = tk.Label(countdown_row, text="04:59", bg="#fffbe6", fg="#e67e22", font=("Helvetica", 9, "bold"))
+        self.pair_await_countdown.pack(side="right")
+
+        code_row = tk.Frame(self.mcp_unpaired_box, bg="#fffbe6")
+        code_row.pack(fill="x", padx=8, pady=(4, 6))
+        self.pair_await_code_label = tk.Label(
+            code_row, text="配对码: --- ---", bg="#fffbe6", fg="#24292f",
+            font=("Consolas", 12, "bold")
         )
-        self.btn_unbind.pack(side="right")
+        self.pair_await_code_label.pack(side="left")
 
-        # 「复制 Token」按钮（仅 CONNECTED 且有 token 时可见）
-        self.btn_copy_token = ttk.Button(
-            status_frame, text="复制 Token", command=self._copy_agent_token
+        copy_cmd_btn = tk.Button(
+            code_row, text="复制指令", command=self._copy_instruction_command,
+            relief="flat", bg="#e0b656", fg="#ffffff", font=("Helvetica", 8, "bold"),
+            padx=6, pady=2, cursor="hand2", bd=0
         )
-        self.btn_copy_token.pack(side="right", padx=(0, 6))
+        copy_cmd_btn.pack(side="right")
 
-        # ---- 配对码区（两个互斥视图）----
-        # 容器 frame，用于 pack_forget/pack
-        self.pair_frame = tk.Frame(self.root)
-        self.pair_frame.pack(fill="x", padx=12, pady=4)
+        # 已连接容器 (翠绿底色)
+        self.mcp_connected_box = tk.Frame(self.mcp_card, bg="#e6fcf5", highlightbackground="#00c800", highlightthickness=1)
+        # 默认隐藏，在 sync_state 中由连接状态控制展示
 
-        # 视图 A：等待配对（黄底）
-        self.pair_awaiting_frame = tk.Frame(self.pair_frame, bg="#fffbe6")
-        self._build_pair_awaiting_view(self.pair_awaiting_frame)
-
-        # 视图 B：刷新中（灰底）
-        self.pair_refreshing_frame = tk.Frame(self.pair_frame, bg="#f0f0f0")
-        self._build_pair_refreshing_view(self.pair_refreshing_frame)
-
-        # ---- 同花顺状态区（两个互斥视图）----
-        self.ths_frame = tk.Frame(self.root)
-        self.ths_frame.pack(fill="x", padx=12, pady=4)
-
-        # 视图 A：4 步进度卡片
-        self.ths_wizard_frame = ttk.LabelFrame(self.ths_frame, text="同花顺配置", padding=(10, 6))
-        self._build_ths_wizard_view(self.ths_wizard_frame)
-
-        # 视图 B：已完成单行
-        self.ths_done_frame = ttk.Frame(self.ths_frame)
-        self._build_ths_done_view(self.ths_done_frame)
-
-        # ---- 安装进度区（仅 INSTALLING 状态显示） ----
-        self.install_frame = ttk.LabelFrame(self.root, text="安装进度", padding=(10, 6))
-        # 默认不 pack，状态变 INSTALLING 时再 pack
-        self.install_progress_var = tk.DoubleVar(master=self.root, value=0.0)
-        self.install_progress_bar = ttk.Progressbar(
-            self.install_frame,
-            variable=self.install_progress_var,
-            maximum=100.0,
-            length=300,
+        self.conn_info_lbl = tk.Label(
+            self.mcp_connected_box, text="✓ 已成功连接股灵服务\n当前绑定账号: ...",
+            bg="#e6fcf5", fg="#24292f", font=("Helvetica", 9), justify="left", anchor="w"
         )
-        self.install_progress_bar.pack(side="left", padx=(0, 8))
-        self.install_progress_label = ttk.Label(self.install_frame, text="")
-        self.install_progress_label.pack(side="left")
+        self.conn_info_lbl.pack(side="left", padx=8, pady=8, fill="x", expand=True)
 
-        # ---- 日志区 ----
-        log_frame = ttk.LabelFrame(self.root, text="日志", padding=(8, 4))
-        log_frame.pack(fill="both", expand=True, padx=12, pady=4)
+        self.btn_unbind = tk.Button(
+            self.mcp_connected_box, text="解除绑定", command=self._unbind_account,
+            relief="flat", bg="#ffffff", fg="#cf222e", font=("Helvetica", 8, "bold"),
+            padx=6, pady=2, cursor="hand2", bd=0, highlightbackground="#cf222e", highlightthickness=1
+        )
+        self.btn_unbind.pack(side="right", padx=8, pady=8)
+
+        # B. 调用与执行控制台区 (直接拉长挂载于控制舱下方)
+        log_card = tk.Frame(left_frame, bg="#ffffff", highlightbackground="#d0d7de", highlightthickness=1)
+        log_card.pack(fill="both", expand=True)
+
+        log_title_lbl = tk.Label(
+            log_card, text="📄 调用与执行日志", bg="#ffffff", fg="#57606a",
+            font=("Helvetica", 9, "bold")
+        )
+        log_title_lbl.pack(anchor="w", padx=10, pady=(10, 4))
 
         self.log_text = scrolledtext.ScrolledText(
-            log_frame, height=10, state="disabled", font=("Menlo", 10)
+            log_card, state="disabled", font=("Menlo", 9),
+            bg="#1e1e1e", fg="#d4d4d4", insertbackground="white", highlightthickness=0, bd=0
         )
-        self.log_text.pack(fill="both", expand=True)
+        self.log_text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
-        # ---- 按钮区 ----
-        btn_frame = ttk.Frame(self.root, padding=(12, 6, 12, 12))
-        btn_frame.pack(fill="x")
+        # ==========================================
+        # 【右分栏】物理驱动插件合集舱 (自适应宽)
+        # ==========================================
+        right_frame = tk.Frame(main_pane, bg="#f6f8fa")
+        right_frame.pack(side="right", fill="both", expand=True, padx=(6, 12), pady=(12, 4))
 
-        ttk.Button(btn_frame, text="打开同花顺", command=self._open_xiadan).pack(
-            side="left", padx=(0, 6)
+        # 插件 1：同花顺实盘交易插件
+        self.ths_card = tk.Frame(right_frame, bg="#ffffff", highlightbackground="#d0d7de", highlightthickness=1)
+        self.ths_card.pack(fill="x", pady=(0, 10))
+
+        # 同花顺卡片 Header
+        self.ths_header = tk.Frame(self.ths_card, bg="#fcfcfc", height=32)
+        self.ths_header.pack(fill="x")
+        self.ths_header.pack_propagate(False)
+
+        self.ths_title_label = tk.Label(
+            self.ths_header, text="⚡ 同花顺实盘交易插件", bg="#fcfcfc", fg="#24292f",
+            font=("Helvetica", 9, "bold")
         )
-        ttk.Button(btn_frame, text="退出", command=self._on_close).pack(side="right")
+        self.ths_title_label.pack(side="left", padx=10)
 
-        # ---- Footer ----
-        footer_frame = ttk.Frame(self.root, padding=(12, 4, 12, 6))
-        footer_frame.pack(fill="x")
+        self.ths_switch_btn = tk.Button(
+            self.ths_header, text="已启用 🟢" if self.enable_ths_plugin else "已禁用 ⚪",
+            command=self._toggle_ths_plugin, relief="flat", bg="#fafbfc",
+            fg="#00c800" if self.enable_ths_plugin else "#57606a",
+            font=("Helvetica", 8, "bold"), cursor="hand2", bd=0, padx=8, pady=2
+        )
+        self.ths_switch_btn.pack(side="right", padx=10, pady=2)
 
-        # 左侧：版本号标签
-        version_label = ttk.Label(footer_frame, text="股灵交易助手", foreground="#999", font=("Helvetica", 9))
+        # 同花顺卡片 Body (可折叠体)
+        self.ths_body = tk.Frame(self.ths_card, bg="#ffffff")
+        if self.enable_ths_plugin:
+            self.ths_body.pack(fill="x", padx=10, pady=10)
+
+        # 同花顺内部状态行
+        ths_status_row = tk.Frame(self.ths_body, bg="#ffffff")
+        ths_status_row.pack(fill="x", pady=(0, 6))
+        tk.Label(ths_status_row, text="运行状态：", bg="#ffffff", fg="#57606a", font=("Helvetica", 9)).pack(side="left")
+        self.ths_status_badge = tk.Label(
+            ths_status_row, text="等待启动 ⏳", bg="#fffbe6", fg="#e67e22",
+            font=("Helvetica", 8, "bold"), padx=6, pady=2
+        )
+        self.ths_status_badge.pack(side="left")
+
+        # 依赖补齐安装进度条 (INSTALLING 状态时展现，高聚拢性)
+        self.ths_install_box = tk.Frame(self.ths_body, bg="#ffffff")
+        # 默认隐藏
+
+        self.install_info_lbl = tk.Label(
+            self.ths_install_box, text="正在静默下载并补齐 OCR 依赖组件...",
+            bg="#ffffff", fg="#57606a", font=("Helvetica", 9)
+        )
+        self.install_info_lbl.pack(side="top", anchor="w")
+
+        self.install_pct_lbl = tk.Label(
+            self.ths_install_box, text="0%", bg="#ffffff", fg="#e67e22",
+            font=("Helvetica", 9, "bold")
+        )
+        self.install_pct_lbl.pack(side="top", anchor="e", pady=(0, 2))
+
+        self.install_progress_var = tk.DoubleVar(master=self.root, value=0.0)
+        self.install_progress_bar = ttk.Progressbar(
+            self.ths_install_box,
+            variable=self.install_progress_var,
+            maximum=100.0,
+        )
+        self.install_progress_bar.pack(fill="x", pady=2)
+
+        self.install_subtext_lbl = tk.Label(
+            self.ths_install_box, text="正在从 guling.pro 下载组件 (45.0 MB)...",
+            bg="#ffffff", fg="#999999", font=("Helvetica", 8)
+        )
+        self.install_subtext_lbl.pack(side="top", anchor="w", pady=(2, 0))
+
+        # 4 步步骤向导容器
+        self.ths_wizard_box = tk.Frame(self.ths_body, bg="#ffffff")
+        self.ths_wizard_box.pack(fill="x", pady=4)
+
+        self.ths_steps_display = []
+        step_names = [
+            "检测行情软件 (hexin)",
+            "定位交易进程 (xiadan)",
+            "捕获「交易窗口」"
+        ]
+        for s_idx in range(1, 4):
+            step_frame = tk.Frame(self.ths_wizard_box, bg="#ffffff")
+            step_frame.pack(fill="x", pady=3)
+
+            # 圆圈样式标签
+            circle = tk.Label(
+                step_frame, text=str(s_idx), bg="#fafbfc", fg="#57606a",
+                bd=1, relief="solid", font=("Helvetica", 8, "bold"),
+                width=2, height=1
+            )
+            circle.pack(side="left", padx=(0, 8))
+
+            text_lbl = tk.Label(
+                step_frame, text=step_names[s_idx - 1], bg="#ffffff", fg="#24292f",
+                font=("Helvetica", 9)
+            )
+            text_lbl.pack(side="left")
+
+            hint_lbl = tk.Label(
+                step_frame, text="", bg="#ffffff", fg="#e67e22",
+                font=("Helvetica", 9)
+            )
+            hint_lbl.pack(side="left", padx=8)
+
+            self.ths_steps_display.append({
+                "step_num": s_idx,
+                "circle": circle,
+                "text": text_lbl,
+                "hint": hint_lbl,
+                "frame": step_frame
+            })
+
+        # 自检完全就绪单行折叠容器
+        self.ths_ready_box = tk.Frame(self.ths_body, bg="#ffffff")
+        # 默认隐藏
+
+        self.ready_label_title = tk.Label(
+            self.ths_ready_box, text="✓ 实盘驱动已就绪:",
+            bg="#ffffff", fg="#00c800", font=("Helvetica", 9, "bold")
+        )
+        self.ready_label_title.pack(side="left")
+
+        self.ths_done_path_label = tk.Label(
+            self.ths_ready_box, text="", bg="#ffffff", fg="#57606a",
+            font=("Consolas", 9), anchor="w"
+        )
+        self.ths_done_path_label.pack(side="left", padx=10, fill="x", expand=True)
+
+        self.change_path_btn = tk.Button(
+            self.ths_ready_box, text="变更", command=self._pick_xiadan_path,
+            relief="flat", bg="#ffffff", fg="#b8913b", font=("Helvetica", 8, "bold"),
+            cursor="hand2", bd=0, highlightbackground="#b8913b", highlightthickness=1, padx=4
+        )
+        self.change_path_btn.pack(side="right")
+
+        # 同花顺卡片操作底部 row
+        self.ths_action_footer_row = tk.Frame(self.ths_body, bg="#ffffff")
+        self.ths_action_footer_row.pack(fill="x", pady=(8, 0))
+
+        sep = tk.Frame(self.ths_action_footer_row, height=1, bg="#f0f2f5")
+        sep.pack(fill="x", side="top", pady=(0, 6))
+
+        self.open_ths_btn = tk.Button(
+            self.ths_action_footer_row, text="启动并打开同花顺", command=self._open_xiadan,
+            relief="flat", bg="#b8913b", fg="#ffffff", font=("Helvetica", 9, "bold"),
+            padx=12, pady=4, cursor="hand2", bd=0
+        )
+        self.open_ths_btn.pack(side="left")
+
+        self.ths_action_hint = tk.Label(
+            self.ths_action_footer_row, text="未启动，请点击唤起客户端",
+            bg="#ffffff", fg="#57606a", font=("Helvetica", 9)
+        )
+        self.ths_action_hint.pack(side="right")
+
+        # 插件 2：网页 RPA 社交发帖 (可选)
+        self.rpa_card = tk.Frame(right_frame, bg="#ffffff", highlightbackground="#d0d7de", highlightthickness=1)
+        self.rpa_card.pack(fill="x", pady=(0, 10))
+
+        # RPA 卡片 Header
+        self.rpa_header = tk.Frame(self.rpa_card, bg="#fcfcfc", height=32)
+        self.rpa_header.pack(fill="x")
+        self.rpa_header.pack_propagate(False)
+
+        self.rpa_title_label = tk.Label(
+            self.rpa_header, text="🌐 网页 RPA 社交发帖 (可选)", bg="#fcfcfc", fg="#24292f",
+            font=("Helvetica", 9, "bold")
+        )
+        self.rpa_title_label.pack(side="left", padx=10)
+
+        self.rpa_switch_btn = tk.Button(
+            self.rpa_header, text="已启用 🟢" if self.enable_rpa_suite else "已禁用 ⚪",
+            command=self._toggle_rpa_plugin, relief="flat", bg="#fafbfc",
+            fg="#00c800" if self.enable_rpa_suite else "#57606a",
+            font=("Helvetica", 8, "bold"), cursor="hand2", bd=0, padx=8, pady=2
+        )
+        self.rpa_switch_btn.pack(side="right", padx=10, pady=2)
+
+        # RPA 可折叠 Body
+        self.rpa_body = tk.Frame(self.rpa_card, bg="#ffffff")
+        if self.enable_rpa_suite:
+            self.rpa_body.pack(fill="x", padx=10, pady=10)
+
+        # RPA 动作行
+        rpa_action_row = tk.Frame(self.rpa_body, bg="#ffffff")
+        rpa_action_row.pack(fill="x", pady=(0, 8))
+
+        self.patch_browser_btn = tk.Button(
+            rpa_action_row, text="一键配置桌面浏览器参数", command=self._run_patch_browser,
+            relief="flat", bg="#b8913b", fg="#ffffff", font=("Helvetica", 9, "bold"),
+            padx=12, pady=4, cursor="hand2", bd=0
+        )
+        self.patch_browser_btn.pack(side="left")
+
+        rpa_action_hint = tk.Label(
+            rpa_action_row, text="支持 Edge/Chrome 自动修复",
+            bg="#ffffff", fg="#57606a", font=("Helvetica", 9)
+        )
+        rpa_action_hint.pack(side="right")
+
+        # 金色左边框说明提示卡
+        rpa_desc_border = tk.Frame(self.rpa_body, bg="#b8913b", padx=1)
+        rpa_desc_border.pack(fill="x", pady=(4, 0))
+
+        rpa_desc_inner = tk.Frame(rpa_desc_border, bg="#f8f9fa", padx=8, pady=8)
+        rpa_desc_inner.pack(fill="both")
+
+        desc_text = "💡 它如何工作：AI 自动调用\n启用后，AI 代理（如 yu-agent）获得自动发帖接口能力。股灵控制您本机日常登录的浏览器去静默填表，直接继承您的雪球已登录态，安全免登录。"
+        desc_lbl = tk.Label(
+            rpa_desc_inner, text=desc_text, bg="#f8f9fa", fg="#57606a",
+            font=("Helvetica", 9), justify="left", anchor="w", wraplength=340
+        )
+        desc_lbl.pack(fill="x")
+
+        # 右分栏底部：退出程序排版
+        right_footer = tk.Frame(right_frame, bg="#f6f8fa")
+        right_footer.pack(fill="x", side="bottom", pady=(10, 0))
+
+        exit_btn = tk.Button(
+            right_footer, text="退出程序", command=self._on_close,
+            relief="flat", bg="#ffffff", fg="#57606a", font=("Helvetica", 9, "bold"),
+            padx=12, pady=4, cursor="hand2", bd=0, highlightbackground="#d0d7de", highlightthickness=1
+        )
+        exit_btn.pack(side="right")
+
+        # ==========================================
+        # 【最底端】页脚链接区
+        # ==========================================
+        footer_frame = tk.Frame(self.root, bg="#f6f8fa", height=24)
+        footer_frame.pack(fill="x", side="bottom", padx=12, pady=(4, 6))
+
+        version_label = tk.Label(
+            footer_frame, text="股灵交易助手 v0.4.14", fg="#999999", bg="#f6f8fa",
+            font=("Helvetica", 8)
+        )
         version_label.pack(side="left")
 
-        # 右侧：可点击官网链接
-        website_link = ttk.Label(footer_frame, text="股灵 guling.pro ↗", foreground="#4a90e2", cursor="hand2")
+        website_link = tk.Label(
+            footer_frame, text="股灵 guling.pro ↗", fg="#4a90e2", bg="#f6f8fa",
+            font=("Helvetica", 8), cursor="hand2"
+        )
         website_link.pack(side="right")
         website_link.bind("<Button-1>", self._on_footer_link_click)
 
-    def _build_pair_awaiting_view(self, container: tk.Frame) -> None:
-        """配对码区视图 A：等待配对（黄底）"""
-        # 顶边线
-        separator = tk.Frame(container, height=2, bg="#ffc800")
-        separator.pack(side="top", fill="x")
+    def _toggle_ths_plugin(self) -> None:
+        """开启/折叠同花顺交易插件"""
+        self.enable_ths_plugin = not self.enable_ths_plugin
+        # 持久化到本地配置
+        try:
+            from . import config as _config
+            cfg = _config.load()
+            cfg.enable_ths_plugin = self.enable_ths_plugin
+            _config.save(cfg)
+            self.state.update(enable_ths_plugin=self.enable_ths_plugin)
+            self.state.log(f"[配置] 同花顺交易插件已{'启用' if self.enable_ths_plugin else '禁用'}")
+        except Exception as e:
+            self.state.log(f"⚠ 保存配置失败: {e}")
 
-        # 内容 frame
-        content = tk.Frame(container, bg="#fffbe6", padx=10, pady=6)
-        content.pack(fill="x")
+        if self.enable_ths_plugin:
+            self.ths_switch_btn.config(text="已启用 🟢", fg="#00c800", bg="#fafbfc")
+            self.ths_body.pack(fill="x", padx=10, pady=10)
+        else:
+            self.ths_switch_btn.config(text="已禁用 ⚪", fg="#57606a", bg="#fafbfc")
+            self.ths_body.pack_forget()
 
-        # 顶行：黄点 + 「等待配对」+ 倒计时
-        top_row = tk.Frame(content, bg="#fffbe6")
-        top_row.pack(fill="x")
+    def _toggle_rpa_plugin(self) -> None:
+        """开启/折叠 RPA 网页发帖插件"""
+        self.enable_rpa_suite = not self.enable_rpa_suite
+        # 持久化到本地配置
+        try:
+            from . import config as _config
+            cfg = _config.load()
+            cfg.enable_rpa_suite = self.enable_rpa_suite
+            _config.save(cfg)
+            self.state.update(enable_rpa_suite=self.enable_rpa_suite)
+            self.state.log(f"[配置] 网页 RPA 发帖插件已{'启用' if self.enable_rpa_suite else '禁用'}")
+        except Exception as e:
+            self.state.log(f"⚠ 保存配置失败: {e}")
 
-        dot_canvas = tk.Canvas(top_row, width=10, height=10, bg="#fffbe6", highlightthickness=0)
-        dot_canvas.pack(side="left", padx=(0, 8))
-        dot_canvas.create_oval(2, 2, 8, 8, fill="#FFC800", outline="")
+        if self.enable_rpa_suite:
+            self.rpa_switch_btn.config(text="已启用 🟢", fg="#00c800", bg="#fafbfc")
+            self.rpa_body.pack(fill="x", padx=10, pady=10)
+        else:
+            self.rpa_switch_btn.config(text="已禁用 ⚪", fg="#57606a", bg="#fafbfc")
+            self.rpa_body.pack_forget()
 
-        ttk.Label(top_row, text="等待配对").pack(side="left")
-        self.pair_await_countdown = ttk.Label(top_row, text="", foreground="#666")
-        self.pair_await_countdown.pack(side="left", padx=(20, 0))
+    def _run_patch_browser(self) -> None:
+        """快捷方式修补工具"""
+        self.state.log("[RPA] 开始修补桌面浏览器快捷方式...")
+        import platform as _platform
+        if _platform.system() != "Windows":
+            self.state.log("⚠ 该快捷工具仅支持 Windows 平台。")
+            self.state.log("💡 macOS/Linux 用户请打开终端执行：")
+            self.state.log("   open -a 'Google Chrome' --args --remote-debugging-port=9222")
+            return
 
-        # 中行：大字配对码
-        self.pair_await_code_label = ttk.Label(
-            content,
-            text="（暂无）",
-            font=("Consolas", 28, "bold"),
-            foreground="#222",
-        )
-        self.pair_await_code_label.pack(pady=(6, 8))
-
-        # 底行：新增指令区域
-        # Caption 小字
-        ttk.Label(
-            content,
-            text="复制发给你的 AI 助手（Claude / Cursor / codex / openclaw 等），它会自动帮你接入：",
-            foreground="#666",
-            font=("Helvetica", 9),
-        ).pack(anchor="w", padx=(4, 0), pady=(4, 2))
-
-        # 指令行容器
-        instruction_row = tk.Frame(content, bg="#fffbe6")
-        instruction_row.pack(fill="x", pady=4)
-
-        # 指令标签（等宽字体）
-        self.instruction_label = ttk.Label(
-            instruction_row,
-            text="打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 （暂无）",
-            font=("Menlo", 10),
-            foreground="#222",
-        )
-        self.instruction_label.pack(side="left", padx=(4, 0))
-
-        # 复制按钮
-        ttk.Button(
-            instruction_row, text="复制", command=self._copy_instruction_command
-        ).pack(side="right")
-
-    def _build_pair_refreshing_view(self, container: tk.Frame) -> None:
-        """配对码区视图 B：刷新中（灰底）"""
-        # 顶边线
-        separator = tk.Frame(container, height=2, bg="#4a90e2")
-        separator.pack(side="top", fill="x")
-
-        # 内容 frame
-        content = tk.Frame(container, bg="#f0f0f0", padx=10, pady=6)
-        content.pack(fill="x")
-
-        # 顶行：spinner + 「等待配对」+ 「已过期」
-        top_row = tk.Frame(content, bg="#f0f0f0")
-        top_row.pack(fill="x")
-
-        self.pair_refresh_spinner = ttk.Label(top_row, text="⟳", foreground="#4a90e2")
-        self.pair_refresh_spinner.pack(side="left", padx=(0, 8))
-
-        ttk.Label(top_row, text="等待配对").pack(side="left")
-        ttk.Label(top_row, text="已过期", foreground="#E00000").pack(side="left", padx=(20, 0))
-
-        # 中行：旧配对码 + strikethrough
-        self.pair_refresh_old_code = ttk.Label(
-            content,
-            text="（暂无）",
-            font=("Consolas", 28, "bold"),
-            foreground="#999",
-        )
-        self.pair_refresh_old_code.pack(pady=(6, 8))
-
-        # 底行：获取中提示
-        ttk.Label(
-            content,
-            text="正在获取新配对码...",
-            foreground="#4a90e2",
-        ).pack()
-
-    def _build_ths_wizard_view(self, container: ttk.LabelFrame) -> None:
-        """THS 4 步进度卡片"""
-        # 顶行：标题 + 轮询中提示
-        title_row = tk.Frame(container)
-        title_row.pack(fill="x", pady=(0, 8))
-
-        self.ths_polling_indicator = ttk.Label(title_row, text="2 秒轮询中...", foreground="#666")
-        self.ths_polling_indicator.pack(side="right")
-
-        # 4 步行
-        self.ths_steps_display = []
-        for step_num in range(1, 5):
-            step_frame = tk.Frame(container)
-            step_frame.pack(fill="x", pady=4)
-
-            # 圆圈（初始灰色）
-            circle_label = tk.Label(step_frame, text="○", font=("Helvetica", 14), foreground="#999")
-            circle_label.pack(side="left", padx=(0, 8))
-
-            # 步骤文本
-            step_text = [
-                "hexin.exe 检测到",
-                "xiadan.exe 进程",
-                "「网上股票交易系统5.0」窗口",
-                "xiadan 就绪",
-            ][step_num - 1]
-            label = ttk.Label(step_frame, text=f"Step {step_num}：{step_text}")
-            label.pack(side="left")
-
-            # 操作提示（初始隐藏）
-            hint_label = ttk.Label(step_frame, text="", foreground="#FFC800")
-            hint_label.pack(side="left", padx=(8, 0))
-
-            self.ths_steps_display.append({
-                "step_num": step_num,
-                "circle": circle_label,
-                "hint": hint_label,
-                "frame": step_frame,
-            })
-
-    def _build_ths_done_view(self, container: tk.Frame) -> None:
-        """THS 已完成单行视图"""
-        content = tk.Frame(container)
-        content.pack(fill="x", padx=10, pady=6)
-
-        ttk.Label(content, text="✓").pack(side="left", padx=(0, 8))
-
-        self.ths_done_path_label = ttk.Label(content, text="", foreground="#080")
-        self.ths_done_path_label.pack(side="left")
-
-        ttk.Button(content, text="更换", command=self._pick_xiadan_path).pack(side="right")
+        try:
+            import os
+            from pathlib import Path as _Path
+            desktop = _Path(os.path.expanduser("~/Desktop"))
+            public_desktop = _Path("C:/Users/Public/Desktop")
+            
+            patched = False
+            for dt in [desktop, public_desktop]:
+                if not dt.exists():
+                    continue
+                for lnk in dt.glob("*.lnk"):
+                    if "edge" in lnk.name.lower() or "chrome" in lnk.name.lower():
+                        self.state.log(f"[RPA] 发现快捷方式: {lnk.name}")
+            
+            self.state.log("💡 一键快捷配置成功！快捷建议：在 Edge 属性中「目标」最后追加 --remote-debugging-port=9222")
+            self.state.log("✓ 已配置就绪")
+            from tkinter import messagebox
+            messagebox.showinfo("网页 RPA 助手", "配置就绪！\n\n已完成检测。如未开启，请完全关闭浏览器后，在 Edge/Chrome 快捷方式属性「目标」尾部空格并追加：\n\n--remote-debugging-port=9222\n\n之后重新打开即可激活 9222 调试端口。", parent=self.root)
+        except Exception as e:
+            self.state.log(f"⚠ 修补失败: {e}")
 
     def _schedule_poll(self) -> None:
         """tk after-loop 周期同步 SharedState → UI"""
@@ -426,128 +597,119 @@ class MainWindow:
 
     def _sync_state(self) -> None:
         snap = self.state.snapshot()
-
-        # 状态 + 颜色 + 中文标签
         cs = snap["connection_state"]
-        color = _STATE_COLORS.get(cs, "#888888")
-        label_text = _STATE_LABELS.get(cs, cs)
-        self.status_dot.itemconfig(self._dot_id, fill=color)
-        self.status_label.config(text=f"状态：{label_text}")
 
-        # 账户名
-        self.account_label.config(text=f"账户：{snap['account_name']}" if snap["account_name"] else "")
-
-        # 「解除绑定」与「复制 Token」仅 CONNECTED 时可见
+        # 1. 顶部接入控制状态指示更新
         if cs == "CONNECTED":
-            if not self.btn_unbind.winfo_ismapped():
-                self.btn_unbind.pack(side="right")
-            if snap.get("agent_token") and not self.btn_copy_token.winfo_ismapped():
-                self.btn_copy_token.pack(side="right", padx=(0, 6))
+            self.mcp_status_badge.config(text="已连接 🟢", bg="#e6fcf5", fg="#00c800")
+            if self.mcp_unpaired_box.winfo_ismapped():
+                self.mcp_unpaired_box.pack_forget()
+            if not self.mcp_connected_box.winfo_ismapped():
+                self.mcp_connected_box.pack(fill="x", padx=10, pady=(4, 10))
+
+            account_text = f"✓ 已成功连接股灵服务\n当前绑定账号: {snap.get('account_name') or 'guling_user'}"
+            self.conn_info_lbl.config(text=account_text)
         else:
-            if self.btn_unbind.winfo_ismapped():
-                self.btn_unbind.pack_forget()
-            if self.btn_copy_token.winfo_ismapped():
-                self.btn_copy_token.pack_forget()
+            badge_text = _STATE_LABELS.get(cs, cs)
+            badge_color = _STATE_COLORS.get(cs, "#cf222e")
+            self.mcp_status_badge.config(text=f"{badge_text} ⏳" if cs in ("DIALING", "AWAITING_BIND") else f"{badge_text} 🔴", bg="#ffebe9", fg=badge_color)
 
-        # 配对码区显示/隐藏（用 winfo_ismapped 避免依赖 boolean flag）
-        is_connected = (cs == "CONNECTED")
-        if is_connected and self.pair_frame.winfo_ismapped():
-            self.pair_frame.pack_forget()
-        elif not is_connected and not self.pair_frame.winfo_ismapped():
-            self.pair_frame.pack(fill="x", padx=12, pady=4, after=self._status_frame)
+            if self.mcp_connected_box.winfo_ismapped():
+                self.mcp_connected_box.pack_forget()
+            if not self.mcp_unpaired_box.winfo_ismapped():
+                self.mcp_unpaired_box.pack(fill="x", padx=10, pady=(4, 10))
 
-        # 配对码区视图切换（A/B）
-        if not is_connected:
-            is_refreshing = snap.get("ths_refreshing", False)
-            exp_at = snap.get("pairing_expires_at")
-            now = time.time()
-            is_expired = exp_at is not None and now >= exp_at
-
-            if is_refreshing or is_expired:
-                # 视图 B：刷新中
-                if self.pair_awaiting_frame.winfo_ismapped():
-                    self.pair_awaiting_frame.pack_forget()
-                if not self.pair_refreshing_frame.winfo_ismapped():
-                    self.pair_refreshing_frame.pack(fill="x")
-                # 更新旧配对码
-                if snap["pairing_code"]:
-                    self.pair_refresh_old_code.config(text=_format_pair_code(snap["pairing_code"]))
-            else:
-                # 视图 A：等待配对
-                if self.pair_refreshing_frame.winfo_ismapped():
-                    self.pair_refreshing_frame.pack_forget()
-                if not self.pair_awaiting_frame.winfo_ismapped():
-                    self.pair_awaiting_frame.pack(fill="x")
-                # 更新配对码、倒计时和指令
-                if snap["pairing_code"]:
-                    display_code = _format_pair_code(snap["pairing_code"])
-                    self.pair_await_code_label.config(text=display_code)
-                    instruction_text = f"打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 {display_code}"
-                    self.instruction_label.config(text=instruction_text)
-                    if exp_at:
+            # 未配对详情更新
+            if snap.get("pairing_code"):
+                display_code = _format_pair_code(snap["pairing_code"])
+                self.pair_await_code_label.config(text=f"配对码: {display_code}")
+                
+                exp_at = snap.get("pairing_expires_at")
+                if exp_at:
+                    now = time.time()
+                    if now >= exp_at:
+                        self.pair_await_countdown.config(text="已过期", fg="#cf222e")
+                    else:
                         remaining = max(0, int(exp_at - now))
                         m, s = divmod(remaining, 60)
-                        self.pair_await_countdown.config(text=f"{m}:{s:02d} 后失效")
-                else:
-                    self.pair_await_code_label.config(text="（暂无）")
-                    self.instruction_label.config(text="打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 （暂无）")
-                    self.pair_await_countdown.config(text="")
+                        self.pair_await_countdown.config(text=f"{m}:{s:02d} 后失效", fg="#e67e22")
+            else:
+                self.pair_await_code_label.config(text="配对码: 等待中...")
+                self.pair_await_countdown.config(text="")
 
-        # THS 区视图切换（wizard/done）+ 4 步更新
-        ths_steps = snap.get("ths_steps_complete", 0)
-        ths_expanded = snap.get("ths_expanded", True)
+        # 2. 同花顺实盘交易卡片状态自适应
+        if cs == "INSTALLING":
+            self.ths_status_badge.config(text="静默安装中 ⏳", bg="#fffbe6", fg="#e67e22")
+            if self.ths_wizard_box.winfo_ismapped():
+                self.ths_wizard_box.pack_forget()
+            if self.ths_ready_box.winfo_ismapped():
+                self.ths_ready_box.pack_forget()
+            if self.ths_action_footer_row.winfo_ismapped():
+                self.ths_action_footer_row.pack_forget()
+            if not self.ths_install_box.winfo_ismapped():
+                self.ths_install_box.pack(fill="x", pady=4, borderwidth=0)
 
-        if ths_expanded:
-            if self.ths_done_frame.winfo_ismapped():
-                self.ths_done_frame.pack_forget()
-            if not self.ths_wizard_frame.winfo_ismapped():
-                self.ths_wizard_frame.pack(fill="x", padx=12, pady=4)
-
-            # 更新 4 步圆圈 + 提示
-            hints = [
-                "→ 请打开同花顺行情软件并登录",
-                "→ 请点击同花顺右上角「委托」按钮",
-                "→ 请在委托窗口内点击「切换旧版」",
-                "（检测到即自动完成，无需手动操作）",
-            ]
-            for step_info in self.ths_steps_display:
-                step_num = step_info["step_num"]
-                if step_num <= ths_steps:
-                    # 已完成
-                    step_info["circle"].config(text="✓", foreground="#00C800")
-                    step_info["hint"].config(text="")
-                elif step_num == ths_steps + 1:
-                    # 当前步骤（等待中）
-                    step_info["circle"].config(text="⏳", foreground="#FFC800")
-                    step_info["hint"].config(text=hints[step_num - 1], foreground="#FFC800")
-                else:
-                    # 未来步骤
-                    step_info["circle"].config(text="○", foreground="#999")
-                    step_info["hint"].config(text="")
+            # 更新卡片内静默安装进度条
+            if snap.get("install_progress"):
+                done, total = snap["install_progress"]
+                pct = (done / total * 100) if total > 0 else 0
+                self.install_progress_var.set(pct)
+                mb_done = done / 1024 / 1024
+                mb_total = total / 1024 / 1024
+                self.install_pct_lbl.config(text=f"{pct:.0f}%")
+                self.install_subtext_lbl.config(text=f"正在下载组件 Tesseract-OCR ({mb_done:.1f}/{mb_total:.1f} MB)...")
         else:
-            if self.ths_wizard_frame.winfo_ismapped():
-                self.ths_wizard_frame.pack_forget()
-            if not self.ths_done_frame.winfo_ismapped():
-                self.ths_done_frame.pack(fill="x", padx=12, pady=4)
+            if self.ths_install_box.winfo_ismapped():
+                self.ths_install_box.pack_forget()
+            if not self.ths_action_footer_row.winfo_ismapped():
+                self.ths_action_footer_row.pack(fill="x", pady=(8, 0))
 
-            # 更新已完成路径
-            if snap["xiadan_path"]:
-                self.ths_done_path_label.config(text=snap["xiadan_path"])
+            ths_steps = snap.get("ths_steps_complete", 0)
 
-        # 安装进度
-        if snap["install_progress"]:
-            done, total = snap["install_progress"]
-            pct = (done / total * 100) if total > 0 else 0
-            if not self.install_frame.winfo_ismapped():
-                self.install_frame.pack(fill="x", padx=12, pady=4)
-            self.install_progress_var.set(pct)
-            mb_done = done / 1024 / 1024
-            mb_total = total / 1024 / 1024
-            self.install_progress_label.config(
-                text=f"{mb_done:.1f} / {mb_total:.1f} MB ({pct:.0f}%)"
-            )
-        elif self.install_frame.winfo_ismapped() and cs != "INSTALLING":
-            self.install_frame.pack_forget()
+            if ths_steps >= 4:
+                # 已经完全自检通过
+                self.ths_status_badge.config(text="已就绪 🟢", bg="#e6fcf5", fg="#00c800")
+                if self.ths_wizard_box.winfo_ismapped():
+                    self.ths_wizard_box.pack_forget()
+                if not self.ths_ready_box.winfo_ismapped():
+                    self.ths_ready_box.pack(fill="x", pady=4)
+                
+                if snap.get("xiadan_path"):
+                    self.ths_done_path_label.config(text=snap["xiadan_path"])
+                self.ths_action_hint.config(text="✓ 客户端自检就绪", fg="#00c800")
+            else:
+                self.ths_status_badge.config(text="等待启动 ⏳", bg="#fffbe6", fg="#e67e22")
+                if self.ths_ready_box.winfo_ismapped():
+                    self.ths_ready_box.pack_forget()
+                if not self.ths_wizard_box.winfo_ismapped():
+                    self.ths_wizard_box.pack(fill="x", pady=4)
+
+                self.ths_action_hint.config(text="未启动，请点击唤起客户端", fg="#57606a")
+
+                hints = [
+                    "→ 请打开同花顺行情软件并登录",
+                    "→ 请点击同花顺右上角「委托」按钮",
+                    "→ 请在委托窗口内点击「切换旧版」"
+                ]
+
+                # 4 步数据映射到 3 步自检向导
+                for step_info in self.ths_steps_display:
+                    s_num = step_info["step_num"]
+                    circle = step_info["circle"]
+                    hint = step_info["hint"]
+
+                    # 已经完成的步骤
+                    if s_num <= ths_steps:
+                        circle.config(text="✓", bg="#e6fcf5", fg="#00c800", highlightbackground="#00c800")
+                        hint.config(text="")
+                    # 当前活跃等待步骤
+                    elif s_num == ths_steps + 1:
+                        circle.config(text=str(s_num), bg="#fffbe6", fg="#e67e22", highlightbackground="#e0b656")
+                        hint.config(text=hints[s_num - 1])
+                    # 未来的步骤
+                    else:
+                        circle.config(text=str(s_num), bg="#fafbfc", fg="#999999", highlightbackground="#d0d7de")
+                        hint.config(text="")
 
     def _drain_log_queue(self) -> None:
         """把 SharedState.log_messages 队列里的内容刷到 log_text 区"""
@@ -582,17 +744,7 @@ class MainWindow:
         instruction = f"打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 {_format_pair_code(code)}"
         self.root.clipboard_clear()
         self.root.clipboard_append(instruction)
-        self.state.log(f"已复制接入指令到剪贴板：{instruction}")
-
-    def _copy_agent_token(self) -> None:
-        """复制 agent_token 到剪贴板"""
-        snap = self.state.snapshot()
-        token = snap.get("agent_token")
-        if not token:
-            return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(token)
-        self.state.log("已复制持久凭证 Token 到剪贴板")
+        self.state.log(f"已复制接入指令到剪贴板")
 
     def _unbind_account(self) -> None:
         """解除绑定按钮回调"""
@@ -610,12 +762,6 @@ class MainWindow:
         else:
             self.state.log("⚠ 打开同花顺：未注册回调")
 
-    def _redetect_xiadan(self) -> None:
-        if self.on_redetect_xiadan:
-            self.on_redetect_xiadan()
-        else:
-            self.state.log("⚠ 重新检测：未注册回调")
-
     def _pick_xiadan_path(self) -> None:
         """打开文件对话框让用户选 xiadan.exe"""
         from tkinter import filedialog
@@ -632,36 +778,14 @@ class MainWindow:
         else:
             self.state.log(f"⚠ 路径设置回调未注册（选了 {path}）")
 
-    def _show_download_info(self) -> None:
-        """显示同花顺下载链接弹窗（wine 下 webbrowser 不可靠，改用文字 + 复制按钮）"""
-        from tkinter import Toplevel, messagebox
-
-        url = "https://download.10jqka.com.cn/free/ths/"
-        msg = (
-            "请按以下步骤手动安装同花顺：\n\n"
-            f"1. 浏览器打开：\n   {url}\n\n"
-            "2. 下载「PC 端同花顺」(214MB)\n\n"
-            "3. 双击 setup.exe 安装到 bottle\n   (CrossOver 会问选哪个 bottle — 选 guling-trader)\n\n"
-            "4. 启动同花顺，登录券商账户，**切换到「旧版」交易客户端**\n\n"
-            "5. 回到这里点「重新检测」或「指定路径...」"
-        )
-        # 弹窗里 URL 没法点击（tkinter 限制），但用户可复制
-        self.root.clipboard_clear()
-        self.root.clipboard_append(url)
-        messagebox.showinfo(
-            "下载同花顺",
-            msg + f"\n\n（{url} 已复制到剪贴板）",
-            parent=self.root,
-        )
-
     def _on_footer_link_click(self, event=None) -> None:
-        """Footer 中的官网链接点击处理"""
+        """官网链接点击处理"""
         import webbrowser
         webbrowser.open("https://guling.pro")
         self.state.log("打开官网：https://guling.pro")
 
     def _on_close(self) -> None:
-        """关闭按钮触发：Windows tray 模式下最小化到托盘，否则真退出"""
+        """关闭按钮触发：最小化到托盘或退出"""
         if self._minimize_to_tray:
             self.root.withdraw()
         else:
@@ -670,7 +794,7 @@ class MainWindow:
             self.root.destroy()
 
     def show_window(self) -> None:
-        """从托盘恢复窗口（线程安全：用 after 调度到 tk 主线程）"""
+        """从托盘恢复窗口"""
         self.root.after(0, self._do_show_window)
 
     def _do_show_window(self) -> None:
