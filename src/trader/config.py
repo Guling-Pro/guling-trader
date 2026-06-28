@@ -17,6 +17,8 @@ class TraderConfig:
     enable_ths_plugin: bool = True  # 是否启用同花顺实盘交易插件，默认启用
     enable_rpa_suite: bool = False  # 是否启用可选的桌面 RPA 扩展模块
     chrome_cdp_port: int = 9222  # 本地 Edge/Chrome CDP 端口，默认 9222
+    order_watch_idle_secs: int = 300   # order_watch 空闲轮询周期（秒）：默认 5 分钟
+    order_watch_active_secs: int = 60  # 有未完成委托时的提速周期（秒）：默认 1 分钟
 
     def has_paired(self) -> bool:
         """检查是否已配对"""
@@ -76,6 +78,8 @@ def load() -> TraderConfig:
             enable_ths_plugin=data.get("enable_ths_plugin", True),
             enable_rpa_suite=data.get("enable_rpa_suite", False),
             chrome_cdp_port=data.get("chrome_cdp_port", 9222),
+            order_watch_idle_secs=data.get("order_watch_idle_secs", 300),
+            order_watch_active_secs=data.get("order_watch_active_secs", 60),
         )
     except Exception:
         return TraderConfig(device_id="")
@@ -95,6 +99,8 @@ def save(config: TraderConfig) -> None:
         "enable_ths_plugin": config.enable_ths_plugin,
         "enable_rpa_suite": config.enable_rpa_suite,
         "chrome_cdp_port": config.chrome_cdp_port,
+        "order_watch_idle_secs": config.order_watch_idle_secs,
+        "order_watch_active_secs": config.order_watch_active_secs,
     }
 
     with open(config_path, "w", encoding="utf-8") as f:

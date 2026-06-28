@@ -78,7 +78,7 @@ def _setup_file_logging() -> Path:
 _LOG_FILE = _setup_file_logging()
 
 
-from . import bootstrap, config as trader_config, tray, ui_dialogs, ws_client
+from . import bootstrap, config as trader_config, order_watch, tray, ui_dialogs, ws_client
 from .installer import auto_install
 from .main_window import MainWindow, SharedState
 
@@ -323,6 +323,7 @@ async def _async_main(
     # 同时跑 ws_client + THS polling + pairing refresh watcher
     polling_task = asyncio.create_task(_ths_polling_task(state))
     refresh_task = asyncio.create_task(_pairing_refresh_watcher(state, client))
+    order_event_task = asyncio.create_task(order_watch.order_watch_task(state, client))
     try:
         await client.run()
     except asyncio.CancelledError:
@@ -333,8 +334,9 @@ async def _async_main(
     finally:
         polling_task.cancel()
         refresh_task.cancel()
+        order_event_task.cancel()
         try:
-            await asyncio.gather(polling_task, refresh_task, return_exceptions=True)
+            await asyncio.gather(polling_task, refresh_task, order_event_task, return_exceptions=True)
         except Exception:
             pass
 
