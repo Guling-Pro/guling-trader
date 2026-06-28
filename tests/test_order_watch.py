@@ -210,3 +210,56 @@ def test_next_interval_idle_when_all_done():
 
 def test_next_interval_idle_when_empty():
     assert order_watch.next_interval({}, 300, 60) == 300
+
+
+def test_send_frame_failure_does_not_advance_baseline():
+    """Regression: if send_frame raises, baseline should not advance; next round retries."""
+    r0 = _active([{"证券代码": "600519", "操作": "买入", "委托数量": "100", "委托价格": "1700.000",
+                   "成交数量": "0", "成交均价": "", "合同编号": "1", "备注": "已报"}])
+    r1 = _active([{"证券代码": "600519", "操作": "买入", "委托数量": "100", "委托价格": "1700.000",
+                   "成交数量": "100", "成交均价": "1699.800", "合同编号": "1", "备注": "已成"}])
+    backend = WatchFakeBackend([r0, r1])
+
+    # Client that raises on first send_frame call
+    class FailingClient:
+        def __init__(self, backend):
+            self.backend = backend
+            self.sent = []
+            self._call_count = 0
+
+        async def send_frame(self, frame):
+            self._call_count += 1
+            if self._call_count == 1:
+                raise RuntimeError("simulated send_frame failure")
+            self.sent.append(frame)
+
+    async def drive():
+        failing_client = FailingClient(backend)
+
+        # Round 1: establish baseline from r0
+        prev, seq, ok = await order_watch._poll_once(backend, failing_client, None, 0)
+        assert ok is True
+        assert set(prev) == {"1"}
+        baseline_snapshot = prev
+
+        # Round 2: try to send filled event (r0→r1), but send_frame raises
+        prev_after, seq_after, ok_after = await order_watch._poll_once(
+            backend, failing_client, prev, seq
+        )
+        assert ok_after is False, "should return False when send fails"
+        assert (
+            prev_after is baseline_snapshot
+        ), "baseline should not advance on send failure"
+        assert len(failing_client.sent) == 0, "no events should be sent on failure"
+
+        # Round 3: same baseline with new working client re-emits the event
+        working_client = WatchFakeClient(backend)
+        prev_retry, seq_retry, ok_retry = await order_watch._poll_once(
+            backend, working_client, prev_after, seq_after
+        )
+        assert ok_retry is True, "should succeed on retry"
+        assert len(working_client.sent) == 1, "event should be sent on retry"
+        assert working_client.sent[0]["event"] == "filled"
+        assert working_client.sent[0]["entrust_no"] == "1"
+
+    asyncio.run(drive())

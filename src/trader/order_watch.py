@@ -147,13 +147,17 @@ async def _poll_once(backend, client, prev: Optional[dict], seq: int) -> tuple[O
     for eno in prev:
         if eno not in cur:
             logger.warning("order_watch 委托 %s 已从委托表消失，保守起见未发事件", eno)
-    for ev in events:
-        seq += 1
-        ev["seq"] = seq
-        ev["ts"] = time.time()
-        await client.send_frame(ev)
-        logger.info("order_watch 推送 %s entrust=%s source=%s filled=%s",
-                    ev["event"], ev["entrust_no"], ev["source"], ev["filled_qty"])
+    try:
+        for ev in events:
+            seq += 1
+            ev["seq"] = seq
+            ev["ts"] = time.time()
+            await client.send_frame(ev)
+            logger.info("order_watch 推送 %s entrust=%s source=%s filled=%s",
+                        ev["event"], ev["entrust_no"], ev["source"], ev["filled_qty"])
+    except Exception as e:
+        logger.warning("order_watch 发送事件失败（下轮重试）：%s", e)
+        return prev, seq, False  # 不推进基线，保留未发的事件供下轮重试
     return cur, seq, True
 
 
@@ -175,12 +179,15 @@ async def order_watch_task(state, client) -> None:
             await asyncio.sleep(interval)
             snap = state.snapshot()
             if snap.get("connection_state") != "CONNECTED":
+                logger.debug("order_watch 跳过：连接状态 %s", snap.get("connection_state"))
                 interval = idle_secs
                 continue
             if not snap.get("enable_ths_plugin", True):
+                logger.debug("order_watch 跳过：THS 插件已禁用")
                 interval = idle_secs
                 continue
             if not in_trading_session(datetime.now()):
+                logger.debug("order_watch 跳过：非交易时段")
                 interval = idle_secs
                 continue
             prev, seq, ok = await _poll_once(backend, client, prev, seq)
