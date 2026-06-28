@@ -67,3 +67,51 @@ def build_snapshot(active_result: Optional[dict]) -> dict[str, dict]:
             "note": (row.get(COL_NOTE) or "").strip(),
         }
     return snap
+
+
+def _is_full(o: dict) -> bool:
+    return o["order_qty"] > 0 and o["filled_qty"] >= o["order_qty"]
+
+
+def _classify_new(o: dict) -> str:
+    if "已撤" in o["note"]:
+        return "canceled"
+    if _is_full(o):
+        return "filled"
+    if o["filled_qty"] > 0:
+        return "partially_filled"
+    return "placed"
+
+
+def _make_event(event_name: str, o: dict, agent_entrust_nos: set[str]) -> dict:
+    return {
+        "type": FRAME_TYPE,
+        "event": event_name,
+        "source": "agent" if o["entrust_no"] in agent_entrust_nos else "external",
+        "entrust_no": o["entrust_no"],
+        "stock_no": o["stock_no"],
+        "op": o["op"],
+        "order_qty": o["order_qty"],
+        "order_price": o["order_price"],
+        "filled_qty": o["filled_qty"],
+        "avg_price": o["avg_price"],
+        "note": o["note"],
+    }
+
+
+def diff_snapshots(prev: dict[str, dict], cur: dict[str, dict],
+                   agent_entrust_nos: set[str]) -> list[dict]:
+    """对比两轮快照，返回 order_event 列表（不含 seq/ts）。"""
+    events: list[dict] = []
+    for eno, o in cur.items():
+        before = prev.get(eno)
+        if before is None:
+            events.append(_make_event(_classify_new(o), o, agent_entrust_nos))
+            continue
+        if "已撤" in o["note"] and "已撤" not in before["note"]:
+            events.append(_make_event("canceled", o, agent_entrust_nos))
+            continue
+        if o["filled_qty"] > before["filled_qty"]:
+            name = "filled" if _is_full(o) else "partially_filled"
+            events.append(_make_event(name, o, agent_entrust_nos))
+    return events

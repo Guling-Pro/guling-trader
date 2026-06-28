@@ -50,3 +50,63 @@ def test_build_snapshot_skips_rows_without_entrust_no():
 def test_build_snapshot_empty_on_error_code():
     assert order_watch.build_snapshot({"code": 1, "msg": "读取失败"}) == {}
     assert order_watch.build_snapshot(None) == {}
+
+
+def _order(eno, qty, filled, note, code="600519", op="买入", price="1700.000", avg=""):
+    return {
+        "entrust_no": eno, "stock_no": code, "op": op,
+        "order_qty": qty, "order_price": price,
+        "filled_qty": filled, "avg_price": avg, "note": note,
+    }
+
+
+def test_new_order_emits_placed():
+    cur = {"1": _order("1", 100, 0, "已报")}
+    evs = order_watch.diff_snapshots({}, cur, set())
+    assert len(evs) == 1
+    e = evs[0]
+    assert e["type"] == "order_event"
+    assert e["event"] == "placed"
+    assert e["source"] == "external"
+    assert e["entrust_no"] == "1"
+    assert e["order_qty"] == 100
+    assert e["filled_qty"] == 0
+
+
+def test_placed_then_partial_then_full():
+    s0 = {"1": _order("1", 100, 0, "已报")}
+    s1 = {"1": _order("1", 100, 60, "部成", avg="1699.500")}
+    s2 = {"1": _order("1", 100, 100, "已成", avg="1699.800")}
+
+    e1 = order_watch.diff_snapshots(s0, s1, set())
+    assert [e["event"] for e in e1] == ["partially_filled"]
+    assert e1[0]["filled_qty"] == 60
+    assert e1[0]["avg_price"] == "1699.500"
+
+    e2 = order_watch.diff_snapshots(s1, s2, set())
+    assert [e["event"] for e in e2] == ["filled"]
+    assert e2[0]["filled_qty"] == 100
+    assert e2[0]["note"] == "已成"
+
+
+def test_placed_then_canceled():
+    s0 = {"1": _order("1", 100, 0, "已报")}
+    s1 = {"1": _order("1", 100, 0, "已撤")}
+    evs = order_watch.diff_snapshots(s0, s1, set())
+    assert [e["event"] for e in evs] == ["canceled"]
+
+
+def test_no_change_is_idempotent():
+    s0 = {"1": _order("1", 100, 60, "部成")}
+    assert order_watch.diff_snapshots(s0, dict(s0), set()) == []
+
+
+def test_source_tagged_agent_when_entrust_known():
+    cur = {"9": _order("9", 100, 0, "已报")}
+    evs = order_watch.diff_snapshots({}, cur, {"9"})
+    assert evs[0]["source"] == "agent"
+
+
+def test_disappeared_order_emits_nothing():
+    s0 = {"1": _order("1", 100, 0, "已报")}
+    assert order_watch.diff_snapshots(s0, {}, set()) == []
