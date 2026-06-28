@@ -110,3 +110,103 @@ def test_source_tagged_agent_when_entrust_known():
 def test_disappeared_order_emits_nothing():
     s0 = {"1": _order("1", 100, 0, "已报")}
     assert order_watch.diff_snapshots(s0, {}, set()) == []
+
+
+# ===== Task 5: 轮询薄壳 _poll_once + next_interval(自适应) + order_watch_task =====
+import asyncio
+
+
+class WatchFakeBackend:
+    def __init__(self, scripted):
+        self.win_lock = asyncio.Lock()
+        self.agent_entrust_nos: set[str] = set()
+        self._scripted = list(scripted)   # 每次 orders_active 返回下一项
+        self._i = 0
+
+    async def orders_active(self):
+        item = self._scripted[min(self._i, len(self._scripted) - 1)]
+        self._i += 1
+        return item
+
+
+class WatchFakeClient:
+    def __init__(self, backend):
+        self.backend = backend
+        self.sent: list[dict] = []
+
+    async def send_frame(self, frame):
+        self.sent.append(frame)
+
+
+def test_first_round_builds_baseline_no_emit():
+    backend = WatchFakeBackend([_active([
+        {"证券代码": "600519", "操作": "买入", "委托数量": "100", "委托价格": "1700.000",
+         "成交数量": "0", "成交均价": "", "合同编号": "1", "备注": "已报"},
+    ])])
+    client = WatchFakeClient(backend)
+
+    async def drive():
+        prev, seq, ok = await order_watch._poll_once(backend, client, None, 0)
+        return prev, seq, ok
+
+    prev, seq, ok = asyncio.run(drive())
+    assert ok is True
+    assert set(prev) == {"1"}
+    assert client.sent == []          # 重启只建基线，不补发历史
+
+
+def test_second_round_emits_fill_with_seq_and_ts():
+    r0 = _active([{"证券代码": "600519", "操作": "买入", "委托数量": "100", "委托价格": "1700.000",
+                   "成交数量": "0", "成交均价": "", "合同编号": "1", "备注": "已报"}])
+    r1 = _active([{"证券代码": "600519", "操作": "买入", "委托数量": "100", "委托价格": "1700.000",
+                   "成交数量": "100", "成交均价": "1699.800", "合同编号": "1", "备注": "已成"}])
+    backend = WatchFakeBackend([r0, r1])
+    client = WatchFakeClient(backend)
+
+    async def drive():
+        prev, seq, _ = await order_watch._poll_once(backend, client, None, 0)
+        prev, seq, _ = await order_watch._poll_once(backend, client, prev, seq)
+        return seq
+
+    seq = asyncio.run(drive())
+    assert len(client.sent) == 1
+    ev = client.sent[0]
+    assert ev["event"] == "filled"
+    assert ev["seq"] == 1
+    assert isinstance(ev["ts"], float)
+    assert seq == 1
+
+
+def test_read_failure_skips_round():
+    backend = WatchFakeBackend([{"code": 1, "msg": "验证码弹窗"}])
+    client = WatchFakeClient(backend)
+
+    async def drive():
+        return await order_watch._poll_once(backend, client, None, 0)
+
+    prev, seq, ok = asyncio.run(drive())
+    assert ok is False
+    assert prev is None              # 读失败不污染基线
+    assert client.sent == []
+
+
+def test_next_interval_active_when_open_order():
+    snap = {"1": _order("1", 100, 0, "已报")}            # 未完成 → 提速
+    assert order_watch.next_interval(snap, 300, 60) == 60
+
+
+def test_next_interval_active_when_partial():
+    snap = {"1": _order("1", 100, 60, "部成")}           # 部成仍未完成 → 提速
+    assert order_watch.next_interval(snap, 300, 60) == 60
+
+
+def test_next_interval_idle_when_all_done():
+    snap = {
+        "1": _order("1", 100, 100, "已成"),
+        "2": _order("2", 100, 0, "已撤"),
+    }
+    assert order_watch.next_interval(snap, 300, 60) == 300
+
+
+def test_next_interval_idle_when_empty():
+    assert order_watch.next_interval({}, 300, 60) == 300
