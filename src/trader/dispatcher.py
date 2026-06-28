@@ -238,6 +238,10 @@ async def handle_call(
         reply["error"] = "同花顺实盘交易插件已被禁用，请在客户端界面中开启该插件模块！"
         return reply
 
+    # 串行化 THS 单窗口访问：order_watch 轮询与下单/查询共用 backend.win_lock。
+    needs_window = method in trading_methods
+    if needs_window:
+        await backend.win_lock.acquire()
     try:
         if method == "balance":
             logger.info("[RPC] method=balance, frame_id=%s", frame_id)
@@ -257,12 +261,18 @@ async def handle_call(
             price = params.get("price")
             client_order_id = params.get("client_order_id")
             result = await backend.buy(stock_no, amount, price, client_order_id)
+            _eno = (result or {}).get("entrust_no")
+            if _eno:
+                backend.agent_entrust_nos.add(str(_eno))
         elif method == "sell":
             stock_no = params.get("stock_no")
             amount = params.get("amount")
             price = params.get("price")
             client_order_id = params.get("client_order_id")
             result = await backend.sell(stock_no, amount, price, client_order_id)
+            _eno = (result or {}).get("entrust_no")
+            if _eno:
+                backend.agent_entrust_nos.add(str(_eno))
         elif method == "cancel":
             entrust_no = params.get("entrust_no")
             result = await backend.cancel(entrust_no)
@@ -308,5 +318,8 @@ async def handle_call(
         logger.error("处理 RPC '%s' 出错：%s", method, e)
         reply["ok"] = False
         reply["error"] = str(e)
+    finally:
+        if needs_window:
+            backend.win_lock.release()
 
     return reply

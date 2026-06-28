@@ -20,6 +20,8 @@ class FakeBackend:
     def __init__(self, result):
         self._result = result
         self.calls = []
+        self.win_lock = asyncio.Lock()
+        self.agent_entrust_nos: set[str] = set()
 
     async def _run(self, name, *args):
         self.calls.append((name, args))

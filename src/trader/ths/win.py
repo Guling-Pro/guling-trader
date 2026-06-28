@@ -304,6 +304,10 @@ if platform.system() == "Windows":
 class WinThsBackend:
     def __init__(self):
         self.hwnd_main = None
+        # order_watch 与 RPC 共用：串行化对 THS 单窗口的访问，避免并发 copy_table。
+        self.win_lock = asyncio.Lock()
+        # agent 经 RPC 下单成功后登记的合同编号，供 order_watch 标记事件来源。
+        self.agent_entrust_nos: set[str] = set()
 
     def _ensure_bound(self) -> dict[str, Any] | None:
         """检查是否已绑定；否则 lazy bind，返回错误 dict 或 None（成功）"""
