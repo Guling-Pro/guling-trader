@@ -38,3 +38,32 @@ def in_trading_session(now: datetime) -> bool:
         return False
     t = now.time()
     return (_MORNING[0] <= t <= _MORNING[1]) or (_AFTERNOON[0] <= t <= _AFTERNOON[1])
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return int(str(value if value is not None else "0").strip().replace(",", "") or "0")
+    except (ValueError, TypeError):
+        return 0
+
+
+def build_snapshot(active_result: Optional[dict]) -> dict[str, dict]:
+    """把 orders_active 返回解析为 {合同编号: order_state}。code!=0/空 → {}。"""
+    snap: dict[str, dict] = {}
+    if not active_result or active_result.get("code") != 0:
+        return snap
+    for row in active_result.get("data", []) or []:
+        eno = (row.get(COL_ENTRUST_NO) or "").strip()
+        if not eno:
+            continue
+        snap[eno] = {
+            "entrust_no": eno,
+            "stock_no": (row.get(COL_CODE) or "").strip(),
+            "op": (row.get(COL_OP) or "").strip(),
+            "order_qty": _to_int(row.get(COL_ORDER_QTY)),
+            "order_price": (row.get(COL_ORDER_PRICE) or "").strip(),
+            "filled_qty": _to_int(row.get(COL_FILLED_QTY)),
+            "avg_price": (row.get(COL_AVG_PRICE) or "").strip(),
+            "note": (row.get(COL_NOTE) or "").strip(),
+        }
+    return snap
