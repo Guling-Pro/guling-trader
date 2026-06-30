@@ -1,0 +1,1072 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>股灵交易桌面客户端 (guling-trader) 交互式设计确认原型 (极致纯粹版)</title>
+    <style>
+        :root {
+            --bg-color: #f6f8fa;
+            --card-bg: #ffffff;
+            --border-color: #d0d7de;
+            --text-primary: #24292f;
+            --text-secondary: #57606a;
+            --gold-primary: #e0b656;
+            --gold-dark: #b8913b;
+            --gold-light: #fffdf5;
+            --green-primary: #00c800;
+            --green-bg: #e6fcf5;
+            --orange-primary: #e67e22;
+            --orange-bg: #fffbe6;
+            --blue-primary: #4a90e2;
+            --blue-bg: #f0f7ff;
+            --active-bg: #f0f2f5;
+            --red-primary: #cf222e;
+            --red-bg: #ffebe9;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            background-color: #2b2b2b;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+
+        /* 模拟横向拓宽的桌面软件外边框 */
+        .window-frame {
+            width: 720px;
+            height: 480px;
+            background-color: var(--bg-color);
+            border-radius: 12px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+            user-select: none;
+            border: 1px solid #444;
+        }
+
+        /* 顶部标题栏 */
+        .title-bar {
+            height: 40px;
+            background-color: var(--card-bg);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 16px;
+            flex-shrink: 0;
+        }
+
+        .window-controls {
+            display: flex;
+            gap: 8px;
+        }
+
+        .dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        .dot-red { background-color: #ff5f56; }
+        .dot-yellow { background-color: #ffbd2e; }
+        .dot-green { background-color: #27c93f; }
+
+        .brand-title {
+            font-size: 14px;
+            font-weight: bold;
+            color: var(--gold-dark);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .header-right {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        /* 左右分栏核心栅格 */
+        .main-content-layout {
+            flex: 1;
+            display: flex;
+            padding: 12px;
+            gap: 12px;
+            overflow: hidden;
+        }
+
+        /* 左分栏：Agent 连接 + 调用日志 */
+        .left-column {
+            width: 290px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+
+        /* 右分栏：插件驱动集合仓 */
+        .right-column {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+
+        /* 统一的插件卡片样式 (支持开启折叠) */
+        .plugin-card {
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            background-color: var(--card-bg);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+            transition: all 0.3s ease;
+        }
+
+        .plugin-card.disabled-style {
+            background-color: #fafbfc;
+        }
+
+        .plugin-header {
+            height: 32px;
+            background-color: #fcfcfc;
+            border-bottom: 1px solid transparent;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 10px;
+            transition: background-color 0.2s ease;
+        }
+
+        .plugin-title-wrap {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 11px;
+            font-weight: bold;
+            color: var(--text-secondary);
+        }
+
+        /* 统一的主开关滑块样式 */
+        .switch-btn {
+            font-size: 9px;
+            font-weight: bold;
+            padding: 2px 8px;
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+            background-color: #fafbfc;
+            color: var(--text-secondary);
+            cursor: pointer;
+            outline: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            transition: all 0.2s ease;
+        }
+
+        .switch-btn.on {
+            background-color: var(--green-bg);
+            border-color: var(--green-primary);
+            color: var(--green-primary);
+        }
+
+        .switch-btn:hover {
+            filter: brightness(0.95);
+        }
+
+        /* 卡片内部伸缩体 */
+        .plugin-body {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.25s ease-in-out;
+            background-color: #ffffff;
+        }
+
+        .plugin-card.open .plugin-body {
+            max-height: 340px; /* 同花顺展开高度限制 */
+        }
+
+        .plugin-card.open .plugin-header {
+            border-bottom-color: var(--border-color);
+        }
+
+        .plugin-body-inner {
+            padding: 10px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        /* 卡片通用样式 (左侧 MCP 接入用) */
+        .card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+        }
+
+        /* 卡片内部状态徽章 */
+        .card-status-badge {
+            font-size: 9px;
+            font-weight: bold;
+            padding: 1px 5px;
+            border-radius: 4px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .card-status-badge.red { background-color: var(--red-bg); color: var(--red-primary); }
+        .card-status-badge.orange { background-color: var(--orange-bg); color: var(--orange-primary); }
+        .card-status-badge.green { background-color: var(--green-bg); color: var(--green-primary); }
+
+        .card-title {
+            font-size: 11px;
+            font-weight: bold;
+            color: var(--text-primary);
+            border-bottom: 1px solid #f0f2f5;
+            padding-bottom: 4px;
+            margin: 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        /* 接入配对卡片细节 */
+        .pairing-container {
+            background-color: var(--orange-bg);
+            border-top: 2px solid var(--gold-primary);
+            border-radius: 4px;
+            padding: 10px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .connected-container {
+            background-color: var(--green-bg);
+            border-top: 2px solid var(--green-primary);
+            border-radius: 4px;
+            padding: 10px 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .countdown-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        .countdown-text {
+            color: var(--orange-primary);
+            font-weight: bold;
+        }
+
+        .code-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+        }
+
+        .code-text {
+            font-family: "Consolas", monospace;
+            font-size: 16px;
+            font-weight: bold;
+            color: #222;
+            letter-spacing: 0.5px;
+        }
+
+        /* 按钮通用 */
+        .btn {
+            background-color: #fafbfc;
+            border: 1px solid var(--border-color);
+            border-radius: 5px;
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--text-primary);
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            transition: all 0.15s ease;
+            outline: none;
+        }
+
+        .btn:hover {
+            background-color: #f3f4f6;
+            border-color: #1b1f2426;
+        }
+
+        .btn-primary {
+            background-color: var(--gold-primary);
+            color: #ffffff;
+            border-color: var(--gold-dark);
+        }
+
+        .btn-primary:hover {
+            background-color: var(--gold-dark);
+        }
+
+        .btn-unbind {
+            border-color: var(--red-primary);
+            color: var(--red-primary);
+            background-color: #ffffff;
+            padding: 4px 10px;
+            font-weight: bold;
+        }
+
+        .btn-unbind:hover {
+            background-color: var(--red-bg);
+        }
+
+        /* 向导步骤样式 */
+        .wizard-step {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 10px;
+            color: var(--text-secondary);
+            padding: 2px 0;
+        }
+
+        .step-circle {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            border: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 8px;
+            font-weight: bold;
+            background-color: #fafbfc;
+            flex-shrink: 0;
+        }
+
+        .wizard-step.active {
+            color: var(--orange-primary);
+            font-weight: bold;
+        }
+
+        .wizard-step.active .step-circle {
+            border-color: var(--orange-primary);
+            color: var(--orange-primary);
+            background-color: var(--orange-bg);
+        }
+
+        .wizard-step.done {
+            color: var(--green-primary);
+        }
+
+        .wizard-step.done .step-circle {
+            border-color: var(--green-primary);
+            color: var(--green-primary);
+            background-color: var(--green-bg);
+        }
+
+        .step-hint {
+            color: var(--orange-primary);
+            font-weight: normal;
+            margin-left: 2px;
+        }
+
+        .rpa-flow-desc {
+            font-size: 9px;
+            color: var(--text-secondary);
+            line-height: 1.35;
+            background-color: #f8f9fa;
+            padding: 6px 8px;
+            border-radius: 4px;
+            border-left: 2px solid var(--gold-primary);
+        }
+
+        /* 执行与调用日志区 */
+        .log-panel {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        .logs-console {
+            flex: 1;
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            font-family: "Menlo", "Consolas", monospace;
+            font-size: 9px;
+            padding: 6px;
+            border-radius: 4px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            border: 1px solid #333;
+            line-height: 1.3;
+        }
+
+        /* 最底部操作行 */
+        .footer-action-row {
+            height: 34px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 12px;
+            border-top: 1px solid var(--border-color);
+            background-color: #ffffff;
+            flex-shrink: 0;
+        }
+
+        .progress-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex: 1;
+            margin: 0 10px;
+        }
+
+        .progress-bar-wrap {
+            flex: 1;
+            height: 5px;
+            background-color: #eaeef2;
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            background-color: var(--gold-primary);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        .progress-label {
+            font-size: 9px;
+            color: var(--text-secondary);
+            min-width: 80px;
+        }
+
+        /* 底部营销链接 Footer */
+        .bottom-branding-footer {
+            height: 20px;
+            background-color: var(--bg-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 12px;
+            font-size: 9px;
+            color: #999999;
+            border-top: 1px solid #e1e4e8;
+            flex-shrink: 0;
+        }
+
+        .website-link {
+            color: var(--blue-primary);
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        .website-link:hover {
+            text-decoration: underline;
+        }
+
+        /* 浮动状态模拟面板 */
+        .simulator-panel {
+            position: absolute;
+            top: 40px;
+            left: 40px;
+            width: 250px;
+            background-color: #1e1e1e;
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 14px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            color: #eee;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            z-index: 300;
+        }
+
+        .sim-title {
+            font-size: 12px;
+            font-weight: bold;
+            color: var(--gold-primary);
+            margin: 0;
+            border-bottom: 1px solid #333;
+            padding-bottom: 6px;
+        }
+
+        .sim-group {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .sim-group label {
+            font-size: 9px;
+            color: #aaa;
+            text-transform: uppercase;
+        }
+
+        .sim-btn {
+            background-color: #2d2d2d;
+            border: 1px solid #444;
+            color: #ccc;
+            padding: 5px;
+            border-radius: 4px;
+            font-size: 10px;
+            cursor: pointer;
+            text-align: left;
+            transition: all 0.15s ease;
+        }
+
+        .sim-btn:hover {
+            background-color: #3d3d3d;
+            color: white;
+            border-color: var(--gold-primary);
+        }
+
+        .sim-btn.active {
+            background-color: var(--gold-primary);
+            color: #111;
+            font-weight: bold;
+            border-color: var(--gold-primary);
+        }
+
+        /* 气泡提示 */
+        .toast {
+            position: absolute;
+            top: 55px;
+            left: 50%;
+            transform: translateX(-50%) translateY(-10px);
+            background-color: #24292f;
+            color: #ffffff;
+            font-size: 10px;
+            padding: 5px 12px;
+            border-radius: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.25s ease;
+            z-index: 400;
+        }
+
+        .toast.show {
+            opacity: 1;
+            visibility: visible;
+            transform: translateX(-50%) translateY(0);
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 浮动的运行状态模拟器 -->
+    <div class="simulator-panel">
+        <h3 class="sim-title">🔄 原型状态切换模拟 (极致纯粹版)</h3>
+        
+        <div class="sim-group">
+            <label>1. 系统接入与连接状态</label>
+            <button class="sim-btn active" id="sim-unpaired" onclick="setAppState('UNPAIRED')">未配对接入 (卡片显示大号配对码)</button>
+            <button class="sim-btn" id="sim-connected" onclick="setAppState('CONNECTED')">已配对就绪 (卡片收拢为已连接)</button>
+            <button class="sim-btn" id="sim-installing" onclick="setAppState('INSTALLING')">模拟同花顺/OCR 静默补齐安装中</button>
+        </div>
+
+        <div class="sim-group">
+            <label>2. 同花顺向导步骤自检</label>
+            <button class="sim-btn" id="sim-step1" onclick="setThsStep(1)">步骤 1：未发现行情软件</button>
+            <button class="sim-btn" id="sim-step2" onclick="setThsStep(2)">步骤 2：未启动交易独立委托</button>
+            <button class="sim-btn" id="sim-step3" onclick="setThsStep(3)">步骤 3：独立委托未切换到旧版</button>
+            <button class="sim-btn" id="sim-step4" onclick="setThsStep(4)">步骤 4：自检全部就绪 (收拢面板)</button>
+        </div>
+
+        <div style="font-size: 9px; color: #888; border-top: 1px solid #333; padding-top: 8px; line-height: 1.35;">
+            💡 <b>“极致纯粹”要点说明</b>：<br>
+            • <b>完全删除了杂质占位插件</b>：彻底拿掉了画饼的美港股/微信灰色假卡槽，右半分栏如今只承载目前最核心、最完美的双引擎，信息聚焦效率最大化。<br>
+            • <b>逻辑完美一致</b>：左右分栏高度对称，每一个主开关都拥有极致对称的滑动展开/折叠体验。
+        </div>
+    </div>
+
+    <!-- 剪贴板复制提示 -->
+    <div class="toast" id="toast-notify">✓ 已复制</div>
+
+    <!-- 客户端主窗口 -->
+    <div class="window-frame">
+        
+        <!-- 1. 顶部标题栏 -->
+        <div class="title-bar">
+            <div class="window-controls">
+                <div class="dot dot-red"></div>
+                <div class="dot dot-yellow"></div>
+                <div class="dot dot-green"></div>
+            </div>
+            <div class="brand-title">
+                🤖 股灵交易助手
+            </div>
+            <div class="header-right">
+                <span>v0.4.14</span>
+            </div>
+        </div>
+
+        <!-- 2. 主页面 左右分栏 Layout -->
+        <div class="main-content-layout">
+            
+            <!-- 【左分栏】MCP 网关连接与监控 (Agent 连接 + 调用控制台) -->
+            <div class="left-column">
+                
+                <!-- A. Agent MCP 接入控制舱 -->
+                <div class="card" id="mcp-card">
+                    <div class="card-title">
+                        <span>🤖 Agent MCP 接入控制</span>
+                        <span class="card-status-badge red" id="mcp-status-badge">未连接 🔴</span>
+                    </div>
+                    
+                    <!-- 情况一：未连接 -->
+                    <div id="mcp-unpaired-box" class="pairing-container">
+                        <div class="countdown-row">
+                            <span style="font-weight: 500;">配对码倒计时：</span>
+                            <span class="countdown-text" id="pairing-countdown">04:59</span>
+                        </div>
+                        <div class="code-row">
+                            <span class="code-text" id="pairing-code">配对码: 328-984</span>
+                            <button class="btn btn-primary" onclick="copyPairingInstruction()">复制接入指令</button>
+                        </div>
+                    </div>
+
+                    <!-- 情况二：已连接 -->
+                    <div id="mcp-connected-box" class="connected-container" style="display: none;">
+                        <div style="font-size: 11px; color: var(--text-secondary); line-height: 1.4; flex: 1;">
+                            <span style="font-weight: bold; color: var(--green-primary); font-size: 12px;">✓ 已成功连接股灵服务</span><br>
+                            <span id="bind-account-info">当前绑定账号: guling_real</span>
+                        </div>
+                        <button class="btn btn-unbind" onclick="resetUnpaired()">解除绑定</button>
+                    </div>
+                </div>
+
+                <!-- B. 调用与执行控制台 -->
+                <div class="log-panel">
+                    <div class="card-title" style="border: none; padding-bottom: 2px;">
+                        <span>📄 调用与执行日志</span>
+                    </div>
+                    <div class="logs-console" id="log-console-box">[15:57:12] === guling-trader 启动 ===
+[15:57:12] log file: C:\Users\Local\trader.log
+[15:57:13] 设备 ID: guling-desktop-8b43f9a
+[15:57:13] 开始自检行情客户端 (hexin)...</div>
+                </div>
+
+            </div>
+
+            <!-- 【右分栏】本地插件驱动合集仓 (仅挂载核心实装的双引擎插件) -->
+            <div class="right-column">
+                
+                <!-- 插件 1：同花顺实盘交易插件 (带主开关，关闭时自动滑动折叠) -->
+                <div class="plugin-card open" id="ths-card">
+                    <div class="plugin-header">
+                        <div class="plugin-title-wrap">
+                            <span>⚡ 同花顺实盘交易插件</span>
+                        </div>
+                        <!-- 头部右侧主开关 (点击触发滑动伸缩) -->
+                        <button class="switch-btn on" id="ths-master-switch" onclick="toggleThsPlugin(event)">已启用 🟢</button>
+                    </div>
+                    
+                    <!-- 自适应伸缩体 -->
+                    <div class="plugin-body" id="ths-body">
+                        <div class="plugin-body-inner">
+                            <div style="display: flex; align-items: center; justify-content: space-between;">
+                                <span style="font-size: 9px; color: var(--text-secondary);">运行状态：</span>
+                                <span class="card-status-badge orange" id="ths-status-badge">等待启动 ⏳</span>
+                            </div>
+
+                            <!-- 新增：依赖/安装进度条（仅在自动下载补齐时可见） -->
+                            <div id="ths-install-box" style="display: none; flex-direction: column; gap: 4px; padding: 4px 0; border-top: 1px dashed #eee; margin-top: 4px;">
+                                <div style="display: flex; justify-content: space-between; font-size: 9px; color: var(--text-secondary);">
+                                    <span>正在静默下载并补齐 OCR 引擎组件...</span>
+                                    <span class="countdown-text" id="install-progress-text-inner" style="color: var(--orange-primary); font-weight: bold;">0%</span>
+                                </div>
+                                <div class="progress-bar-wrap" style="height: 6px; background-color: #eaeef2; border-radius: 3px; overflow: hidden; margin-top: 2px; flex-shrink: 0;">
+                                    <div class="progress-bar-fill" id="install-progress-fill-inner" style="height: 100%; background-color: var(--gold-primary); width: 0%;"></div>
+                                </div>
+                                <span style="font-size: 8px; color: #999; margin-top: 2px;" id="install-progress-subtext">正在从 guling.pro 下载 Tesseract-OCR (45.0 MB)...</span>
+                            </div>
+
+                            <!-- 自检引导 -->
+                            <div id="ths-wizard-box" style="display: flex; flex-direction: column; gap: 2px;">
+                                <div class="wizard-step" id="step-row-1">
+                                    <div class="step-circle">1</div>
+                                    <span>检测行情软件 (hexin)</span>
+                                    <span class="step-hint" id="step-hint-1"></span>
+                                </div>
+                                <div class="wizard-step" id="step-row-2">
+                                    <div class="step-circle">2</div>
+                                    <span>定位交易进程 (xiadan)</span>
+                                    <span class="step-hint" id="step-hint-2"></span>
+                                </div>
+                                <div class="wizard-step" id="step-row-3">
+                                    <div class="step-circle">3</div>
+                                    <span>捕获「交易窗口」</span>
+                                    <span class="step-hint" id="step-hint-3"></span>
+                                </div>
+                            </div>
+
+                            <!-- 就绪收拢 -->
+                            <div id="ths-ready-box" style="display: none; align-items: center; justify-content: space-between; padding: 2px 0;">
+                                <div style="display: flex; flex-direction: column; gap: 2px; font-size: 10px;">
+                                    <span style="color: var(--green-primary); font-weight: bold;">✓ 实盘驱动已就绪:</span>
+                                    <span style="color: var(--text-secondary); font-family: monospace; font-size: 9px; word-break: break-all;" id="ready-path-label">C:\ths\xiadan.exe</span>
+                                </div>
+                                <button class="btn" style="padding: 1px 4px; font-size: 9px;" onclick="setThsStep(3)">变更</button>
+                            </div>
+
+                            <!-- 打开按钮 -->
+                            <div id="ths-action-footer-row" style="margin-top: 2px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid #f0f2f5; padding-top: 6px;">
+                                <button class="btn btn-primary" style="padding: 4px 10px; font-weight: bold;" onclick="triggerOpenThs()">启动并打开同花顺</button>
+                                <span style="font-size: 9px; color: var(--text-secondary);" id="ths-action-hint">未就绪，请先检查步骤</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 插件 2：网页 RPA 社交发帖 (带主开关，关闭时自动滑动折叠) -->
+                <div class="plugin-card" id="rpa-collapsible">
+                    
+                    <div class="plugin-header">
+                        <div class="plugin-title-wrap">
+                            <span>🌐 网页 RPA 社交发帖 (可选)</span>
+                        </div>
+                        <!-- 头部右侧主开关 (点击触发滑动伸缩) -->
+                        <button class="switch-btn" id="rpa-master-switch" onclick="toggleRpaPlugin(event)">已禁用 ⚪</button>
+                    </div>
+
+                    <div class="plugin-body" id="rpa-body">
+                        <div class="plugin-body-inner">
+                            <div id="rpa-actions-box" style="display: flex; flex-direction: column; gap: 4px;">
+                                <div style="display: flex; align-items: center; justify-content: space-between;">
+                                    <button class="btn btn-primary" style="padding: 2px 6px; font-size: 9px;" onclick="runPatchBrowser()">一键配置桌面浏览器参数</button>
+                                    <span style="font-size: 8px; color: var(--text-secondary);">支持 Edge/Chrome 自动修复</span>
+                                </div>
+                            </div>
+
+                            <div class="rpa-flow-desc">
+                                <b>💡 它如何工作：AI 自动调用</b><br>
+                                勾选开启后，AI 代理（如 <code>yu-agent</code>）获得直接调用发帖接口的能力。股灵控制您本机日常登录的浏览器去静默填表，直接继承您的雪球已登录态，安全免登录。
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+
+            </div>
+
+        </div>
+
+        <!-- 3. 最底系统操作行 -->
+        <div class="footer-action-row">
+            <div style="flex: 1;" id="footer-spacer"></div>
+            <button class="btn" style="padding: 3px 10px;" onclick="triggerExit()">退出程序</button>
+        </div>
+
+        <!-- 4. 底部营销链接 Footer -->
+        <div class="bottom-branding-footer">
+            <span>股灵交易助手</span>
+            <span class="website-link" onclick="openWebsite()">股灵 guling.pro ↗</span>
+        </div>
+
+    </div>
+
+    <script>
+        // 软件全局模拟状态
+        let appState = "UNPAIRED";
+        let thsStep = 1;
+        let isThsPluginEnabled = true;
+        let isRpaPluginEnabled = false;
+        let pairingTimeLeft = 300; // 5分钟倒计时
+        let installProgress = 0;
+
+        // 定时器模拟配对码失效
+        setInterval(() => {
+            if (appState === "UNPAIRED" && pairingTimeLeft > 0) {
+                pairingTimeLeft--;
+                const m = Math.floor(pairingTimeLeft / 60);
+                const s = pairingTimeLeft % 60;
+                document.getElementById("pairing-countdown").innerText = `${m}:${s < 10 ? '0' : ''}${s}`;
+            }
+        }, 1000);
+
+        // 定时器模拟下载安装
+        setInterval(() => {
+            if (appState === "INSTALLING" && installProgress < 100) {
+                installProgress += 5;
+                if (installProgress > 100) installProgress = 100;
+                
+                // 动态更新同花顺卡片内部的进度条
+                document.getElementById("install-progress-fill-inner").style.width = `${installProgress}%`;
+                const mbDone = (installProgress * 0.45).toFixed(1);
+                document.getElementById("install-progress-text-inner").innerText = `${installProgress}%`;
+                document.getElementById("install-progress-subtext").innerText = `正在从 guling.pro 下载 Tesseract-OCR (${mbDone}/45.0 MB)...`;
+                
+                logMessage(`[INSTALLER] 下载进度：${installProgress}% (${mbDone}/45.0 MB)`);
+                
+                if (installProgress === 100) {
+                    appState = "UNPAIRED";
+                    thsStep = 4;
+                    renderUI();
+                    logMessage(`[✓] 同花顺自动安装/OCR 环境补齐成功！`);
+                    logMessage(`[✓] 自检完成 · xiadan 就绪`);
+                }
+            }
+        }, 800);
+
+        // 切换软件运行状态模拟
+        function setAppState(state) {
+            appState = state;
+            if (state === "UNPAIRED") {
+                pairingTimeLeft = 300;
+            } else if (state === "INSTALLING") {
+                installProgress = 0;
+            }
+            
+            // 按钮高亮更新
+            document.querySelectorAll(".simulator-panel button[id^='sim-']").forEach(btn => btn.classList.remove("active"));
+            if (state === "UNPAIRED") document.getElementById("sim-unpaired").classList.add("active");
+            if (state === "CONNECTED") document.getElementById("sim-connected").classList.add("active");
+            if (state === "INSTALLING") document.getElementById("sim-installing").classList.add("active");
+
+            renderUI();
+            logMessage(`[Simulator] 软件运行态切换为：${state}`);
+        }
+
+        // 切换同花顺向导自检步骤
+        function setThsStep(step) {
+            thsStep = step;
+            renderUI();
+            logMessage(`[Simulator] 同花顺检测步骤变更为：第 ${step} 步`);
+        }
+
+        // ⚡ 切换同花顺插件开启/折叠状态
+        function toggleThsPlugin(event) {
+            event.stopPropagation();
+            const switchBtn = document.getElementById("ths-master-switch");
+            const thsCard = document.getElementById("ths-card");
+            const thsBody = document.getElementById("ths-body");
+            
+            isThsPluginEnabled = !isThsPluginEnabled;
+            if (isThsPluginEnabled) {
+                switchBtn.innerText = "已启用 🟢";
+                switchBtn.classList.add("on");
+                thsCard.classList.add("open");
+                thsCard.classList.remove("disabled-style");
+                thsBody.style.maxHeight = "340px"; // 滑动展开
+                logMessage("[Plugin] 同花顺交易插件已启用，自动向云端宣告下单/查询实盘能力接口！");
+            } else {
+                switchBtn.innerText = "已禁用 ⚪";
+                switchBtn.classList.remove("on");
+                thsCard.classList.remove("open");
+                thsCard.classList.add("disabled-style");
+                thsBody.style.maxHeight = "0px"; // 滑动折叠
+                logMessage("[Plugin] 同花顺交易插件已禁用，已从云端注销所有实盘交易接口。");
+            }
+        }
+
+        // 🌐 切换 RPA 发帖插件开启/折叠状态
+        function toggleRpaPlugin(event) {
+            event.stopPropagation();
+            const switchBtn = document.getElementById("rpa-master-switch");
+            const card = document.getElementById("rpa-collapsible");
+            const body = document.getElementById("rpa-body");
+            
+            isRpaPluginEnabled = !isRpaPluginEnabled;
+            if (isRpaPluginEnabled) {
+                switchBtn.innerText = "已启用 🟢";
+                switchBtn.classList.add("on");
+                card.classList.add("open");
+                card.classList.remove("disabled-style");
+                body.style.maxHeight = "340px"; // 滑动展开
+                logMessage("[Plugin] RPA 网页发帖插件已启用，自动暴露 xueqiu_publish_review 动作！");
+            } else {
+                switchBtn.innerText = "已禁用 ⚪";
+                switchBtn.classList.remove("on");
+                card.classList.remove("open");
+                card.classList.add("disabled-style");
+                body.style.maxHeight = "0px"; // 滑动折叠
+                logMessage("[Plugin] RPA 网页发帖插件已禁用，已从云端注销发帖能力接口。");
+            }
+        }
+
+        // 一键浏览器配置
+        function runPatchBrowser() {
+            logMessage("[RPA] 开始一键注入桌面浏览器快捷方式...");
+            logMessage("[RPA] 检测到桌面路径：C:\\Users\\Public\\Desktop\\Microsoft Edge.lnk");
+            logMessage("[✓] 快捷方式修补成功，追加启动参数：--remote-debugging-port=9222");
+            
+            showToast("✓ 成功配置桌面浏览器！");
+        }
+
+        // 复制接入指令
+        function copyPairingInstruction() {
+            const code = "328-984";
+            const textToCopy = `打开 https://mcp.guling.pro 帮我接入股灵交易，配对码 ${code}`;
+            
+            navigator.clipboard.writeText(textToCopy).then(() => {
+                showToast("✓ 已复制");
+                logMessage(`[UI] 用户点击复制接入指令："${textToCopy}"`);
+            }).catch(err => {
+                logMessage(`[UI] 复制失败：${textToCopy}`);
+            });
+        }
+
+        // 触发启动同花顺
+        function triggerOpenThs() {
+            logMessage("[Action] 用户点击：启动并打开同花顺行情客户端...");
+            if (thsStep < 4) {
+                logMessage("[警告] 环境检测未全部完成，请按照第 1~3 步的引导进行配置！");
+            } else {
+                logMessage("[✓] 成功呼起 C:\\ths\\xiadan.exe 进程！窗口置顶。");
+            }
+        }
+
+        // 触发退出
+        function triggerExit() {
+            logMessage("[Action] 用户点击：退出程序");
+            alert("正在关闭股灵交易助手进程...");
+        }
+
+        // 恢复未配对
+        function resetUnpaired() {
+            setAppState("UNPAIRED");
+        }
+
+        // 打开官网
+        function openWebsite() {
+            logMessage("[Action] 点击官网链接，打开 https://guling.pro");
+            window.open("https://guling.pro", "_blank");
+        }
+
+        // 显示气泡通知
+        function showToast(text) {
+            const toast = document.getElementById("toast-notify");
+            toast.innerText = text;
+            toast.classList.add("show");
+            setTimeout(() => {
+                toast.classList.remove("show");
+            }, 2500);
+        }
+
+        // 在控制台追加一条日志
+        function logMessage(msg) {
+            const consoleBox = document.getElementById("log-console-box");
+            const now = new Date();
+            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+            consoleBox.innerHTML += `\n[${timeStr}] ${msg}`;
+            consoleBox.scrollTop = consoleBox.scrollHeight;
+        }
+
+        // 渲染 UI 自适应
+        function renderUI() {
+            const mcpStatusBadge = document.getElementById("mcp-status-badge");
+            const mcpUnpairedBox = document.getElementById("mcp-unpaired-box");
+            const mcpConnectedBox = document.getElementById("mcp-connected-box");
+            
+            const thsStatusBadge = document.getElementById("ths-status-badge");
+            const thsWizardBox = document.getElementById("ths-wizard-box");
+            const thsReadyBox = document.getElementById("ths-ready-box");
+            const thsInstallBox = document.getElementById("ths-install-box");
+            const thsActionHint = document.getElementById("ths-action-hint");
+            const thsActionFooterRow = document.getElementById("ths-action-footer-row");
+
+            // 1. 处理 Agent MCP 接入卡片内部的状态自适应
+            if (appState === "UNPAIRED") {
+                mcpStatusBadge.innerText = "未连接 🔴";
+                mcpStatusBadge.className = "card-status-badge red";
+                mcpUnpairedBox.style.display = "flex";
+                mcpConnectedBox.style.display = "none";
+            } else if (appState === "CONNECTED") {
+                mcpStatusBadge.innerText = "已连接 🟢";
+                mcpStatusBadge.className = "card-status-badge green";
+                mcpUnpairedBox.style.display = "none";
+                mcpConnectedBox.style.display = "flex";
+            } else if (appState === "INSTALLING") {
+                // 静默下载安装时，MCP卡片依然可以照常显示等待配对，极佳的并行体验
+                mcpStatusBadge.innerText = "未连接 🔴";
+                mcpStatusBadge.className = "card-status-badge red";
+                mcpUnpairedBox.style.display = "flex";
+                mcpConnectedBox.style.display = "none";
+            }
+
+            // 2. 处理同花顺步骤与状态自适应
+            if (appState === "INSTALLING") {
+                thsStatusBadge.innerText = "静默安装中 ⏳";
+                thsStatusBadge.className = "card-status-badge orange";
+                thsWizardBox.style.display = "none";
+                thsReadyBox.style.display = "none";
+                thsInstallBox.style.display = "flex";
+                thsActionFooterRow.style.display = "none";
+            } else {
+                thsInstallBox.style.display = "none";
+                thsActionFooterRow.style.display = "flex";
+                if (thsStep === 4) {
+                    thsStatusBadge.innerText = "已就绪 🟢";
+                    thsStatusBadge.className = "card-status-badge green";
+                    thsWizardBox.style.display = "none";
+                    thsReadyBox.style.display = "flex";
+                    thsActionHint.innerText = "✓ 客户端自检就绪";
+                } else {
+                    thsStatusBadge.innerText = "等待启动 ⏳";
+                    thsStatusBadge.className = "card-status-badge orange";
+                    thsWizardBox.style.display = "flex";
+                    thsReadyBox.style.display = "none";
+                    thsActionHint.innerText = "未启动，请点击唤起客户端";
+
+                    for (let s = 1; s <= 3; s++) {
+                        const row = document.getElementById(`step-row-${s}`);
+                        const circle = row.querySelector(".step-circle");
+                        const hint = document.getElementById(`step-hint-${s}`);
+                        
+                        row.className = "wizard-step";
+                        hint.innerText = "";
+
+                        if (s < thsStep) {
+                            row.classList.add("done");
+                            circle.innerText = "✓";
+                        } else if (s === thsStep) {
+                            row.classList.add("active");
+                            circle.innerText = s;
+                            if (s === 1) hint.innerText = "→ 请双击打开桌面同花顺软件";
+                            if (s === 2) hint.innerText = "→ 请在行情客户端右上角点击「委托」";
+                            if (s === 3) hint.innerText = "→ 请在委托窗口中点击「切换旧版」";
+                        } else {
+                            circle.innerText = s;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 初始化
+        renderUI();
+    </script>
+</body>
+</html>
