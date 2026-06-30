@@ -311,8 +311,22 @@ class WinThsBackend:
 
     def _ensure_bound(self) -> dict[str, Any] | None:
         """检查是否已绑定；否则 lazy bind，返回错误 dict 或 None（成功）"""
+        # 关键：缓存句柄必须验活。xiadan 重启后旧 hwnd 数值仍 >0 但窗口已销毁，
+        # 不验活会拿死句柄去 SendMessage/FindWindowEx → Win32 报错 1400「无效的窗口句柄」。
+        # IsWindow 判断句柄是否仍指向存活窗口；标题前缀校验顺带防 HWND 数值被系统回收复用。
         if self.hwnd_main and self.hwnd_main > 0:
-            return None  # 已绑定
+            try:
+                alive = bool(win32gui.IsWindow(self.hwnd_main)) and win32gui.GetWindowText(
+                    self.hwnd_main
+                ).startswith(window_title)
+            except Exception:
+                alive = False
+            if alive:
+                return None  # 已绑定且句柄有效
+            logger.info(
+                "缓存的 xiadan 句柄 %s 已失效（疑似重启/重登），重新捕获…", self.hwnd_main
+            )
+            self.hwnd_main = None  # 丢弃失效句柄，强制重绑
 
         # 尝试 bind
         logger.info("未检测到 xiadan 窗口，尝试 lazy bind...")
