@@ -13,7 +13,12 @@
 注意：会用 F4/F1/F6/F8/F2/F7 等热键切换【查询】面板，不触发任何下单。
 收盘/周末运行最稳。运行时最好让 `python -m trader` 先退出，避免两者同时驱动窗口。
 """
+import os
+import sys
 import time
+
+# 免设 PYTHONPATH：把仓库的 src 目录插入模块搜索路径，裸跑 `python tools\probe_ids.py` 即可
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 import win32api
 import win32con

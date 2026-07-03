@@ -3,8 +3,7 @@
 用途：判断"新版/旧版"界面切换后，控件类名链是否还能被现有自动化定位——
 即回答"新版是否支持、要不要改代码"。切到某个版本后运行，把输出贴给维护者即可。
 
-用法（项目根目录，cmd）：
-    set PYTHONPATH=src
+用法（项目根目录，任意 shell）：
     python tools/dump_ths.py
 
 对照读法：
@@ -15,6 +14,11 @@
                                        → 新版重写了 UI，标准控件自动化不可行。
 """
 import collections
+import os
+import sys
+
+# 免设 PYTHONPATH：把仓库的 src 目录插入模块搜索路径，裸跑即可
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 import win32gui
 import win32process
