@@ -1,66 +1,64 @@
-"""探查 xiadan「自选股」面板：在整个窗口里定位【可见】的自选股 grid（新版专有）。只读，临时探针。
+"""定位并校验 xiadan 的自选股文件 SelfStockInfo.json（新版自选股来源）。只读，临时探针。
 
-上一版发现自选股视图不在 get_right_hwnd 容器里（那里的 grid 全 vis=0、且是残留持仓表）。
-本版在 hwnd_main 全窗口枚举所有 CVirtualGridCtrl，打印 hwnd/id/可见/矩形，并读出【可见】
-那张的表头——表头是 代码/名称/涨幅/现价 即自选股。
+自选股列表在 xiadan 里是 CEF(内嵌Chromium) 渲染的网页，原生控件读不到；但 xiadan 会把
+自选股维护到本地 SelfStockInfo.json。本探针从 xiadan.exe 进程路径出发搜这个文件，报路径、
+更新时间、解析出的自选股数量与前几只，确认它是否可用作 get_watchlist 的数据源。
 
-运行前请把自选股面板停在【自选】tab（不是持仓）。
-用法（项目根，任意 shell，停掉 python -m trader）：
+用法（项目根，任意 shell）：
     python tools\\probe_watchlist.py
 """
+import glob
+import json
 import os
 import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-import win32gui
+try:
+    import psutil
+except Exception:
+    psutil = None
 
-from trader.ths import win as W
+# 1) 找 xiadan.exe 的安装目录
+roots = set()
+if psutil:
+    for p in psutil.process_iter(["name", "exe"]):
+        try:
+            if (p.info["name"] or "").lower() == "xiadan.exe" and p.info["exe"]:
+                roots.add(os.path.dirname(p.info["exe"]))
+        except Exception:
+            pass
+# 常见同花顺安装目录兜底
+for guess in (r"C:\同花顺软件", r"C:\Program Files\同花顺", r"C:\Program Files (x86)\同花顺",
+              r"D:\同花顺软件", os.path.expanduser(r"~\同花顺")):
+    if os.path.isdir(guess):
+        roots.add(guess)
 
-W.setup("网上股票交易系统5.0", "", "")
-b = W.WinThsBackend()
-b.bind_client()
-print("hwnd_main =", hex(b.hwnd_main) if b.hwnd_main else None)
-if not b.hwnd_main:
-    raise SystemExit("!! 未绑定，先确认已打开并登录（新版），且自选股停在【自选】tab")
+print("搜索根目录:", roots or "（未找到 xiadan 进程/安装目录，请手动指认）")
 
-b.switch_to_normal()
-print("导航到「自选股」节点:", b._select_tree_node_by_text("自选股"))
-time.sleep(1.2)
+# 2) 在这些根目录下递归找 SelfStockInfo.json
+found = []
+for r in roots:
+    for f in glob.glob(os.path.join(r, "**", "SelfStockInfo.json"), recursive=True):
+        found.append(f)
 
-# 全窗口枚举所有 CVirtualGridCtrl
-grids = []
+if not found:
+    print("\n未找到 SelfStockInfo.json。请在 xiadan 图标右键→打开文件位置，把含账户号的目录路径告诉我。")
+    sys.exit(0)
 
-
-def wk(h, _):
+print(f"\n=== 找到 {len(found)} 个 SelfStockInfo.json ===")
+for f in found:
     try:
-        if win32gui.GetClassName(h) == "CVirtualGridCtrl":
-            grids.append((
-                h, win32gui.GetDlgCtrlID(h) & 0xFFFF,
-                int(bool(win32gui.IsWindowVisible(h))),
-                win32gui.GetWindowRect(h),
-            ))
+        age = int(time.time() - os.path.getmtime(f))
     except Exception:
-        pass
-    return True
+        age = -1
+    print(f"\n路径: {f}")
+    print(f"更新: {age} 秒前  ({'新鲜' if 0 <= age < 3600 else '偏旧，可能 xiadan 不刷新它'})")
+    try:
+        raw = json.loads(open(f, encoding="utf-8").read())
+        print(f"解析: {len(raw)} 条自选股；前 5 条 = {raw[:5]}")
+    except Exception as e:
+        print("解析失败:", e)
 
-
-win32gui.EnumChildWindows(b.hwnd_main, wk, None)
-print(f"\n=== 全窗口 CVirtualGridCtrl 共 {len(grids)} 张 ===")
-for h, cid, vis, rect in grids:
-    w, ht = rect[2] - rect[0], rect[3] - rect[1]
-    print(f"  hwnd=0x{h:06X}  id=0x{cid:04X}  vis={vis}  {w}x{ht}  rect={rect}")
-
-# 读每张【可见】grid 的表头，识别自选股
-print("\n=== 各【可见】grid 表头 ===")
-for h, cid, vis, rect in grids:
-    if not vis:
-        continue
-    data = b.read_table_text(h)
-    head = (data or "").splitlines()[0][:140] if data else "(空)"
-    tag = "★自选股" if ("涨幅" in head and "现价" in head) else (
-        "持仓" if "股票余额" in head or "参考成本价" in head else "?")
-    print(f"  hwnd=0x{h:06X} id=0x{cid:04X} [{tag}]  表头: {head}")
-
-print("\n把上面贴回：我要那张 [★自选股] grid 的 hwnd/id/大小，据此让 get_watchlist 精确定位它读取。")
+print("\n把路径 + 更新秒数贴回。若'新鲜'，get_watchlist 就读这个文件。")
