@@ -50,6 +50,12 @@ from .const import (
     FILLED_COL_OP,
     FILLED_COL_PRICE,
     FILLED_COL_QTY,
+    MARKET_AMOUNT_ID,
+    MARKET_CODE_ID,
+    MARKET_STRATEGY,
+    MARKET_STRATEGY_COMBO_ID,
+    MARKET_SUBMIT_BTN_ID,
+    MARKET_TREE_PARENT,
     VK_CODE,
 )
 
@@ -1332,10 +1338,103 @@ class WinThsBackend:
             return self._submit_market_trade("买入", stock_no, amount)
         return self._submit_trade("F1", "买入", stock_no, amount, price)
 
+    def _set_market_strategy(self, combo, key, expected_index):
+        """委托策略 ComboBox 切到五档即成剩撤：键盘位置数字(WM_CHAR)→CB_GETCURSEL 校验，
+        未命中回退 CB_SETCURSEL(index)。返回是否已确为期望项。
+
+        键盘法（真机验证优先）：标准 ComboBox 收到数字字符 → 增量匹配"以该数字开头"的项
+        （买入'1'→'1-...'、卖出'4'→'4-五档即成剩撤'），且能触发同花顺的策略变更处理。
+        跨进程发键需 AttachThreadInput + SetFocus，否则 WM_CHAR 落不到目标控件。"""
+        CB_GETCURSEL, CB_SETCURSEL = 0x0147, 0x014E
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        my_tid = kernel32.GetCurrentThreadId()
+        tgt_tid, _ = win32process.GetWindowThreadProcessId(combo)
+        attached = False
+        try:
+            if my_tid != tgt_tid:
+                attached = bool(user32.AttachThreadInput(my_tid, tgt_tid, True))
+            user32.SetFocus(combo)
+            user32.SendMessageW(combo, win32con.WM_CHAR, ord(key), 0)
+        finally:
+            if attached:
+                user32.AttachThreadInput(my_tid, tgt_tid, False)
+        time.sleep(short_sleep_time)
+        idx = win32gui.SendMessage(combo, CB_GETCURSEL, 0, 0)
+        if idx != expected_index:
+            # 键盘法未命中 → 程序化兜底设选中项
+            logger.info("market strategy keyboard set idx=%s != %s, fallback CB_SETCURSEL",
+                        idx, expected_index)
+            win32gui.SendMessage(combo, CB_SETCURSEL, expected_index, 0)
+            time.sleep(short_sleep_time)
+            idx = win32gui.SendMessage(combo, CB_GETCURSEL, 0, 0)
+        return idx == expected_index
+
     def _submit_market_trade(self, op_keyword, stock_no, amount):
-        # 市价委托(五档即成剩撤)路径，真机实现见 Task 6。
-        return {"code": 9, "status": "not_implemented",
-                "msg": "market path not wired yet"}
+        """市价委托(五档即成剩撤)：导航子面板→填单→设策略→提交→查成交回执。
+
+        五档即成剩撤=立即成交、剩余自动撤销、无残留挂单；可能部分成交 → 回执查成交表
+        (orders_filled)前后差分拿真实成交量/均价。仅连续竞价时段可下，集合竞价/涨跌停会被
+        拒（回执查不到成交时返回 unknown 并提示可能非交易时段，不当成功）。"""
+        strat = MARKET_STRATEGY.get(op_keyword)
+        if not strat:
+            return {"code": 1, "status": "failed", "msg": f"未知方向 {op_keyword!r}"}
+
+        self.switch_to_normal()
+        _activate_window(self.hwnd_main)
+        # 下单前快照成交表作 before 基线（差分辨"本次新增成交" vs 历史成交；~1-2s，
+        # 换回执真实性，值得——市价单可能部分成交，必须拿准实际成交量/均价）。
+        pre = self.get_filled_orders()
+        before = pre.get("data", []) if pre.get("code") == 0 else []
+
+        if not self._select_tree_child(MARKET_TREE_PARENT, op_keyword):
+            return {"code": 1, "status": "failed", "msg": "未能导航到市价委托面板"}
+        time.sleep(sleep_time)
+        hwnd = self.get_right_hwnd()
+
+        # 填 证券代码 + 数量（市价面板无价格框）
+        set_text(self._find_input(hwnd, MARKET_CODE_ID), stock_no)
+        time.sleep(sleep_time)
+        set_text(self._find_input(hwnd, MARKET_AMOUNT_ID), str(amount))
+        time.sleep(short_sleep_time)
+
+        # 委托策略 = 五档即成剩撤（卖出默认是即成剩撤=深市专有、沪市会拒 → 必须显式设）
+        combo = self._find_ctrl_by_id(hwnd, MARKET_STRATEGY_COMBO_ID, cls="ComboBox", visible=True) \
+            or self._find_ctrl_by_id(hwnd, MARKET_STRATEGY_COMBO_ID)
+        if not combo:
+            return {"code": 1, "status": "failed", "msg": "未找到委托策略下拉框"}
+        if not self._set_market_strategy(combo, strat["key"], strat["index"]):
+            logger.warning("market strategy not set to 五档即成剩撤 op=%s, abort", op_keyword)
+            return {"code": 1, "status": "failed",
+                    "msg": "委托策略未能设为五档即成剩撤，已中止（避免下错单）"}
+
+        # 提交：点提交按钮（焦点无关，避开 combo 焦点吞 Enter）→ 确认框 →（可能验证码）→ 关弹窗
+        submit_btn = self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID, cls="Button", visible=True) \
+            or self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID)
+        if submit_btn:
+            win32api.SendMessage(submit_btn, win32con.BM_CLICK, 0, 0)
+        else:
+            hot_key(["enter"])
+        hot_key(["enter"])   # 确认买卖 dialog
+        self.input_ocr()     # 反机器人验证码（无弹窗立即返回）
+        hot_key(["enter"])   # 关结果弹窗
+        time.sleep(sleep_time)
+
+        # 回执：轮询成交表拿本次新增成交（五档即成剩撤成交极快，给足 8s）
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            post = self.get_filled_orders()
+            if post.get("code") == 0:
+                r = _match_market_fill(before, post.get("data", []),
+                                       stock_no, op_keyword, amount)
+                if r["code"] == 0:
+                    return r
+            time.sleep(0.3)
+        logger.warning("market submit unconfirmed stock=%s op=%s amount=%s",
+                       stock_no, op_keyword, amount)
+        return {"code": 2, "status": "unknown", "stock_no": str(stock_no),
+                "op": op_keyword, "requested_amount": int(amount), "filled_amount": 0,
+                "msg": "已提交但未在成交表确认成交，可能非连续竞价时段/涨跌停被拒/无成交，请自行核对成交与委托"}
 
     def _do_cancel(self, entrust_no):
         try:
