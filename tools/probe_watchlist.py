@@ -1,12 +1,12 @@
-"""探查 xiadan「自选股」面板结构（新版专有；旧版无此菜单）。只读，临时探针。
+"""探查 xiadan「自选股」面板：自选/持仓 tab + 两张 grid 的结构（新版专有）。只读，临时探针。
 
-用途：确认自选股面板是不是可 Ctrl+C 的 CVirtualGridCtrl、有哪些列，决定 get_watchlist
-怎么实现。摸清后本脚本即可删除。
+自选股面板顶部有「自选 | 持仓」两个 tab，各对应一张 CVirtualGridCtrl。需先切到「自选」
+tab 再读对应 grid。本探针 dump tab 控件 + 两张 grid 的 id/可见/矩形，并读一次当前可见 grid，
+据此实现 get_watchlist。摸清后即删。
 
-用法（项目根，任意 shell，需停掉 python -m trader 避免抢窗口）：
+用法（项目根，任意 shell，停掉 python -m trader）：
     python tools\\probe_watchlist.py
 """
-import collections
 import os
 import sys
 import time
@@ -24,37 +24,48 @@ print("hwnd_main =", b.hwnd_main)
 if not b.hwnd_main:
     raise SystemExit("!! 未绑定到下单窗口，先确认已打开并登录（新版）")
 
-# 1) 标签导航到「自选股」树节点
 b.switch_to_normal()
-ok = b._select_tree_node_by_text("自选股")
-print("导航到「自选股」节点:", ok, "（False = 旧版无此菜单 / 树文字没读到）")
+print("导航到「自选股」节点:", b._select_tree_node_by_text("自选股"))
 time.sleep(1.0)
 
 hwnd = b.get_right_hwnd()
 print("right_hwnd =", hex(hwnd & 0xFFFFFFFF) if hwnd else None)
 
-# 2) 右面板控件类名分布（看是不是标准 CVirtualGridCtrl 表格）
+# dump: 自选/持仓 tab 相关控件 + 所有 CVirtualGridCtrl + CCustomTabCtrl（含矩形，便于必要时坐标点击）
+print("\n=== 自选/持仓 tab 与表格控件（id / 类名 / 文字 / 可见 / 矩形）===")
+rows = []
+
+
+def wk(h, _):
+    try:
+        cls = win32gui.GetClassName(h)
+        txt = (win32gui.GetWindowText(h) or "").strip()
+        keep = cls in ("CVirtualGridCtrl", "CCustomTabCtrl") or any(
+            t in txt for t in ("自选", "持仓")
+        )
+        if keep:
+            rows.append((
+                win32gui.GetDlgCtrlID(h) & 0xFFFF, cls, txt,
+                int(bool(win32gui.IsWindowVisible(h))),
+                win32gui.GetWindowRect(h),
+            ))
+    except Exception:
+        pass
+    return True
+
+
 if hwnd:
-    cnt: collections.Counter = collections.Counter()
-
-    def wk(h, _):
-        cnt[win32gui.GetClassName(h)] += 1
-        return True
-
     win32gui.EnumChildWindows(hwnd, wk, None)
-    print("\n=== 右面板控件类名分布 ===")
-    for k, n in sorted(cnt.items()):
-        print(f"  {n:3}  {k}")
+for cid, cls, txt, vis, rect in rows:
+    print(f"  id=0x{cid:04X}  {cls:<18} vis={vis}  rect={rect}  {txt!r}")
 
-# 3) 试着按表格读一次（复用 _find_grid + read_table_text）
+# 读一次当前可见 grid 的前几行（看现在停在哪个 tab）
 grid = b._find_grid(hwnd) if hwnd else 0
-print("\n_find_grid =", hex(grid & 0xFFFFFFFF) if grid else None)
+print("\n_find_grid（当前可见）=", hex(grid & 0xFFFFFFFF) if grid else None)
 if grid:
     data = b.read_table_text(grid)
-    if data:
-        print("=== 自选股表格文本（前 1000 字符）===")
-        print(data[:1000])
-    else:
-        print("read_table_text 返回空（自选股可能不是可拷表格，需换方案）")
+    head = "\n".join((data or "").splitlines()[:3])
+    print("当前可见 grid 前 3 行：\n" + head)
+    print("\n↑ 若表头是 代码/名称/涨幅/现价 → 是【自选】；若是 股票余额/参考成本价 → 是【持仓】。")
 
-print("\n把上面输出贴回：确认自选股是不是可拷 CVirtualGridCtrl、含哪些列（代码/名称/现价…）。")
+print("\n把上面贴回：我看两张 grid 的 id/可见性 + tab 结构，据此让 get_watchlist 先切「自选」再读。")
