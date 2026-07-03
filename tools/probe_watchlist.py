@@ -1,64 +1,85 @@
-"""定位并校验 xiadan 的自选股文件 SelfStockInfo.json（新版自选股来源）。只读，临时探针。
+"""探测 xiadan 的内嵌 CEF(Chromium) 是否暴露 remote-debugging 调试端口。只读，临时探针。
 
-自选股列表在 xiadan 里是 CEF(内嵌Chromium) 渲染的网页，原生控件读不到；但 xiadan 会把
-自选股维护到本地 SelfStockInfo.json。本探针从 xiadan.exe 进程路径出发搜这个文件，报路径、
-更新时间、解析出的自选股数量与前几只，确认它是否可用作 get_watchlist 的数据源。
+新版 xiadan 的自选股是 CEF 渲染的网页，数据来自内部 HTTP 请求。若 CEF 开了调试端口，
+就能用 CDP(和 cdp_client.py 连雪球同一套)直接读网页 DOM 或拦网络，拿到实时自选股。
+本探针枚举 xiadan.exe 及其子进程监听的本地端口，逐个测 CDP 的 /json/version 接口。
 
 用法（项目根，任意 shell）：
     python tools\\probe_watchlist.py
 """
-import glob
 import json
 import os
 import sys
-import time
+import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 try:
     import psutil
 except Exception:
-    psutil = None
+    print("需要 psutil：pip 装过就有。缺了就 py -3.11 -m pip install psutil")
+    raise SystemExit(1)
 
-# 1) 找 xiadan.exe 的安装目录
-roots = set()
-if psutil:
-    for p in psutil.process_iter(["name", "exe"]):
+# 1) 找 xiadan.exe 及其所有子进程（CEF 的 browser/renderer 子进程）
+targets = {}
+for p in psutil.process_iter(["name", "pid", "ppid"]):
+    try:
+        nm = (p.info["name"] or "").lower()
+        if nm == "xiadan.exe":
+            targets[p.info["pid"]] = p
+    except Exception:
+        pass
+# 加上 xiadan 的子进程（CEF 子进程名可能是 xiadan.exe / HevExecute / cef 等）
+all_procs = {p.pid: p for p in psutil.process_iter(["name", "pid", "ppid"])}
+for pid, p in list(all_procs.items()):
+    try:
+        if p.info.get("ppid") in targets:
+            targets[pid] = p
+    except Exception:
+        pass
+
+print("xiadan 相关进程:", {pid: (p.info["name"]) for pid, p in targets.items()} or "（未找到 xiadan.exe）")
+
+# 2) 枚举这些进程监听的本地端口
+ports = set()
+try:
+    for c in psutil.net_connections(kind="tcp"):
+        if c.status == psutil.CONN_LISTEN and c.pid in targets and c.laddr:
+            ports.add(c.laddr.port)
+except Exception as e:
+    print("枚举端口失败（可能需要管理员权限）:", e)
+
+print("监听端口:", sorted(ports) or "（无）")
+
+# 3) 逐个测 CDP 接口
+print("\n=== 逐端口测 CDP /json/version ===")
+hit = []
+for port in sorted(ports):
+    for host in ("127.0.0.1", "localhost"):
+        url = f"http://{host}:{port}/json/version"
         try:
-            if (p.info["name"] or "").lower() == "xiadan.exe" and p.info["exe"]:
-                roots.add(os.path.dirname(p.info["exe"]))
+            with urllib.request.urlopen(url, timeout=1.5) as r:
+                body = r.read().decode("utf-8", "ignore")
+            if "Browser" in body or "webSocketDebuggerUrl" in body or "Chrome" in body:
+                print(f"  ★ {url} → 是 CDP！{body[:200]}")
+                hit.append(port)
+            else:
+                print(f"    {url} → 有响应但不像 CDP: {body[:80]}")
+            break
         except Exception:
             pass
-# 常见同花顺安装目录兜底
-for guess in (r"C:\同花顺软件", r"C:\Program Files\同花顺", r"C:\Program Files (x86)\同花顺",
-              r"D:\同花顺软件", os.path.expanduser(r"~\同花顺")):
-    if os.path.isdir(guess):
-        roots.add(guess)
 
-print("搜索根目录:", roots or "（未找到 xiadan 进程/安装目录，请手动指认）")
-
-# 2) 在这些根目录下递归找 SelfStockInfo.json
-found = []
-for r in roots:
-    for f in glob.glob(os.path.join(r, "**", "SelfStockInfo.json"), recursive=True):
-        found.append(f)
-
-if not found:
-    print("\n未找到 SelfStockInfo.json。请在 xiadan 图标右键→打开文件位置，把含账户号的目录路径告诉我。")
-    sys.exit(0)
-
-print(f"\n=== 找到 {len(found)} 个 SelfStockInfo.json ===")
-for f in found:
-    try:
-        age = int(time.time() - os.path.getmtime(f))
-    except Exception:
-        age = -1
-    print(f"\n路径: {f}")
-    print(f"更新: {age} 秒前  ({'新鲜' if 0 <= age < 3600 else '偏旧，可能 xiadan 不刷新它'})")
-    try:
-        raw = json.loads(open(f, encoding="utf-8").read())
-        print(f"解析: {len(raw)} 条自选股；前 5 条 = {raw[:5]}")
-    except Exception as e:
-        print("解析失败:", e)
-
-print("\n把路径 + 更新秒数贴回。若'新鲜'，get_watchlist 就读这个文件。")
+if hit:
+    print(f"\n✅ 发现 CDP 端口 {hit} —— 可走【路①】：CDP 读自选股网页。再测 /json 列出页面：")
+    for port in hit:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=2) as r:
+                pages = json.loads(r.read())
+            for pg in pages[:20]:
+                print(f"    - title={pg.get('title')!r} url={pg.get('url')!r}")
+        except Exception as e:
+            print("  列页面失败:", e)
+else:
+    print("\n❌ 没探到 CDP 调试端口 —— xiadan 的 CEF 没开 remote-debugging。")
+    print("   那路①走不通（除非能让它带 --remote-debugging-port 启动，较侵入）。")
+    print("   把上面【监听端口】贴回，我再判断有没有别的内部接口可利用；否则退回路②(MITM 抓包)。")
