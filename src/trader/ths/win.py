@@ -185,25 +185,6 @@ def _activate_window(hwnd):
         logger.debug("activate_window swallowed: %s", e)
 
 
-def _force_ime_english(hwnd):
-    """Close the IME on hwnd's thread so keybd_event injects raw ASCII.
-
-    Why: when the OS is in Chinese pinyin mode, alphabetic keystrokes get
-    intercepted as pinyin (e.g. 'm','b' → 拼音候选 like 目标/明白) instead of
-    landing in the Edit control. This bites the captcha popup hardest, since
-    its codes are letters+digits.
-    """
-    try:
-        himc = ctypes.windll.imm32.ImmGetContext(hwnd)
-        if himc:
-            try:
-                ctypes.windll.imm32.ImmSetOpenStatus(himc, False)
-            finally:
-                ctypes.windll.imm32.ImmReleaseContext(hwnd, himc)
-    except Exception as e:
-        logger.debug("force_ime_english failed: %s", e)
-
-
 def set_text(hwnd, string, isPrice=False):
     """快速填值：EM_SETSEL 全选 + WM_CLEAR 清空 + 逐字符 WM_CHAR 直发（无逐字延迟）。
 
