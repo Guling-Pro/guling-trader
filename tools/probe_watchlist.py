@@ -97,8 +97,10 @@ win32gui.EnumChildWindows(b.hwnd_main, lambda hh, _: cands.append(hh) or True
                           and win32gui.IsWindowVisible(hh) else True, None)
 target = cands[0] if cands else b.hwnd_main
 
+# 滚到底为止：不预设总数（不知道用户有多少只），靠"连续两屏无新增=到底了"终止。
+# range 上限只是防死循环的安全阀，设得足够大以免长列表被截断。
 seen, order, dry = set(), [], 0
-for rnd in range(15):
+for rnd in range(200):
     cs = codes_in(capture(target))
     new = [c for c in cs if c not in seen]
     for c in cs:
@@ -106,7 +108,8 @@ for rnd in range(15):
             seen.add(c); order.append(c)
     print(f"round {rnd}: 本屏 {len(cs)} 只，新增 {len(new)}，累计 {len(order)}")
     dry = dry + 1 if not new else 0
-    if dry >= 2:
+    if dry >= 2:  # 连续两屏无新增 → 已滚到底
+        print("（连续两屏无新增，判定已到底）")
         break
     scroll_down(target)
     time.sleep(0.5)
