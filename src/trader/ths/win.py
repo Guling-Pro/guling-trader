@@ -1059,62 +1059,6 @@ class WinThsBackend:
     def _do_buy(self, stock_no, amount, price):
         return self._submit_trade("F1", "买入", stock_no, amount, price)
 
-    def sell_kc(self, stock_no, amount, price):
-        self.switch_to_kechuang()
-        self.click_kc_sell()
-        hwnd = self.get_right_hwnd()
-        ctrl = self._find_input(hwnd, 0x408)
-        set_text(ctrl, stock_no)
-        time.sleep(sleep_time)
-        if price is not None:
-            time.sleep(sleep_time)
-            price = "%.3f" % price
-            ctrl = self._find_input(hwnd, 0x409)
-            set_text(ctrl, price)
-            time.sleep(sleep_time)
-        ctrl = self._find_input(hwnd, 0x40A)
-        set_text(ctrl, str(amount))
-        time.sleep(sleep_time)
-        hot_key(["enter"])
-        retry = 0
-        while retry < retry_time:
-            time.sleep(sleep_time)
-            result = self.get_result()
-            if result:
-                hot_key(["enter"])
-                return result
-            hot_key(["enter"])
-            retry += 1
-        return {"code": 2, "status": "unknown", "msg": "获取结果失败,请自行确认订单状态"}
-
-    def buy_kc(self, stock_no, amount, price):
-        self.switch_to_kechuang()
-        self.click_kc_buy()
-        hwnd = self.get_right_hwnd()
-        ctrl = self._find_input(hwnd, 0x408)
-        set_text(ctrl, stock_no)
-        time.sleep(sleep_time)
-        if price is not None:
-            time.sleep(sleep_time)
-            price = "%.3f" % price
-            ctrl = self._find_input(hwnd, 0x409)
-            set_text(ctrl, price)
-            time.sleep(sleep_time)
-        ctrl = self._find_input(hwnd, 0x40A)
-        set_text(ctrl, str(amount))
-        time.sleep(sleep_time)
-        hot_key(["enter"])
-        retry = 0
-        while retry < retry_time:
-            time.sleep(sleep_time)
-            result = self.get_result()
-            if result:
-                hot_key(["enter"])
-                return result
-            hot_key(["enter"])
-            retry += 1
-        return {"code": 2, "status": "unknown", "msg": "获取结果失败,请自行确认订单状态"}
-
     def _do_cancel(self, entrust_no):
         try:
             return self._cancel_inner(entrust_no)
@@ -1232,38 +1176,6 @@ class WinThsBackend:
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         time.sleep(sleep_time)
         _activate_window(self.hwnd_main)
-
-    def switch_to_kechuang(self):
-        tabs = self.get_left_bottom_tabs()
-        left, top, right, bottom = win32gui.GetWindowRect(tabs)
-        x = left + 200
-        y = top + 5
-        win32api.SetCursorPos((x, y))
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        time.sleep(sleep_time)
-
-    def click_kc_buy(self):
-        tree = self.get_tree_hwnd()
-        left, top, right, bottom = win32gui.GetWindowRect(tree)
-        x = left + 10
-        y = top + 10
-        win32api.SetCursorPos((x, y))
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        time.sleep(sleep_time)
-
-    def click_kc_sell(self):
-        tree = self.get_tree_hwnd()
-        left, top, right, bottom = win32gui.GetWindowRect(tree)
-        x = left + 10
-        y = top + 30
-        win32api.SetCursorPos((x, y))
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        time.sleep(sleep_time)
 
     def _empty_clipboard(self) -> bool:
         """用 API 清空剪贴板，替代 os.system("echo off | clip")（后者慢且闪 cmd 窗）。
