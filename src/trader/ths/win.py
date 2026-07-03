@@ -292,6 +292,7 @@ TVIF_TEXT = 0x0001
 
 if platform.system() == "Windows":
     class _TVITEMW(ctypes.Structure):
+        # 64 位布局（hItem/pszText/lParam = 8 字节）；当目标进程是 64 位时用。
         _fields_ = [
             ("mask", ctypes.c_uint),
             ("hItem", ctypes.c_ssize_t),       # HTREEITEM（指针大小）
@@ -304,6 +305,34 @@ if platform.system() == "Windows":
             ("cChildren", ctypes.c_int),
             ("lParam", ctypes.c_ssize_t),
         ]
+
+    class _TVITEM32(ctypes.Structure):
+        # 32 位布局（hItem/pszText/lParam = 4 字节）。xiadan 是 32 位进程，64 位 Python
+        # 发 TVM_GETITEMW 时结构指针大小必须与目标一致，否则目标读到错位结构 → 消息
+        # 失败(返回 0)、文字读空。这就是历史上"树文字读不到"被误判为"回调式不可读"的真因。
+        _fields_ = [
+            ("mask", ctypes.c_uint),
+            ("hItem", ctypes.c_uint32),
+            ("state", ctypes.c_uint),
+            ("stateMask", ctypes.c_uint),
+            ("pszText", ctypes.c_uint32),
+            ("cchTextMax", ctypes.c_int),
+            ("iImage", ctypes.c_int),
+            ("iSelectedImage", ctypes.c_int),
+            ("cChildren", ctypes.c_int),
+            ("lParam", ctypes.c_uint32),
+        ]
+
+    def _proc_is_wow64(pid: int):
+        """目标进程是否 32 位(在 64 位 Windows 上以 WOW64 运行)。用于给跨进程 TVITEM
+        选对应位数的布局。失败返回 None。"""
+        try:
+            h = win32api.OpenProcess(0x0400, False, pid)  # PROCESS_QUERY_INFORMATION
+            wow = wintypes.BOOL()
+            ctypes.windll.kernel32.IsWow64Process(int(h), ctypes.byref(wow))
+            return bool(wow.value)
+        except Exception:
+            return None
 
 
 class ThsState:
@@ -693,6 +722,10 @@ class WinThsBackend:
             logger.warning("settlement: tree hwnd not found")
             return False
         _, pid = win32process.GetWindowThreadProcessId(tree)
+        # 目标位数决定 TVITEM 布局：xiadan 是 32 位 → 用 4 字节指针的 _TVITEM32，否则
+        # 64 位结构发给 32 位目标会错位 → TVM_GETITEMW 失败、文字读空。
+        is32 = _proc_is_wow64(pid)
+        TVITEM = _TVITEM32 if is32 else _TVITEMW
         PROCESS_VM = 0x0008 | 0x0010 | 0x0020  # OPERATION | READ | WRITE
         MEM = 0x1000 | 0x2000  # COMMIT | RESERVE
         PAGE_RW = 0x04
@@ -710,7 +743,7 @@ class WinThsBackend:
         h_proc = win32api.OpenProcess(PROCESS_VM, False, pid)
         bufsize = 512
         remote_text = k32.VirtualAllocEx(int(h_proc), None, bufsize, MEM, PAGE_RW)
-        remote_item = k32.VirtualAllocEx(int(h_proc), None, ctypes.sizeof(_TVITEMW), MEM, PAGE_RW)
+        remote_item = k32.VirtualAllocEx(int(h_proc), None, ctypes.sizeof(TVITEM), MEM, PAGE_RW)
         try:
             if not remote_text or not remote_item:
                 logger.warning("settlement: VirtualAllocEx failed")
@@ -727,9 +760,9 @@ class WinThsBackend:
             fallback_node = 0
 
             def read_text(hitem: int) -> str:
-                item = _TVITEMW()
+                item = TVITEM()
                 item.mask = TVIF_TEXT
-                item.hItem = hitem
+                item.hItem = (hitem & 0xFFFFFFFF) if is32 else hitem
                 item.pszText = remote_text
                 item.cchTextMax = bufsize // 2
                 k32.WriteProcessMemory(int(h_proc), remote_item,
@@ -889,48 +922,25 @@ class WinThsBackend:
         logger.info("settlement: 真实点击时段 hwnd=%s text=%r", hex(h), pick[0][2])
         return True
 
-    # 交割单是「查询(F4)」展开后 资金股票 往下数第 8 个子节点：
-    #   资金股票(0) 当日委托 当日成交 历史委托 历史成交 历史持仓 资金明细 对帐单 交割单(8)
-    # THS 左树文字是回调式，跨进程 TVM_GETITEM 读不到（实测全空），所以不靠文字定位，
-    # 改用「F4 落到资金股票 → 给树发 8 次 Down 键消息」走结构定位，纯键盘、无坐标、
-    # 无 DPI 问题。最后用列名校验确认确实切到了交割单，绝不把资金股票数据当交割单返回。
-    _SETTLEMENT_DOWN_FROM_F4 = 8
-    # 交割单独有、资金股票/持仓没有的列，用来校验面板切对了
+    # 交割单独有、资金股票/持仓没有的列，用来校验确实切到了交割单面板
     _SETTLEMENT_MARKER_COLS = ("发生金额", "成交编号", "印花税", "成交日期")
 
     def _goto_settlement_panel(self) -> None:
-        """F4 进查询（落 资金股票）→ 给左树发 N 次 Down 键 → 选中交割单（触发面板切换）。"""
+        """F4 进查询(展开+落资金股票) → 按标签选中「交割单」树节点(触发面板切换)。
+
+        导航靠位数感知的 TVM_GETITEM 读树文字、按标签定位——免疫菜单重排，取代旧的
+        「数 8 次 Down 键」脆弱走位。失败只记日志，由调用方的列名校验(_SETTLEMENT_
+        MARKER_COLS)兜底：切错面板会返回错误而非把别的面板数据当交割单。
+        """
         self.switch_to_normal()
         _activate_window(self.hwnd_main)
-        hot_key(["F4"])  # 查询：默认选中并显示 资金股票
+        hot_key(["F4"])  # 查询：展开并默认选中 资金股票（确保交割单节点可见可点）
         time.sleep(refresh_sleep_time)
-        tree = self.get_tree_hwnd()
-        if not tree:
-            logger.warning("settlement: tree hwnd not found")
-            return
-        # 先让左树拿到键盘焦点（跨线程需 AttachThreadInput），方向键才稳被处理。
-        try:
-            user32 = ctypes.windll.user32
-            my_tid = ctypes.windll.kernel32.GetCurrentThreadId()
-            tgt_tid, _ = win32process.GetWindowThreadProcessId(tree)
-            attached = False
-            if my_tid != tgt_tid and user32.AttachThreadInput(my_tid, tgt_tid, True):
-                attached = True
-            try:
-                user32.SetFocus(tree)
-            finally:
-                if attached:
-                    user32.AttachThreadInput(my_tid, tgt_tid, False)
-        except Exception as e:
-            logger.debug("settlement: focus tree failed: %s", e)
-        # 给树发 WM_KEYDOWN/UP：每次 Down 下移一项，选中变化触发右侧面板切换
-        # （与用户按方向键等效）。无需坐标，DPI 无关。
-        for _ in range(self._SETTLEMENT_DOWN_FROM_F4):
-            win32gui.SendMessage(tree, win32con.WM_KEYDOWN, win32con.VK_DOWN, 0)
-            win32gui.SendMessage(tree, win32con.WM_KEYUP, win32con.VK_DOWN, 0)
-            time.sleep(short_sleep_time)
-        time.sleep(sleep_time)
-        logger.info("settlement: F4 + %d×Down 切到交割单", self._SETTLEMENT_DOWN_FROM_F4)
+        if self._select_tree_node_by_text("交割单", fallback_token="割"):
+            time.sleep(sleep_time)
+            logger.info("settlement: 按标签「交割单」导航成功")
+        else:
+            logger.warning("settlement: 按标签导航「交割单」失败（树文字读取或节点缺失）")
 
     def _do_settlement(self, date_range: str = "近一年"):
         """读取交割单（默认近一年）。低频功能，一次性尽量多拿。"""
