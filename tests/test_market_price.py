@@ -60,3 +60,42 @@ def test_zero_is_never_silently_substituted_for_none(bad):
     """显式 price=0 也只会原样透传（由上层校验），dispatcher/backend 不再制造 0。"""
     backend, captured = _drive(lambda b: b.sell("300459", 100, bad))
     assert captured["args"][2] == bad
+
+
+# ── 市价/限价路径分派（_do_buy/_do_sell 内部按 price 有无分流）──────────────
+def _stub_submits(backend):
+    """打桩两条提交路径，返回记录调用的字典。"""
+    calls = {}
+    backend._submit_trade = lambda *a: calls.setdefault("limit", a) or {"code": 0}
+    backend._submit_market_trade = lambda *a: calls.setdefault("market", a) or {"code": 0}
+    return calls
+
+
+def test_do_buy_none_price_routes_to_market():
+    backend = WinThsBackend()
+    calls = _stub_submits(backend)
+    backend._do_buy("600000", 100, None)
+    assert "limit" not in calls
+    assert calls["market"] == ("买入", "600000", 100)
+
+
+def test_do_sell_none_price_routes_to_market():
+    backend = WinThsBackend()
+    calls = _stub_submits(backend)
+    backend._do_sell("300459", 200, None)
+    assert calls["market"] == ("卖出", "300459", 200)
+
+
+def test_do_buy_with_price_routes_to_limit():
+    backend = WinThsBackend()
+    calls = _stub_submits(backend)
+    backend._do_buy("600000", 100, 12.34)
+    assert "market" not in calls
+    assert calls["limit"] == ("F1", "买入", "600000", 100, 12.34)
+
+
+def test_do_sell_with_price_routes_to_limit():
+    backend = WinThsBackend()
+    calls = _stub_submits(backend)
+    backend._do_sell("300459", 200, 4.11)
+    assert calls["limit"] == ("F2", "卖出", "300459", 200, 4.11)

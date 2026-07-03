@@ -1135,10 +1135,20 @@ class WinThsBackend:
         }
 
     def _do_sell(self, stock_no, amount, price):
+        # price is None ⇒ 真·市价委托(五档即成剩撤)；有值 ⇒ F2 限价挂单(原逻辑)。
+        if price is None:
+            return self._submit_market_trade("卖出", stock_no, amount)
         return self._submit_trade("F2", "卖出", stock_no, amount, price)
 
     def _do_buy(self, stock_no, amount, price):
+        if price is None:
+            return self._submit_market_trade("买入", stock_no, amount)
         return self._submit_trade("F1", "买入", stock_no, amount, price)
+
+    def _submit_market_trade(self, op_keyword, stock_no, amount):
+        # 市价委托(五档即成剩撤)路径，真机实现见 Task 6。
+        return {"code": 9, "status": "not_implemented",
+                "msg": "market path not wired yet"}
 
     def _do_cancel(self, entrust_no):
         try:
