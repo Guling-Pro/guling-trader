@@ -1,11 +1,12 @@
-"""同花顺下单窗口【架构测绘】：类名链 + 左侧树菜单全量 dump（只读，不下单）。
+"""同花顺下单窗口【架构测绘】诊断工具：类名链 + 左侧树菜单全量 dump（只读，不下单）。
 
 用途：把窗口的控件骨架和左侧 SysTreeView32 菜单的完整层级/文字打出来，作为
-"控件架构 + 菜单布局"的权威记录，供设计稳健导航（按树节点选择而非脆弱文字匹配）
-以及排查新旧皮肤差异使用。
+"控件架构 + 菜单布局"的权威记录。**当同花顺出新版本 / 换券商 / 疑似控件对不上时重跑它**，
+把输出对照 docs/ths_architecture.md 排查差异。会自动检测 xiadan 位数并用匹配的
+TVITEM 布局读树文字（64 位 Python vs 32 位 xiadan 的坑，详见架构文档）。
 
 用法（项目根，任意 shell）：
-    python tools\\dump_arch.py
+    python tools\\ths_diag.py
 """
 import ctypes
 import os
