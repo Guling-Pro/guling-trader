@@ -205,35 +205,21 @@ def _force_ime_english(hwnd):
 
 
 def set_text(hwnd, string, isPrice=False):
+    """快速填值：EM_SETSEL 全选 + WM_CLEAR 清空 + 逐字符 WM_CHAR 直发（无逐字延迟）。
+
+    交易讲究快。原实现用 keybd_event + 每字符 sleep(0.1)，"000970" 就要 0.6s，还抢
+    全局键盘/光标、要强切 IME。改用 WM_CHAR **直接发给目标 Edit**：
+    - "真实键入"语义 —— 逐字符触发 EN_CHANGE，THS 证券代码→名称联想/校验照常；
+    - 直发 hwnd，不依赖焦点、不移动光标、绕过 IME 与 shift 时序；
+    - 无逐字 sleep，整串几乎瞬间完成，比原来快一个数量级。
+    isPrice 保留签名兼容；价格串由调用方已按 %.3f 格式化。
+    """
+    u32 = ctypes.windll.user32
     _activate_window(hwnd)
-    _force_ime_english(hwnd)
-    win32api.SendMessage(hwnd, win32con.EM_SETSEL, 0, -1)
-    if isPrice:
-        rect = win32gui.GetWindowRect(hwnd)
-        x, y, w, h = rect
-        center_x = x + (w - x) // 2
-        center_y = y + (h - y) // 2
-        win32api.SetCursorPos((center_x, center_y))
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, center_x, center_y, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, center_x, center_y, 0, 0)
-        time.sleep(0.1)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, center_x, center_y, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, center_x, center_y, 0, 0)
-
-    win32api.keybd_event(VK_CODE["backspace"], 0, 0, 0)
-    time.sleep(short_sleep_time)
-    win32api.keybd_event(VK_CODE["backspace"], 0, win32con.KEYEVENTF_KEYUP, 0)
-
-    for char in string:
-        if char.isupper():
-            win32api.keybd_event(0xA0, 0, 0, 0)
-            win32api.keybd_event(VK_CODE[char.lower()], 0, 0, 0)
-            win32api.keybd_event(VK_CODE[char.lower()], 0, win32con.KEYEVENTF_KEYUP, 0)
-            win32api.keybd_event(0xA0, 0, win32con.KEYEVENTF_KEYUP, 0)
-        else:
-            win32api.keybd_event(VK_CODE[char], 0, 0, 0)
-            win32api.keybd_event(VK_CODE[char], 0, win32con.KEYEVENTF_KEYUP, 0)
-        time.sleep(0.1)
+    u32.SendMessageW(hwnd, win32con.EM_SETSEL, 0, -1)  # 全选
+    u32.SendMessageW(hwnd, win32con.WM_CLEAR, 0, 0)    # 清空（防残留）
+    for ch in str(string):
+        u32.SendMessageW(hwnd, win32con.WM_CHAR, ord(ch), 0)
 
 
 def get_text(hwnd):
