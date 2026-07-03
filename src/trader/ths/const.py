@@ -148,6 +148,20 @@ VK_CODE = {
     "`": 0xC0,
 }
 
+# 市价委托面板控件（真机已 dump 验证；原生控件，非 CEF；新旧皮肤一致）
+MARKET_TREE_PARENT = "市价委托"     # 左树父节点，子节点为 买入/卖出（无 F 快捷键）
+MARKET_CODE_ID = 0x408             # 证券代码 Edit（与 F1/F2 同 ID）
+MARKET_AMOUNT_ID = 0x40A           # 数量 Edit（与 F1/F2 同 ID）
+MARKET_SUBMIT_BTN_ID = 0x3EE       # 买入/卖出 提交 Button
+MARKET_STRATEGY_COMBO_ID = 0x605   # 委托策略 ComboBox（标准 ComboBox 类）
+# 委托策略=五档即成剩撤：买卖下拉项不同 → 键盘位置数字切换（WM_CHAR），选后 CB_GETCURSEL 校验。
+# 买入下拉 2 项、五档=键"1"/index 0（已默认）；卖出下拉 5 项、五档=键"4"/index 3
+# （默认 index 2=即成剩撤是深市专有、沪市会拒 → 卖出必须显式设）。
+MARKET_STRATEGY = {
+    "买入": {"key": "1", "index": 0},
+    "卖出": {"key": "4", "index": 3},
+}
+
 # 成交表(orders_filled)列名——真机以 parse_table 解析结果为准，不符只改此处
 FILLED_COL_CODE = "证券代码"
 FILLED_COL_OP = "操作"
