@@ -148,6 +148,14 @@ VK_CODE = {
     "`": 0xC0,
 }
 
+# 成交表(orders_filled)列名——真机以 parse_table 解析结果为准，不符只改此处
+FILLED_COL_CODE = "证券代码"
+FILLED_COL_OP = "操作"
+FILLED_COL_QTY = "成交数量"
+FILLED_COL_PRICE = "成交均价"
+FILLED_COL_AMOUNT = "成交金额"
+FILLED_COL_DEAL_NO = "成交编号"
+
 BALANCE_CONTROL_ID_GROUP = {
     "资金余额": 0x3F4,
     "冻结金额": 0x3F5,

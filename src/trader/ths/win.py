@@ -42,9 +42,60 @@ if platform.system() == "Windows":
     import win32process
     import win32ui
 
-from .const import BALANCE_CONTROL_ID_GROUP, VK_CODE
+from .const import (
+    BALANCE_CONTROL_ID_GROUP,
+    FILLED_COL_AMOUNT,
+    FILLED_COL_CODE,
+    FILLED_COL_DEAL_NO,
+    FILLED_COL_OP,
+    FILLED_COL_PRICE,
+    FILLED_COL_QTY,
+    VK_CODE,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _match_market_fill(before, after, stock_no, op_keyword, requested_amount):
+    """前后成交表差分 → 市价单成交回执。before/after 为 get_filled_orders 的 data。
+
+    五档即成剩撤下单后几乎不留 orders_active（全成→成交表；部分成→成交部分进成交表、
+    剩余被撤），故市价回执查成交表(orders_filled)差分，而非 orders_active。可能部分
+    成交 → 回执带回真实成交数量与按金额加权的成交均价。
+    """
+    def _key(r):
+        return r.get(FILLED_COL_DEAL_NO, "").strip() or (
+            r.get(FILLED_COL_CODE, ""), r.get(FILLED_COL_QTY, ""),
+            r.get(FILLED_COL_PRICE, ""), r.get(FILLED_COL_AMOUNT, ""))
+
+    seen = {_key(r) for r in before}
+    filled_qty = 0
+    filled_amt = 0.0
+    for r in after:
+        if _key(r) in seen:
+            continue
+        if r.get(FILLED_COL_CODE, "").strip() != str(stock_no):
+            continue
+        if op_keyword not in r.get(FILLED_COL_OP, ""):
+            continue
+        try:
+            qty = int(float(r.get(FILLED_COL_QTY, "0") or 0))
+            amt = float(r.get(FILLED_COL_AMOUNT, "0") or 0)
+        except ValueError:
+            continue
+        filled_qty += qty
+        filled_amt += amt
+
+    if filled_qty <= 0:
+        return {"code": 2, "status": "unknown", "stock_no": str(stock_no),
+                "op": op_keyword, "requested_amount": int(requested_amount),
+                "filled_amount": 0}
+
+    avg = round(filled_amt / filled_qty, 3)
+    status = "filled" if filled_qty >= int(requested_amount) else "partially_filled"
+    return {"code": 0, "status": status, "stock_no": str(stock_no),
+            "op": op_keyword, "requested_amount": int(requested_amount),
+            "filled_amount": filled_qty, "avg_price": avg}
 
 # PyInstaller bundled Tesseract 路径绑定（仅 onefile 模式激活）
 if hasattr(sys, "_MEIPASS"):
