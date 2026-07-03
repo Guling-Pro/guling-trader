@@ -100,6 +100,31 @@ xiadan 是 32 位，`TVITEMW` 的 `hItem/pszText/lParam` 是 4 字节；64 位 P
 | 序列号确认 + 读后即清空 | 剪贴板陈旧数据 / 并发冲突 |
 | 交割单大查询重点重试 + 回车关超时框 | 近一年等大查询首次「查询超时」、表格读空 |
 
+## 7.5 自选股（watchlist）——截图 + OCR（新版专有）
+
+自选股在**新版 xiadan** 里是**内嵌 CEF(Chromium) 渲染的网页**，不是原生表格：
+
+- 原生控件读不到（整窗只有 2 张 CVirtualGridCtrl，都是持仓相关，无自选股 grid）；
+- CEF **没开 remote-debugging 端口**（探测 xiadan 及子进程 HxExternal 只有一个私有 IPC 端口），CDP 注入走不通；
+- 本地 `SelfStockInfo.json` 由**行情主应用**写，行情不常开 → 常过期数天、成分都旧；
+- **旧版 xiadan 没有自选股菜单**。
+
+所以唯一实时途径是**截图 + OCR**（`ths/win.get_watchlist`）：
+
+1. `_select_tree_node_by_text("自选股")` 导航到自选股节点；
+2. `_capture_window_png(hwnd_main)`：**DPI 感知（Per-Monitor-V2）的 `PrintWindow(PW_RENDERFULLCONTENT)`**
+   截整个窗口——能截到内嵌 CEF 的网页内容（`BitBlt` 会黑屏），2x 屏（Parallels/Retina）不截半张；
+3. `_ocr_leftmost_codes`：`pytesseract.image_to_data` 拿词框，**只取 x 最小那一簇 6 位数字 = 代码列**，
+   天然排除左侧菜单与右侧数字列（主力净额/总金额的 6 位数假阳性）；
+4. Tesseract 路径复用 `installer.tesseract.detect_tesseract()`（与验证码识别同一个）。
+
+限制：CEF 分页，`WM_MOUSEWHEEL` 滚不动，只读**第一屏（顶部）**，返回 `partial=true`。
+但**同花顺习惯：新加入的自选股出现在顶部**，所以只比顶部即可捕捉"新增"。
+
+**看门狗**（`watchlist_watch.py`）：定点整点（默认 8/12/16/20，避开交易时段）同步顶部
+→ 与上次 diff → 有变化经 WS 推 `watchlist_event`（含 `added`/`codes`/`partial`）。仿 `order_watch`。
+配置：`enable_watchlist_watch` / `watchlist_sync_hours`。
+
 ## 8. 出新版本时怎么排查
 
 1. 切到目标皮肤、登录 xiadan。
