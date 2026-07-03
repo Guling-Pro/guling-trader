@@ -711,28 +711,6 @@ class WinThsBackend:
                 except Exception:
                     pass
 
-    def _find_watchlist_cef(self) -> int:
-        """自选股面板的 CEF 渲染窗口（面积最大的 Chrome_RenderWidgetHostHWND/CefBrowserWindow）。"""
-        cands = []
-
-        def wk(hh, _):
-            try:
-                if win32gui.GetClassName(hh) in (
-                    "Chrome_RenderWidgetHostHWND", "CefBrowserWindow"
-                ) and win32gui.IsWindowVisible(hh):
-                    r = win32gui.GetWindowRect(hh)
-                    cands.append((hh, (r[2] - r[0]) * (r[3] - r[1])))
-            except Exception:
-                pass
-            return True
-
-        try:
-            win32gui.EnumChildWindows(self.hwnd_main, wk, None)
-        except Exception:
-            pass
-        cands.sort(key=lambda x: -x[1])
-        return cands[0][0] if cands else 0
-
     def _ocr_leftmost_codes(self, img) -> list[str]:
         """OCR 图中 6 位数字，只取【最左一簇】(x 最小)=代码列，排除右侧数字列(主力净额/
         总金额等)产生的假 6 位数。去重保序（顶部在前）。"""
@@ -757,12 +735,12 @@ class WinThsBackend:
         if not self._select_tree_node_by_text("自选股"):
             return {"code": 1, "status": "failed",
                     "msg": "未找到自选股菜单（旧版 xiadan 无此菜单，请用新版）"}
-        time.sleep(sleep_time)
-        cef = self._find_watchlist_cef()
-        if not cef:
-            return {"code": 1, "status": "failed", "msg": "未找到自选股渲染窗口（CEF）"}
+        time.sleep(1.0)  # 等内嵌 CEF 渲染出自选股（0.2s 太短）
         try:
-            img = self._capture_window_png(cef)
+            # 截整个窗口：PrintWindow(PW_RENDERFULLCONTENT) 会把内嵌 CEF 的自选股一并截到；
+            # 直接找 CEF 子窗口常 IsWindowVisible=False 找不到，截整窗更稳（代码列 OCR 用
+            # 最左簇过滤，自然排除左侧菜单与右侧数字列）。
+            img = self._capture_window_png(self.hwnd_main)
             codes = self._ocr_leftmost_codes(img)
         except Exception as e:
             logger.exception("get_watchlist OCR failed")
