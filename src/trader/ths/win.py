@@ -365,24 +365,23 @@ class WinThsBackend:
                 retry -= 1
 
     def get_tree_hwnd(self):
-        hwnd = self.hwnd_main
-        hwnd = win32gui.FindWindowEx(hwnd, None, "AfxMDIFrame140s", None)
-        hwnd = win32gui.FindWindowEx(hwnd, None, "AfxWnd140s", None)
+        # 结构链保持不变，仅把带 MFC 版本号的类名(AfxMDIFrame140s/AfxWnd140s)换成
+        # 前缀匹配，版本号变了也不断链；HexinScrollWnd/SysTreeView32 名称稳定，精确匹配。
+        hwnd = self._child_by_class_prefix(self.hwnd_main, "AfxMDIFrame")
+        hwnd = self._child_by_class_prefix(hwnd, "AfxWnd")
         hwnd = win32gui.FindWindowEx(hwnd, None, None, "HexinScrollWnd")
-        hwnd = win32gui.FindWindowEx(hwnd, None, "AfxWnd140s", None)
+        hwnd = self._child_by_class_prefix(hwnd, "AfxWnd")
         hwnd = win32gui.FindWindowEx(hwnd, None, "SysTreeView32", None)
         return hwnd
 
     def get_right_hwnd(self):
-        hwnd = self.hwnd_main
-        hwnd = win32gui.FindWindowEx(hwnd, None, "AfxMDIFrame140s", None)
-        hwnd = win32gui.GetDlgItem(hwnd, 0xE901)
+        hwnd = self._child_by_class_prefix(self.hwnd_main, "AfxMDIFrame")
+        hwnd = win32gui.GetDlgItem(hwnd, 0xE901) if hwnd else 0
         return hwnd
 
     def get_left_bottom_tabs(self):
-        hwnd = self.hwnd_main
-        hwnd = win32gui.FindWindowEx(hwnd, None, "AfxMDIFrame140s", None)
-        hwnd = win32gui.FindWindowEx(hwnd, None, "AfxWnd140s", None)
+        hwnd = self._child_by_class_prefix(self.hwnd_main, "AfxMDIFrame")
+        hwnd = self._child_by_class_prefix(hwnd, "AfxWnd")
         hwnd = win32gui.FindWindowEx(hwnd, None, "CCustomTabCtrl", None)
         return hwnd
 
@@ -432,6 +431,37 @@ class WinThsBackend:
             or self._find_ctrl_by_id(root, 0x417, visible=True)
             or self._find_ctrl_by_id(root, 0x417, cls="CVirtualGridCtrl")
             or self._find_ctrl_by_id(root, 0x417)
+        )
+
+    @staticmethod
+    def _child_by_class_prefix(parent: int, prefix: str) -> int:
+        """在 parent 的直接子窗口里找第一个【类名以 prefix 开头】的，绕开 MFC 版本号后缀。
+
+        get_tree/right/tabs 的父子链原本写死 AfxMDIFrame140s / AfxWnd140s，其中 140
+        = MFC 14.0。同花顺一旦换 MFC 工具链重编，后缀会变(如 142s) → FindWindowEx
+        精确匹配失效。用前缀匹配只锁 "AfxMDIFrame"/"AfxWnd" 语义部分，版本号无关。
+        """
+        if not parent:
+            return 0
+        h = 0
+        while True:
+            h = win32gui.FindWindowEx(parent, h, None, None)
+            if h == 0:
+                return 0
+            try:
+                if win32gui.GetClassName(h).startswith(prefix):
+                    return h
+            except Exception:
+                pass
+
+    def _find_input(self, root: int, cid: int) -> int:
+        """找下单表单输入框(证券代码0x408/价格0x409/数量0x40A)。优先【可见的 Edit】，
+        逐级放宽 —— 右区同时挂着买/卖等多个表单，只有当前面板的可见。"""
+        return (
+            self._find_ctrl_by_id(root, cid, cls="Edit", visible=True)
+            or self._find_ctrl_by_id(root, cid, cls="Edit")
+            or self._find_ctrl_by_id(root, cid, visible=True)
+            or self._find_ctrl_by_id(root, cid)
         )
 
     def get_ocr_hwnd(self):
@@ -488,7 +518,8 @@ class WinThsBackend:
         self.refresh()
         right = self.get_right_hwnd()
         try:
-            btn = win32gui.GetDlgItem(right, btn_id)
+            btn = self._find_ctrl_by_id(right, btn_id, cls="Button", visible=True) \
+                or self._find_ctrl_by_id(right, btn_id, cls="Button")
         except Exception as e:
             return {"code": 1, "status": "failed",
                     "msg": f"GetDlgItem 0x{btn_id:04X}: {e}"}
@@ -982,16 +1013,16 @@ class WinThsBackend:
         hot_key([panel_key])
         time.sleep(sleep_time)
         hwnd = self.get_right_hwnd()
-        ctrl = win32gui.GetDlgItem(hwnd, 0x408)
+        ctrl = self._find_input(hwnd, 0x408)
         set_text(ctrl, stock_no)
         time.sleep(sleep_time)
         price_str = None
         if price is not None:
             price_str = "%.3f" % price
-            ctrl = win32gui.GetDlgItem(hwnd, 0x409)
+            ctrl = self._find_input(hwnd, 0x409)
             set_text(ctrl, price_str, True)
             time.sleep(short_sleep_time)
-        ctrl = win32gui.GetDlgItem(hwnd, 0x40A)
+        ctrl = self._find_input(hwnd, 0x40A)
         set_text(ctrl, str(amount))
         time.sleep(sleep_time)
         # Submit form → 确认买卖 dialog → confirm. THS may then pop an anti-bot
@@ -1032,16 +1063,16 @@ class WinThsBackend:
         self.switch_to_kechuang()
         self.click_kc_sell()
         hwnd = self.get_right_hwnd()
-        ctrl = win32gui.GetDlgItem(hwnd, 0x408)
+        ctrl = self._find_input(hwnd, 0x408)
         set_text(ctrl, stock_no)
         time.sleep(sleep_time)
         if price is not None:
             time.sleep(sleep_time)
             price = "%.3f" % price
-            ctrl = win32gui.GetDlgItem(hwnd, 0x409)
+            ctrl = self._find_input(hwnd, 0x409)
             set_text(ctrl, price)
             time.sleep(sleep_time)
-        ctrl = win32gui.GetDlgItem(hwnd, 0x40A)
+        ctrl = self._find_input(hwnd, 0x40A)
         set_text(ctrl, str(amount))
         time.sleep(sleep_time)
         hot_key(["enter"])
@@ -1060,16 +1091,16 @@ class WinThsBackend:
         self.switch_to_kechuang()
         self.click_kc_buy()
         hwnd = self.get_right_hwnd()
-        ctrl = win32gui.GetDlgItem(hwnd, 0x408)
+        ctrl = self._find_input(hwnd, 0x408)
         set_text(ctrl, stock_no)
         time.sleep(sleep_time)
         if price is not None:
             time.sleep(sleep_time)
             price = "%.3f" % price
-            ctrl = win32gui.GetDlgItem(hwnd, 0x409)
+            ctrl = self._find_input(hwnd, 0x409)
             set_text(ctrl, price)
             time.sleep(sleep_time)
-        ctrl = win32gui.GetDlgItem(hwnd, 0x40A)
+        ctrl = self._find_input(hwnd, 0x40A)
         set_text(ctrl, str(amount))
         time.sleep(sleep_time)
         hot_key(["enter"])
@@ -1098,7 +1129,7 @@ class WinThsBackend:
         hwnd = self.get_right_hwnd()
         if not hwnd:
             return {"code": 1, "status": "failed", "msg": "right pane not found"}
-        ctrl = win32gui.GetDlgItem(hwnd, 0x417)
+        ctrl = self._find_grid(hwnd)
         if not ctrl:
             return {"code": 1, "status": "failed", "msg": "table control 0x417 not found in F3 panel"}
         self.copy_table(ctrl)
