@@ -64,6 +64,15 @@ FALLBACK_TOOLS_SCHEMA = {
       }
     },
     {
+      "name": "watchlist",
+      "description": "查询自选股列表（证券代码）。返回同花顺自选股当前顶部可见的代码列表；按同花顺习惯，最新加入的自选股出现在顶部。注意：受限于客户端渲染，仅返回第一屏顶部部分（非全量，返回中 partial=true）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False
+      }
+    },
+    {
       "name": "buy",
       "description": "下买入委托单。**会真实下单**，慎重调用。返回包含委托编号 entrust_no。不传 price 则按市价下单。",
       "inputSchema": {
@@ -176,7 +185,7 @@ def load_tools_schema() -> dict[str, Any]:
         schema = json.loads(json.dumps(FALLBACK_TOOLS_SCHEMA))
 
     if not cfg.enable_ths_plugin:
-        trading_names = {"balance", "position", "orders_active", "orders_filled", "settlement", "buy", "sell", "cancel"}
+        trading_names = {"balance", "position", "orders_active", "orders_filled", "settlement", "watchlist", "buy", "sell", "cancel"}
         schema["tools"] = [t for t in schema["tools"] if t.get("name") not in trading_names]
 
     if cfg.enable_rpa_suite:
@@ -191,6 +200,7 @@ METHOD_WHITELIST = {
     "orders_active",
     "orders_filled",
     "settlement",
+    "watchlist",
     "buy",
     "sell",
     "cancel",
@@ -229,6 +239,7 @@ async def handle_call(
         "orders_active",
         "orders_filled",
         "settlement",
+        "watchlist",
         "buy",
         "sell",
         "cancel",
@@ -255,6 +266,8 @@ async def handle_call(
             result = await backend.orders_filled()
         elif method == "settlement":
             result = await backend.settlement(params.get("date_range", "近一年"))
+        elif method == "watchlist":
+            result = await backend.watchlist()
         elif method == "buy":
             stock_no = params.get("stock_no")
             amount = params.get("amount")

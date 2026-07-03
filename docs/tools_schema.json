@@ -47,10 +47,24 @@
           "date_range": {
             "type": "string",
             "description": "查询的时间跨度，可选值：近一周、近一月、近三月、近一年；默认近一年",
-            "enum": ["近一周", "近一月", "近三月", "近一年"],
+            "enum": [
+              "近一周",
+              "近一月",
+              "近三月",
+              "近一年"
+            ],
             "default": "近一年"
           }
         },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "watchlist",
+      "description": "查询自选股列表（证券代码）。返回同花顺自选股当前顶部可见的代码列表；按同花顺习惯，最新加入的自选股出现在顶部。注意：受限于客户端渲染，仅返回第一屏顶部部分（非全量，返回中 partial=true）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
         "additionalProperties": false
       }
     },
@@ -77,7 +91,10 @@
             "description": "可选的客户端自定义订单 ID"
           }
         },
-        "required": ["stock_no", "amount"],
+        "required": [
+          "stock_no",
+          "amount"
+        ],
         "additionalProperties": false
       }
     },
@@ -104,7 +121,10 @@
             "description": "可选的客户端自定义订单 ID"
           }
         },
-        "required": ["stock_no", "amount"],
+        "required": [
+          "stock_no",
+          "amount"
+        ],
         "additionalProperties": false
       }
     },
@@ -119,7 +139,9 @@
             "description": "要撤销的委托编号（从 orders_active 中获取）"
           }
         },
-        "required": ["entrust_no"],
+        "required": [
+          "entrust_no"
+        ],
         "additionalProperties": false
       }
     }

@@ -670,6 +670,109 @@ class WinThsBackend:
             return {"code": 0, "status": "succeed", "data": parsed}
         return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
+    # --- 自选股（新版专有）------------------------------------------------
+    # 新版 xiadan 的自选股是内嵌 CEF(Chromium) 渲染的网页，没有原生表格控件、无 CDP
+    # 调试口、本地 SelfStockInfo.json 由行情 app 写(常过期)。唯一能实时拿到的方式是
+    # 截图 + OCR。用同花顺的习惯：新加的自选股出现在顶部，所以只读第一屏(顶部)即可
+    # 覆盖"检测新增"；全量需滚屏(CEF 不吃 WM_MOUSEWHEEL，暂不支持)。旧版无此菜单。
+
+    def _capture_window_png(self, hwnd):
+        """DPI 感知 PrintWindow(PW_RENDERFULLCONTENT) 截取窗口 → PIL.Image。
+        能截 Chromium/CEF（BitBlt 会黑屏）；2x 屏(Parallels/Retina)切 Per-Monitor-V2
+        让 GetWindowRect 返回物理像素，不截半张。"""
+        user32 = ctypes.windll.user32
+        old = None
+        if hasattr(user32, "SetThreadDpiAwarenessContext"):
+            try:
+                old = user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))  # PMv2
+            except Exception:
+                old = None
+        try:
+            l, t, r, b = win32gui.GetWindowRect(hwnd)
+            w, h = r - l, b - t
+            hdc = win32gui.GetWindowDC(hwnd)
+            dc = win32ui.CreateDCFromHandle(hdc)
+            cdc = dc.CreateCompatibleDC()
+            bmp = win32ui.CreateBitmap()
+            bmp.CreateCompatibleBitmap(dc, w, h)
+            cdc.SelectObject(bmp)
+            user32.PrintWindow(hwnd, cdc.GetSafeHdc(), 2)  # PW_RENDERFULLCONTENT
+            bits = bmp.GetBitmapBits(True)
+            img = Image.frombuffer("RGB", (w, h), bits, "raw", "BGRX", 0, 1)
+            win32gui.DeleteObject(bmp.GetHandle())
+            cdc.DeleteDC()
+            dc.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hdc)
+            return img
+        finally:
+            if old is not None:
+                try:
+                    user32.SetThreadDpiAwarenessContext(old)
+                except Exception:
+                    pass
+
+    def _find_watchlist_cef(self) -> int:
+        """自选股面板的 CEF 渲染窗口（面积最大的 Chrome_RenderWidgetHostHWND/CefBrowserWindow）。"""
+        cands = []
+
+        def wk(hh, _):
+            try:
+                if win32gui.GetClassName(hh) in (
+                    "Chrome_RenderWidgetHostHWND", "CefBrowserWindow"
+                ) and win32gui.IsWindowVisible(hh):
+                    r = win32gui.GetWindowRect(hh)
+                    cands.append((hh, (r[2] - r[0]) * (r[3] - r[1])))
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumChildWindows(self.hwnd_main, wk, None)
+        except Exception:
+            pass
+        cands.sort(key=lambda x: -x[1])
+        return cands[0][0] if cands else 0
+
+    def _ocr_leftmost_codes(self, img) -> list[str]:
+        """OCR 图中 6 位数字，只取【最左一簇】(x 最小)=代码列，排除右侧数字列(主力净额/
+        总金额等)产生的假 6 位数。去重保序（顶部在前）。"""
+        from pytesseract import Output
+        d = pytesseract.image_to_data(img, lang="chi_sim+eng", output_type=Output.DICT)
+        got = [(t.strip(), d["left"][i]) for i, t in enumerate(d["text"])
+               if re.fullmatch(r"\d{6}", (t or "").strip())]
+        if not got:
+            return []
+        min_x = min(x for _, x in got)
+        seen, out = set(), []
+        for t, x in got:
+            if x <= min_x + 120 and t not in seen:  # 容差 120 物理像素
+                seen.add(t)
+                out.append(t)
+        return out
+
+    def get_watchlist(self):
+        """读自选股代码（截图+OCR 代码列）。仅第一屏(顶部)——新增出现在顶部，足够检测
+        新增；全量需滚屏(CEF 暂不支持)。旧版无此菜单会返回错误。"""
+        self.switch_to_normal()
+        if not self._select_tree_node_by_text("自选股"):
+            return {"code": 1, "status": "failed",
+                    "msg": "未找到自选股菜单（旧版 xiadan 无此菜单，请用新版）"}
+        time.sleep(sleep_time)
+        cef = self._find_watchlist_cef()
+        if not cef:
+            return {"code": 1, "status": "failed", "msg": "未找到自选股渲染窗口（CEF）"}
+        try:
+            img = self._capture_window_png(cef)
+            codes = self._ocr_leftmost_codes(img)
+        except Exception as e:
+            logger.exception("get_watchlist OCR failed")
+            return {"code": 1, "status": "failed", "msg": f"自选股截图/OCR 失败: {e}"}
+        if not codes:
+            return {"code": 1, "status": "failed", "msg": "OCR 未识别到自选股代码（面板可能未切到自选 tab）"}
+        self.state.update("watchlist", codes)
+        return {"code": 0, "status": "succeed", "count": len(codes),
+                "partial": True, "data": codes}  # partial: 仅顶部第一屏
+
     # --- 交割单（低频，一次性拉一年做分析）----------------------------------
     def _select_tree_node_by_text(self, target: str, fallback_token: str = "") -> bool:
         """按文字在左侧树（SysTreeView32）找到节点 → 程序化选中 + 真实鼠标点击。
@@ -1486,6 +1589,12 @@ class WinThsBackend:
         if bound_err:
             return bound_err
         return await asyncio.to_thread(self._do_settlement, date_range)
+
+    async def watchlist(self) -> dict[str, Any]:
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
+        return await asyncio.to_thread(self.get_watchlist)
 
     async def buy(
         self,
