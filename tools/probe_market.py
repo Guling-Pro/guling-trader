@@ -75,23 +75,19 @@ for h, cid, cls, txt, vis in rows:
     if cls in ("Edit", "Button") or "ComboBox" in cls or txt:
         print(f"  hwnd=0x{h:06X} id=0x{cid:04X}  {cls:<16} vis={vis}  {txt!r}")
 
-# 3) 枚举每个 ComboBox 的选项 + 当前选中（委托策略下拉）
-CB_GETCOUNT, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN = 0x0146, 0x0147, 0x0148, 0x0149
+# 3) 每个 ComboBox 的项数 + 当前选中索引（只读整数，跨进程安全；不读文字——CB_GETLBTEXT
+#    跨进程会往目标进程写内存、有崩溃风险。文字以你的截图为准，或真实现里用 VirtualAllocEx 读）
+CB_GETCOUNT, CB_GETCURSEL = 0x0146, 0x0147
 combos = [r for r in rows if "ComboBox" in r[2]]
-print(f"\n=== ComboBox 详情（{len(combos)} 个）===")
+print(f"\n=== ComboBox（委托策略下拉，{len(combos)} 个）===")
 for h, cid, cls, txt, vis in combos:
     cnt = win32gui.SendMessage(h, CB_GETCOUNT, 0, 0)
     cur = win32gui.SendMessage(h, CB_GETCURSEL, 0, 0)
-    print(f"  ComboBox id=0x{cid:04X} {cls} vis={vis} 共{cnt}项 当前选中index={cur}")
-    for i in range(max(0, cnt)):
-        n = win32gui.SendMessage(h, CB_GETLBTEXTLEN, i, 0)
-        buf = ctypes.create_unicode_buffer(n + 1)
-        win32gui.SendMessage(h, CB_GETLBTEXT, i, buf)
-        mark = " ←当前" if i == cur else ""
-        print(f"      [{i}] {buf.value!r}{mark}")
+    print(f"  id=0x{cid:04X}  {cls}  vis={vis}  共{cnt}项  当前选中index={cur}  当前文字={txt!r}")
 
 print("""
-=== 我要的信息（贴回上面输出即可）===
+=== 我要的信息（在【市价买入】和【市价卖出】各跑一次，贴回）===
 1. "可见 CEF" 是不是「无」（确认原生）；
-2. 证券代码 Edit 的 id、买入数量 Edit 的 id、买入 Button 的 id；
-3. 委托策略 ComboBox 的 id/类名 + "最优五档成交剩余撤销" 是第几项(index)、当前是否已选中它。""")
+2. 证券代码 Edit 的 id、买入/卖出数量 Edit 的 id、买入/卖出 Button 的 id；
+3. 委托策略 ComboBox 的 id/类名（是不是标准 'ComboBox'）+ 项数 + 当前 index。
+   （下拉各项文字你已截图，买入面板也麻烦展开截一张。）""")
