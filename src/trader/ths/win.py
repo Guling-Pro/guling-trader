@@ -930,33 +930,35 @@ class WinThsBackend:
         try:
             self._goto_settlement_panel()
             # 时段：按文字点「近一年」等按钮（真实 Button，可命中）
-            ranged = self._click_settlement_range(date_range)
-            # 点完时段，表格要重新查询+刷新，多等一会儿再读，否则会读到过滤前/不完整
-            # 的数据（实测近一月只读到 2 条）。
-            time.sleep(refresh_sleep_time)
-            self.refresh()
-            time.sleep(refresh_sleep_time)
-
-            hwnd = self.get_right_hwnd()
-            ctrl = self._find_grid(hwnd)
-            if not ctrl:
-                return {"code": 1, "status": "failed",
-                        "msg": "交割单表格控件(0x417)未找到，可能未切到交割单面板"}
-            # 拷表 + 读剪贴板可能拿到不完整快照（过滤未落定/竞态）。重拷几次取行数最多
-            # 的那次为准。get_clipboard_data 已永不抛异常（失败返回 None）。
+            # 大查询（如近一年 5000+ 行）THS 首次常「查询超时」、弹超时确认框、表格为空。
+            # 需要重新点时段触发重查（等效用户"再点几下 tab"数据才出来），并先回车关掉可能
+            # 的超时弹窗——模态框会挡住重点，必须先关。循环到读出非空为止（也顺带解决小查询
+            # 过滤未落定/竞态的不完整快照：取行数最多的一轮）。
             rows: list[dict] = []
-            for attempt in range(3):
-                data = self.read_table_text(ctrl)
-                if data:
-                    parsed = parse_table(data)
-                    if len(parsed) > len(rows):
-                        rows = parsed
-                # 行数已稳定（这次没读到更多）就不必再拷
-                if attempt >= 1 and data and len(parse_table(data)) <= len(rows):
-                    break
+            ranged = False
+            for attempt in range(6):
+                hot_key(["enter"])          # 关掉上一轮可能残留的「查询超时」确认框（无框则无害）
+                time.sleep(short_sleep_time)
+                if self._click_settlement_range(date_range):
+                    ranged = True
+                time.sleep(refresh_sleep_time)
+                self.refresh()
+                time.sleep(refresh_sleep_time)
+                hwnd = self.get_right_hwnd()
+                ctrl = self._find_grid(hwnd)
+                if ctrl:
+                    data = self.read_table_text(ctrl)
+                    if data:
+                        parsed = parse_table(data)
+                        if len(parsed) > len(rows):
+                            rows = parsed
+                        # 已拿到数据且这轮没读到更多 → 稳定，停
+                        if attempt >= 1 and len(parse_table(data)) <= len(rows):
+                            break
                 time.sleep(refresh_sleep_time)
             if not rows:
-                return {"code": 1, "status": "failed", "msg": "交割单读取为空"}
+                return {"code": 1, "status": "failed",
+                        "msg": "交割单读取为空（大查询可能仍在超时，请稍后重试或改用更小时段）"}
 
             # 列名校验：确认确实是交割单面板，避免把资金股票/持仓数据误当交割单返回。
             cols = set(rows[0].keys()) if rows else set()
