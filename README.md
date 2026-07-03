@@ -13,7 +13,7 @@
 
 **让 Agent 交易像移动支付一样，成为每个普通投资者触手可及的基础能力。**
 
-guling-trader 是一个跑在 Windows 上的开源交易执行客户端。它把你登录的同花顺独立委托客户端（xiadan.exe）接入任意 AI 助手（Claude / Cursor / openclaw 等），通过 MCP（Model Context Protocol）协议暴露 8 个交易工具——买入、卖出、查持仓、查资金等——让 AI 可以直接帮你研究、盯盘、下单，而整个过程中你的账号密码始终不离开同花顺官方软件。
+guling-trader 是一个跑在 Windows 上的开源交易执行客户端。它把你登录的同花顺独立委托客户端（xiadan.exe）接入任意 AI 助手（Claude / Cursor / openclaw 等），通过 MCP（Model Context Protocol）协议暴露 9 个交易工具——市价/限价买卖、查持仓、查资金、查委托/成交、查交割单、读自选股等——让 AI 可以直接帮你研究、盯盘、下单，而整个过程中你的账号密码始终不离开同花顺官方软件。
 
 接入后，你可以对 AI 说：
 > "帮我对手价买入 100 股贵州茅台。"  
@@ -48,7 +48,7 @@ guling-trader 与同花顺、MCP 三合一，是这一范式落地 A 股的开�
 
 你需要一台**7×24 运行的 Windows 机器**（物理机、云 VPS，或 Mac 虚拟机如 Parallels Desktop）。
 
-1. **登录同花顺**：打开同花顺独立委托客户端（`xiadan.exe`），用你的证券账户登录，界面切到"旧版"风格，停留在下单主页。请勿最小化。
+1. **登录同花顺**：打开同花顺独立委托客户端（`xiadan.exe`），用你的证券账户登录，停留在下单主页。**新版 / 旧版皮肤均可**——v0.5.0 起自动适配控件，无需再手动切"旧版"。请勿最小化。
 
 2. **运行交易助手**：从 [GitHub Releases](https://github.com/Guling-Pro/guling-trader/releases/latest/download/guling-trader.exe) 下载 `guling-trader.exe`（单文件免安装），双击运行。
    - 首次启动会自动静默安装 Tesseract OCR（图形识别环境），无感进行。
@@ -193,7 +193,7 @@ AI 助手部分（Claude、Cursor 等）在任何系统都能跑；只需确保�
 
 ## MCP 工具接口速查表
 
-配对成功后解锁全部 8 个交易工具。完整 Schema 见 [`docs/tools_schema.json`](docs/tools_schema.json)。
+配对成功后解锁全部 9 个交易工具。完整 Schema 见 [`docs/tools_schema.json`](docs/tools_schema.json)。
 
 | 工具 | 用途 | 关键参数 |
 |------|------|---------|
@@ -202,8 +202,9 @@ AI 助手部分（Claude、Cursor 等）在任何系统都能跑；只需确保�
 | `orders_active` | 当日未成交委托 | — |
 | `orders_filled` | 当日已成交记录 | — |
 | `settlement` | 交割单查询 | `date_range`：近一周/近一月/近三月/近一年 |
-| `buy` | 买入（实盘） | `stock_no`, `amount`, `price`(可选), `client_order_id`(可选) |
-| `sell` | 卖出（实盘） | `stock_no`, `amount`, `price`(可选), `client_order_id`(可选) |
+| `watchlist` | 读同花顺自选股代码（新版）| —（顶部第一屏，按同花顺习惯最新在顶部）|
+| `buy` | 买入（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(可选) |
+| `sell` | 卖出（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(可选) |
 | `cancel` | 撤销未成交单 | `entrust_no` |
 
 > 未配对时仅暴露 `pair_with_code` 一个工具；完整帧协议（握手、call、reply、reject、心跳）见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
@@ -247,7 +248,7 @@ guling-trader/
 │   ├── bootstrap.py         # 启动引导
 │   ├── brand.py             # 品牌/版本管理
 │   ├── config.py            # 配置加载
-│   ├── dispatcher.py        # 8 个交易工具定义（FALLBACK_TOOLS_SCHEMA）
+│   ├── dispatcher.py        # 9 个交易工具定义（FALLBACK_TOOLS_SCHEMA）
 │   ├── handshake.py         # WebSocket 握手逻辑
 │   ├── ws_client.py         # WebSocket 客户端
 │   ├── ui_dialogs.py        # UI 对话框
