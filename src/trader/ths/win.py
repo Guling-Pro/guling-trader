@@ -951,6 +951,142 @@ class WinThsBackend:
                 k32.VirtualFreeEx(int(h_proc), remote_item, 0, MEM_RELEASE)
             win32api.CloseHandle(h_proc)
 
+    def _select_tree_child(self, parent_text: str, child_text: str) -> bool:
+        """先按 parent_text 定位父节点，再在其【直接子节点】里整串精确匹配 child_text 选中。
+
+        用于市价委托 └ 买入/卖出——子节点文字'买入'与顶层'买入[F1]'前缀相同，深度优先的
+        _select_tree_node_by_text 会先撞顶层，故必须限定在父节点子树内、且整串精确匹配。
+
+        跨进程 TreeView 读写/位数处理/DPI 点击与 _select_tree_node_by_text 同构；那套原语有
+        交割单/自选股导航依赖，为免在无法回归的环境重构破坏，这里独立实现，真机稳定后可再合并。
+        """
+        tree = self.get_tree_hwnd()
+        if not tree:
+            logger.warning("market: tree hwnd not found")
+            return False
+        _, pid = win32process.GetWindowThreadProcessId(tree)
+        is32 = _proc_is_wow64(pid)
+        TVITEM = _TVITEM32 if is32 else _TVITEMW
+        PROCESS_VM = 0x0008 | 0x0010 | 0x0020
+        MEM = 0x1000 | 0x2000
+        PAGE_RW = 0x04
+        MEM_RELEASE = 0x8000
+        k32 = ctypes.windll.kernel32
+        u32 = ctypes.windll.user32
+        k32.VirtualAllocEx.restype = ctypes.c_void_p
+        k32.VirtualAllocEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+        k32.VirtualFreeEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD]
+        k32.WriteProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        k32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+
+        h_proc = win32api.OpenProcess(PROCESS_VM, False, pid)
+        bufsize = 512
+        remote_text = k32.VirtualAllocEx(int(h_proc), None, bufsize, MEM, PAGE_RW)
+        remote_item = k32.VirtualAllocEx(int(h_proc), None, ctypes.sizeof(TVITEM), MEM, PAGE_RW)
+        try:
+            if not remote_text or not remote_item:
+                logger.warning("market: VirtualAllocEx failed")
+                return False
+
+            def _norm(s: str) -> str:
+                return s.replace(" ", "").replace("　", "")
+
+            parent_norm = _norm(parent_text)
+            child_norm = _norm(child_text)
+
+            def read_text(hitem: int) -> str:
+                item = TVITEM()
+                item.mask = TVIF_TEXT
+                item.hItem = (hitem & 0xFFFFFFFF) if is32 else hitem
+                item.pszText = remote_text
+                item.cchTextMax = bufsize // 2
+                k32.WriteProcessMemory(int(h_proc), remote_item,
+                                       ctypes.byref(item), ctypes.sizeof(item), None)
+                win32gui.SendMessage(tree, TVM_GETITEMW, 0, remote_item)
+                buf = (ctypes.c_char * bufsize)()
+                k32.ReadProcessMemory(int(h_proc), remote_text, buf, bufsize, None)
+                return buf.raw.decode("utf-16-le", "ignore").split("\x00", 1)[0]
+
+            # 1) 深度优先找父节点（parent_text 在菜单里唯一，子串匹配足够）
+            def find_parent(hitem: int):
+                while hitem:
+                    if parent_norm in _norm(read_text(hitem)):
+                        return hitem
+                    child = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_CHILD, hitem)
+                    if child:
+                        found = find_parent(child)
+                        if found:
+                            return found
+                    hitem = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_NEXT, hitem)
+                return 0
+
+            parent = find_parent(win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_ROOT, 0))
+            if not parent:
+                logger.warning("market: parent tree node %r not found", parent_text)
+                return False
+
+            # 2) 只在父节点的【直接子节点】里整串精确匹配 child_text（免撞顶层"买入[F1]"）
+            node = 0
+            seen_children: list[str] = []
+            hchild = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_CHILD, parent)
+            while hchild:
+                ctext = _norm(read_text(hchild))
+                seen_children.append(ctext)
+                if ctext == child_norm:
+                    node = hchild
+                    break
+                hchild = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_NEXT, hchild)
+            if not node:
+                logger.warning("market: child %r under %r not found; children=%r",
+                               child_text, parent_text, seen_children)
+                return False
+
+            # 3) 选中 + 真实鼠标点击（触发右侧面板切换；同 _select_tree_node_by_text）
+            win32gui.SendMessage(tree, TVM_SELECTITEM, TVGN_CARET, node)
+            k32.WriteProcessMemory(int(h_proc), remote_text,
+                                   ctypes.byref(ctypes.c_ssize_t(node)),
+                                   ctypes.sizeof(ctypes.c_ssize_t), None)
+            got = win32gui.SendMessage(tree, TVM_GETITEMRECT, 0, remote_text)
+            if not got:
+                logger.info("market: selected (no rect, 程序化) child %r/%r",
+                            parent_text, child_text)
+                return True
+            rect = (wintypes.LONG * 4)()
+            k32.ReadProcessMemory(int(h_proc), remote_text, ctypes.byref(rect),
+                                  ctypes.sizeof(rect), None)
+            cx = (rect[0] + rect[2]) // 2
+            cy = (rect[1] + rect[3]) // 2
+
+            DPI_PMv2 = ctypes.c_void_p(-4)
+            old_ctx = None
+            if hasattr(u32, "SetThreadDpiAwarenessContext"):
+                try:
+                    old_ctx = u32.SetThreadDpiAwarenessContext(DPI_PMv2)
+                except Exception:
+                    old_ctx = None
+            try:
+                pt = wintypes.POINT(cx, cy)
+                u32.ClientToScreen(tree, ctypes.byref(pt))
+                win32api.SetCursorPos((pt.x, pt.y))
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            finally:
+                if old_ctx is not None:
+                    try:
+                        u32.SetThreadDpiAwarenessContext(old_ctx)
+                    except Exception:
+                        pass
+            time.sleep(sleep_time)
+            logger.info("market: clicked tree child %r/%r at client(%d,%d)",
+                        parent_text, child_text, cx, cy)
+            return True
+        finally:
+            if remote_text:
+                k32.VirtualFreeEx(int(h_proc), remote_text, 0, MEM_RELEASE)
+            if remote_item:
+                k32.VirtualFreeEx(int(h_proc), remote_item, 0, MEM_RELEASE)
+            win32api.CloseHandle(h_proc)
+
     def _real_click_hwnd(self, h: int) -> None:
         """对控件做一次真实鼠标点击（取窗口中心 → SetCursorPos → 按下抬起）。
 
