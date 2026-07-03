@@ -11,7 +11,8 @@
 ## Global Constraints
 
 - 复用 `buy`/`sell` 两个工具，不新增工具；`price is None` = 市价，`price` 有值 = 限价（方案 A）。
-- 市价策略固定为**五档即成剩撤**（沪深北全市场通用、剩余自动撤、无残留）。
+- 市价策略固定为**五档即成剩撤**（沪深北全市场通用、剩余自动撤、无残留）。**买卖委托策略下拉不同、策略号也不同**（真机实测：买入下拉 2 项、五档即成剩撤=`1`且已是默认；卖出下拉 5 项、五档即成剩撤=`4`、默认是`3-即成剩撤`=深市专有沪市会拒）→ **用键盘输入位置数字切换**：买入发 `"1"`、卖出发 `"4"`（委托策略 ComboBox 支持键盘 1/2/3/4/5 切换）。键盘输入能触发同花顺的策略变更处理，比 `CB_SETCURSEL` 程序化设置更可靠，且**免掉跨进程读下拉文字**。
+- **【真机已验证，控件 dump 完成】** 市价委托面板是**原生控件**（非 CEF，与自选股不同）；证券代码 Edit=`0x0408`、数量 Edit=`0x040A`、提交 Button=`0x03EE`、委托策略 ComboBox=`0x0605`（标准 `ComboBox` 类），买卖一致；市价买入/卖出**无 F 快捷键**，须树菜单导航（Task 5）。
 - 市价回执数据源是 `get_filled_orders()`（成交表），**不是** `get_active_orders()`。
 - 限价路径（`price` 有值）逻辑**一行都不改**，仍走 `_submit_trade` + `_lookup_entrust_no` + 由 agent 用 `orders_active`/`cancel` 管理。
 - 纯逻辑（Task 1/2/3）在 macOS 可跑测试；面板/控件（Task 4/5/6/7）**只能 Windows + xiadan 真机**联调，测试为手动实单核对。
@@ -352,38 +353,41 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 - Modify: `src/trader/ths/const.py`（写入市价委托面板控件常量）
 
 **Interfaces:**
-- Produces（值以真机 dump 为准）：
+- Produces（**值已真机 dump 确认（见下），直接写死**）：
   - `MARKET_TREE_PARENT = "市价委托"`（父节点文字）
-  - `MARKET_CODE_ID`（证券代码 Edit，预期 `0x408`）
-  - `MARKET_AMOUNT_ID`（数量 Edit，预期 `0x40A`）
-  - `MARKET_STRATEGY_COMBO_ID`（委托策略 ComboBox 控件 ID）
-  - `MARKET_STRATEGY_TEXT = "五档即成剩撤"` 及其 `MARKET_STRATEGY_INDEX`（下拉项索引）
+  - `MARKET_CODE_ID = 0x408`（证券代码 Edit，与 F1/F2 同 ID）
+  - `MARKET_AMOUNT_ID = 0x40A`（数量 Edit，与 F1/F2 同 ID）
+  - `MARKET_SUBMIT_ID = 0x3EE`（提交 Button，文字为 买入/卖出）
+  - `MARKET_STRATEGY_COMBO_ID = 0x605`（委托策略 ComboBox，标准 `ComboBox` 类）
+  - `MARKET_STRATEGY_KEY_BUY = "1"` / `MARKET_STRATEGY_KEY_SELL = "4"`（键盘输入位置数字选五档即成剩撤；买入下拉 2 项/卖出 5 项，策略号不同）
 
-- [ ] **Step 1: 登录 xiadan，切到目标皮肤**
+> **本 Task 的真机 dump 已在计划评审阶段完成**（`tools/probe_market.py`，只读探针）。控件值已确认（上方 Produces）：原生面板、证券代码 `0x408`/数量 `0x40A`/提交 `0x3EE`/委托策略 ComboBox `0x605`（标准 `ComboBox`）。所以本 Task 只剩把常量写进 `const.py`。
 
-在 Windows 真机启动 xiadan 并登录（新版/旧版皮肤都要各测一遍——见 Task 7）。
+- [ ] **Step 1: 写入 const.py**
 
-- [ ] **Step 2: 手动导航到「市价委托 └ 买入」面板**
+在 `const.py` 追加：
 
-左侧树点开「市价委托」→「买入」，确认右侧出现委托策略下拉（截图对照 spec §1）。
+```python
+# 市价委托面板（真机实测，见 tools/probe_market.py）
+MARKET_TREE_PARENT = "市价委托"      # 树父节点文字
+MARKET_CODE_ID = 0x408             # 证券代码 Edit（与 F1/F2 同 ID）
+MARKET_AMOUNT_ID = 0x40A           # 数量 Edit（与 F1/F2 同 ID）
+MARKET_SUBMIT_ID = 0x3EE           # 提交 Button（文字 买入/卖出）
+MARKET_STRATEGY_COMBO_ID = 0x605   # 委托策略 ComboBox（标准 ComboBox 类）
+# 五档即成剩撤的位置数字（键盘输入切换；买卖下拉不同、号不同）
+MARKET_STRATEGY_KEY_BUY = "1"      # 买入下拉 2 项，五档即成剩撤=1（且默认即是）
+MARKET_STRATEGY_KEY_SELL = "4"     # 卖出下拉 5 项，五档即成剩撤=4（默认 3-即成剩撤=深市专有，须改）
+```
 
-- [ ] **Step 3: dump 该面板控件**
+- [ ] **Step 2: 真机核对一眼（稳妥）**
 
-复用 `tools/ths_diag.py` 骨架，在其上临时加一段：定位当前右侧面板 `get_right_hwnd()` → `EnumChildWindows` 打印每个子控件 `(hex(id), class, text, visible)`。运行：
-`python tools/ths_diag.py`
-记录：证券代码 Edit id、数量 Edit id、委托策略 ComboBox 的 id 与 class（`ComboBox` / `ComboBoxEx32` / 同花顺自绘？）。
+真机把市价买入/卖出的委托策略下拉各展开一次，确认：买入 `1`=「最优五档成交剩余撤销」、卖出 `4`=「五档即成剩撤」（这是下单路径，值得最后核一眼）。
 
-- [ ] **Step 4: 读委托策略下拉项与索引**
-
-对 ComboBox 发 `CB_GETCOUNT`/`CB_GETLBTEXT` 枚举各项文字，找到"五档即成剩撤"对应索引（截图里显示为第 4 项"4-五档即成剩撤"，索引大概率 3，**以枚举结果为准**）。若非标准 ComboBox（同花顺自绘），记录其实际交互方式（键盘下拉 / 点击项），留给 Task 6。
-
-- [ ] **Step 5: 写入 const.py 并提交**
-
-把实测值写入 `const.py`（`0x...` 十六进制 + 索引）。删掉 `ths_diag.py` 里的临时 dump 段（或保留为注释掉的 probe）。
+- [ ] **Step 3: Commit**
 
 ```bash
-git add src/trader/ths/const.py tools/ths_diag.py
-git commit -m "chore(ths): 真机 dump 市价委托面板控件 ID/委托策略索引 写入 const
+git add src/trader/ths/const.py
+git commit -m "chore(ths): 市价委托面板控件常量(真机实测) 写入 const
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ```
