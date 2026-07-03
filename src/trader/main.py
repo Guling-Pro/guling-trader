@@ -324,6 +324,8 @@ async def _async_main(
     polling_task = asyncio.create_task(_ths_polling_task(state))
     refresh_task = asyncio.create_task(_pairing_refresh_watcher(state, client))
     order_event_task = asyncio.create_task(order_watch.order_watch_task(state, client))
+    from . import watchlist_watch
+    watchlist_task = asyncio.create_task(watchlist_watch.watchlist_watch_task(state, client))
     try:
         await client.run()
     except asyncio.CancelledError:
@@ -335,8 +337,9 @@ async def _async_main(
         polling_task.cancel()
         refresh_task.cancel()
         order_event_task.cancel()
+        watchlist_task.cancel()
         try:
-            await asyncio.gather(polling_task, refresh_task, order_event_task, return_exceptions=True)
+            await asyncio.gather(polling_task, refresh_task, order_event_task, watchlist_task, return_exceptions=True)
         except Exception:
             pass
 

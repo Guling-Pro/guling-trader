@@ -19,6 +19,8 @@ class TraderConfig:
     chrome_cdp_port: int = 9222  # 本地 Edge/Chrome CDP 端口，默认 9222
     order_watch_idle_secs: int = 300   # order_watch 空闲轮询周期（秒）：默认 5 分钟
     order_watch_active_secs: int = 60  # 有未完成委托时的提速周期（秒）：默认 1 分钟
+    enable_watchlist_watch: bool = True  # 是否定时同步自选股并推变化事件（新版 xiadan）
+    watchlist_sync_hours: str = "8,12,16,20"  # 自选股定时同步的整点（避开交易时段）
 
     def has_paired(self) -> bool:
         """检查是否已配对"""
@@ -80,6 +82,8 @@ def load() -> TraderConfig:
             chrome_cdp_port=data.get("chrome_cdp_port", 9222),
             order_watch_idle_secs=data.get("order_watch_idle_secs", 300),
             order_watch_active_secs=data.get("order_watch_active_secs", 60),
+            enable_watchlist_watch=data.get("enable_watchlist_watch", True),
+            watchlist_sync_hours=data.get("watchlist_sync_hours", "8,12,16,20"),
         )
     except Exception:
         return TraderConfig(device_id="")
@@ -101,6 +105,8 @@ def save(config: TraderConfig) -> None:
         "chrome_cdp_port": config.chrome_cdp_port,
         "order_watch_idle_secs": config.order_watch_idle_secs,
         "order_watch_active_secs": config.order_watch_active_secs,
+        "enable_watchlist_watch": config.enable_watchlist_watch,
+        "watchlist_sync_hours": config.watchlist_sync_hours,
     }
 
     with open(config_path, "w", encoding="utf-8") as f:
