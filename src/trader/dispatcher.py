@@ -74,7 +74,7 @@ FALLBACK_TOOLS_SCHEMA = {
     },
     {
       "name": "buy",
-      "description": "下买入委托单。**会真实下单**，慎重调用。返回包含委托编号 entrust_no。不传 price 则按市价下单。",
+      "description": "下买入委托单。**会真实下单**，慎重调用。不传 price=五档即成剩撤市价单(立即成交、剩余自动撤销、无残留挂单)，回执 status/filled_amount/avg_price 为实际成交；传 price=限价挂单，返回 entrust_no，未成交需自行用 orders_active+cancel 管理。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -88,7 +88,7 @@ FALLBACK_TOOLS_SCHEMA = {
           },
           "price": {
             "type": "number",
-            "description": "限价买入价格。不传则按同花顺客户端对手价市价单执行"
+            "description": "限价买入价格。不传则走同花顺市价委托(五档即成剩撤)立即成交、剩余自动撤销、无残留挂单；传则限价挂单，需自行 orders_active/cancel 管理。"
           },
           "client_order_id": {
             "type": "string",
@@ -101,7 +101,7 @@ FALLBACK_TOOLS_SCHEMA = {
     },
     {
       "name": "sell",
-      "description": "下卖出委托单。**会真实下单**，慎重调用。返回包含委托编号 entrust_no。不传 price 则按市价下单。",
+      "description": "下卖出委托单。**会真实下单**，慎重调用。不传 price=五档即成剩撤市价单(立即成交、剩余自动撤销、无残留挂单)，回执 status/filled_amount/avg_price 为实际成交；传 price=限价挂单，返回 entrust_no，未成交需自行用 orders_active+cancel 管理。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -115,7 +115,7 @@ FALLBACK_TOOLS_SCHEMA = {
           },
           "price": {
             "type": "number",
-            "description": "限价卖出价格。不传则按同花顺客户端对手价市价单执行"
+            "description": "限价卖出价格。不传则走同花顺市价委托(五档即成剩撤)立即成交、剩余自动撤销、无残留挂单；传则限价挂单，需自行 orders_active/cancel 管理。"
           },
           "client_order_id": {
             "type": "string",
