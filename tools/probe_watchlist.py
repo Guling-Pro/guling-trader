@@ -22,7 +22,15 @@ from PIL import Image
 
 from trader.ths import win as W
 
-W.setup("网上股票交易系统5.0", "", "")
+# 复用 trader 的 Tesseract 检测（和验证码识别用同一个），否则 setup 传空 → pytesseract
+# 走 PATH 找不到。
+try:
+    from trader.installer.tesseract import detect_tesseract
+    _tess = detect_tesseract() or ""
+except Exception as _e:
+    _tess = ""
+print("tesseract_cmd =", _tess or "<PATH>")
+W.setup("网上股票交易系统5.0", _tess, "")
 b = W.WinThsBackend()
 b.bind_client()
 print("hwnd_main =", hex(b.hwnd_main) if b.hwnd_main else None)
