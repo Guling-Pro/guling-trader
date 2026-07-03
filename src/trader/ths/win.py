@@ -880,46 +880,29 @@ class WinThsBackend:
                     pass
         time.sleep(sleep_time)
 
-    def _click_button_by_text(self, text: str) -> bool:
-        """找含 `text` 的时段按钮并真实点击。
+    # 交割单时段按钮的控件 ID（实测规整连续，见 tools/dump_settlement_buttons.py）。
+    # 5 个查询面板各有一套同 ID 副本，只有当前交割单面板那套可见 → 用可见性过滤命中。
+    _SETTLEMENT_RANGE_IDS = {
+        "近一周": 0x14BC,
+        "近一月": 0x14BD,
+        "近三月": 0x14BE,
+        "近一年": 0x14BF,
+    }
 
-        实测：交割单/资金股票/历史成交 等多个查询子面板各有一套时段按钮，含同名
-        「近三月」的 Button 有 5 个，其中只有交割单面板那个是可见+可用的。必须只点
-        **可见且可用**的那个，否则点的是隐藏副本、时段不切（停在默认近一周）。
-        """
-        cands: list[tuple[int, str, str, bool, bool]] = []
-
-        def walker(h, _):
-            try:
-                wt = win32gui.GetWindowText(h) or ""
-                if text in wt:
-                    cands.append((
-                        h, win32gui.GetClassName(h), wt,
-                        bool(win32gui.IsWindowVisible(h)),
-                        bool(win32gui.IsWindowEnabled(h)),
-                    ))
-            except Exception:
-                pass
-            return True
-
-        try:
-            win32gui.EnumChildWindows(self.hwnd_main, walker, None)
-        except Exception as e:
-            logger.warning("settlement: EnumChildWindows failed: %s", e)
-        logger.info("settlement: 时段 %r 候选=%r",
-                    text, [(c, t, v, e) for _, c, t, v, e in cands])
-        if not cands:
-            logger.warning("settlement: 时段 %r 未找到", text)
+    def _click_settlement_range(self, date_range: str) -> bool:
+        """按【控件 ID + 可见性】点交割单时段按钮，取代按文字匹配（零文字依赖）。"""
+        cid = self._SETTLEMENT_RANGE_IDS.get(date_range)
+        if cid is None:
+            logger.warning("settlement: 未知时段 %r（支持 %s）",
+                           date_range, list(self._SETTLEMENT_RANGE_IDS))
             return False
-        # 只点可见+可用的（避开隐藏副本）；优先 Button 类
-        usable = [m for m in cands if m[3] and m[4]]
-        pick = [m for m in usable if m[1] == "Button"] or usable
-        if not pick:
-            logger.warning("settlement: 时段 %r 有候选但无可见可用项", text)
+        # 全窗口找【可见】的那个：5 面板各有一套同 ID 副本，只有当前交割单面板的可见。
+        btn = self._find_ctrl_by_id(self.hwnd_main, cid, cls="Button", visible=True)
+        if not btn:
+            logger.warning("settlement: 时段按钮 0x%04X(%s) 无可见实例", cid, date_range)
             return False
-        h = pick[0][0]
-        self._real_click_hwnd(h)
-        logger.info("settlement: 真实点击时段 hwnd=%s text=%r", hex(h), pick[0][2])
+        self._real_click_hwnd(btn)
+        logger.info("settlement: 点击时段 %s id=0x%04X hwnd=%s", date_range, cid, hex(btn))
         return True
 
     # 交割单独有、资金股票/持仓没有的列，用来校验确实切到了交割单面板
@@ -947,7 +930,7 @@ class WinThsBackend:
         try:
             self._goto_settlement_panel()
             # 时段：按文字点「近一年」等按钮（真实 Button，可命中）
-            ranged = self._click_button_by_text(date_range)
+            ranged = self._click_settlement_range(date_range)
             # 点完时段，表格要重新查询+刷新，多等一会儿再读，否则会读到过滤前/不完整
             # 的数据（实测近一月只读到 2 条）。
             time.sleep(refresh_sleep_time)
