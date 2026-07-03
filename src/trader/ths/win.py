@@ -386,6 +386,40 @@ class WinThsBackend:
         hwnd = win32gui.FindWindowEx(hwnd, None, "CCustomTabCtrl", None)
         return hwnd
 
+    def _find_ctrl_by_id(self, root: int, cid: int, cls: str | None = None) -> int:
+        """在 root 的全部子孙里递归找【控件 ID==cid】(可选类名过滤)的第一个，找不到返回 0。
+
+        取代只查【直接子控件】的 win32gui.GetDlgItem：新版皮肤给查询/下单面板多套了
+        一层父容器，原本是 right_hwnd 直接子的控件(资金字段 0x3F4.. / 表格 0x417 /
+        代码价量 0x408~0x40A)变成了孙辈，GetDlgItem 直接子查不到 → 报错 1421。递归
+        枚举则无视嵌套层级，新旧版皮肤通吃，这是"无视新旧版本"的核心。
+        """
+        if not root:
+            return 0
+        hit: list[int] = []
+
+        def _wk(h, _):
+            try:
+                if win32gui.GetDlgCtrlID(h) == cid and (
+                    cls is None or win32gui.GetClassName(h) == cls
+                ):
+                    hit.append(h)
+                    return False  # 命中即停止枚举
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumChildWindows(root, _wk, None)
+        except Exception:
+            pass
+        return hit[0] if hit else 0
+
+    def _find_grid(self, root: int) -> int:
+        """找面板里的表格控件(0x417)：优先真正的 CVirtualGridCtrl，回退到任意 0x417。"""
+        return self._find_ctrl_by_id(root, 0x417, cls="CVirtualGridCtrl") or \
+            self._find_ctrl_by_id(root, 0x417)
+
     def get_ocr_hwnd(self):
         tid, pid = win32process.GetWindowThreadProcessId(self.hwnd_main)
 
@@ -483,7 +517,7 @@ class WinThsBackend:
         hwnd = self.get_right_hwnd()
         data = {}
         for key, cid in BALANCE_CONTROL_ID_GROUP.items():
-            ctrl = win32gui.GetDlgItem(hwnd, cid)
+            ctrl = self._find_ctrl_by_id(hwnd, cid)
             if ctrl > 0:
                 data[key] = get_text(ctrl)
         return {"code": 0, "status": "succeed", "data": data}
@@ -495,7 +529,7 @@ class WinThsBackend:
             hot_key(["F6"])
             self.refresh()
             hwnd = self.get_right_hwnd()
-            ctrl = win32gui.GetDlgItem(hwnd, 0x417)
+            ctrl = self._find_grid(hwnd)
             self.copy_table(ctrl)
             data = get_clipboard_data()
             if data:
@@ -509,7 +543,7 @@ class WinThsBackend:
             hot_key(["F4"])
             self.refresh()
             hwnd = self.get_right_hwnd()
-            ctrl = win32gui.GetDlgItem(hwnd, 0x417)
+            ctrl = self._find_grid(hwnd)
             self.copy_table(ctrl)
             data = get_clipboard_data()
             if data:
@@ -525,7 +559,7 @@ class WinThsBackend:
             hot_key(["F8"])
             self.refresh()
             hwnd = self.get_right_hwnd()
-            ctrl = win32gui.GetDlgItem(hwnd, 0x417)
+            ctrl = self._find_grid(hwnd)
             self.copy_table(ctrl)
             data = get_clipboard_data()
             if data:
@@ -540,7 +574,7 @@ class WinThsBackend:
         hot_key(["F7"])
         self.refresh()
         hwnd = self.get_right_hwnd()
-        ctrl = win32gui.GetDlgItem(hwnd, 0x417)
+        ctrl = self._find_grid(hwnd)
         self.copy_table(ctrl)
         data = None
         retry = 0
@@ -823,7 +857,7 @@ class WinThsBackend:
             time.sleep(refresh_sleep_time)
 
             hwnd = self.get_right_hwnd()
-            ctrl = win32gui.GetDlgItem(hwnd, 0x417)
+            ctrl = self._find_grid(hwnd)
             if not ctrl:
                 return {"code": 1, "status": "failed",
                         "msg": "交割单表格控件(0x417)未找到，可能未切到交割单面板"}
