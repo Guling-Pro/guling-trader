@@ -41,6 +41,18 @@ print("\n=== 左侧树菜单（层级 / 文字）===")
 if not tree:
     raise SystemExit("!! 未定位到 SysTreeView32，树菜单无法 dump")
 
+# 关键：先像 settlement 那样 switch_to_normal() 激活/归位窗口再读。冷读(脚本刚绑定、
+# 未与窗口交互)常把 TVITEM 文字读成空——settlement 之所以能读出，是它导航前做了
+# switch_to_normal + 激活，让树被完全实现(realized)。
+import time
+try:
+    b.switch_to_normal()
+    time.sleep(0.3)
+except Exception as e:
+    print("  switch_to_normal 失败(忽略):", e)
+# 重新取一次树句柄（激活后更稳）
+tree = b.get_tree_hwnd() or tree
+
 _, pid = win32process.GetWindowThreadProcessId(tree)
 PROCESS_VM = 0x0008 | 0x0010 | 0x0020
 MEM = 0x1000 | 0x2000
@@ -48,13 +60,19 @@ PAGE_RW = 0x04
 k32 = ctypes.windll.kernel32
 k32.VirtualAllocEx.restype = ctypes.c_void_p
 k32.VirtualAllocEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+k32.WriteProcessMemory.restype = wintypes.BOOL
 k32.WriteProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+k32.ReadProcessMemory.restype = wintypes.BOOL
 k32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
 
 h_proc = win32api.OpenProcess(PROCESS_VM, False, pid)
 bufsize = 512
 remote_text = k32.VirtualAllocEx(int(h_proc), None, bufsize, MEM, PAGE_RW)
 remote_item = k32.VirtualAllocEx(int(h_proc), None, ctypes.sizeof(W._TVITEMW), MEM, PAGE_RW)
+print(f"  [诊断] tree=0x{tree & 0xFFFFFFFF:X} pid={pid} h_proc={int(h_proc)} "
+      f"remote_text={remote_text} remote_item={remote_item}")
+
+_diag = {"n": 0}
 
 
 def read_text(hitem):
@@ -63,11 +81,17 @@ def read_text(hitem):
     item.hItem = hitem
     item.pszText = remote_text
     item.cchTextMax = bufsize // 2
-    k32.WriteProcessMemory(int(h_proc), remote_item, ctypes.byref(item), ctypes.sizeof(item), None)
-    win32gui.SendMessage(tree, W.TVM_GETITEMW, 0, remote_item)
+    wpm = k32.WriteProcessMemory(int(h_proc), remote_item, ctypes.byref(item),
+                                 ctypes.sizeof(item), None)
+    rc = win32gui.SendMessage(tree, W.TVM_GETITEMW, 0, remote_item)
     buf = (ctypes.c_char * bufsize)()
-    k32.ReadProcessMemory(int(h_proc), remote_text, buf, bufsize, None)
-    return buf.raw.decode("utf-16-le", "ignore").split("\x00", 1)[0]
+    rpm = k32.ReadProcessMemory(int(h_proc), remote_text, buf, bufsize, None)
+    txt = buf.raw.decode("utf-16-le", "ignore").split("\x00", 1)[0]
+    if _diag["n"] < 3:  # 前 3 个节点打印原始返回值，读空时可据此定位
+        _diag["n"] += 1
+        print(f"  [诊断#{_diag['n']}] hitem={hitem} WPM={wpm} SendMsg={rc} RPM={rpm} "
+              f"raw16={buf.raw[:16].hex()} txt={txt!r}")
+    return txt
 
 
 count = 0
