@@ -65,20 +65,48 @@ k32.WriteProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_vo
 k32.ReadProcessMemory.restype = wintypes.BOOL
 k32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
 
+
+def _target_is_32bit(pid_):
+    """xiadan 是否 32 位(WOW64)。64位Python 发 TVM_GETITEMW 时 TVITEM 的指针字段
+    必须与目标位数一致，否则目标读到错位结构 → 消息失败(SendMsg=0)、文字读空。"""
+    try:
+        h = win32api.OpenProcess(0x0400, False, pid_)  # PROCESS_QUERY_INFORMATION
+        wow = wintypes.BOOL()
+        ctypes.windll.kernel32.IsWow64Process(int(h), ctypes.byref(wow))
+        return bool(wow.value)
+    except Exception as e:
+        print("  IsWow64Process 失败:", e)
+        return None
+
+
+class _TVITEM32(ctypes.Structure):
+    # 32 位 TVITEMW 布局：hItem/pszText/lParam 都是 4 字节
+    _fields_ = [
+        ("mask", ctypes.c_uint), ("hItem", ctypes.c_uint32),
+        ("state", ctypes.c_uint), ("stateMask", ctypes.c_uint),
+        ("pszText", ctypes.c_uint32), ("cchTextMax", ctypes.c_int),
+        ("iImage", ctypes.c_int), ("iSelectedImage", ctypes.c_int),
+        ("cChildren", ctypes.c_int), ("lParam", ctypes.c_uint32),
+    ]
+
+
+is32 = _target_is_32bit(pid)
+TVITEM = _TVITEM32 if is32 else W._TVITEMW
+print(f"  [诊断] tree=0x{tree & 0xFFFFFFFF:X} pid={pid} 目标32位(WOW64)={is32} "
+      f"→ 用{'32' if is32 else '64'}位 TVITEM(sizeof={ctypes.sizeof(TVITEM)})")
+
 h_proc = win32api.OpenProcess(PROCESS_VM, False, pid)
 bufsize = 512
 remote_text = k32.VirtualAllocEx(int(h_proc), None, bufsize, MEM, PAGE_RW)
-remote_item = k32.VirtualAllocEx(int(h_proc), None, ctypes.sizeof(W._TVITEMW), MEM, PAGE_RW)
-print(f"  [诊断] tree=0x{tree & 0xFFFFFFFF:X} pid={pid} h_proc={int(h_proc)} "
-      f"remote_text={remote_text} remote_item={remote_item}")
+remote_item = k32.VirtualAllocEx(int(h_proc), None, ctypes.sizeof(TVITEM), MEM, PAGE_RW)
 
 _diag = {"n": 0}
 
 
 def read_text(hitem):
-    item = W._TVITEMW()
+    item = TVITEM()
     item.mask = W.TVIF_TEXT
-    item.hItem = hitem
+    item.hItem = (hitem & 0xFFFFFFFF) if is32 else hitem
     item.pszText = remote_text
     item.cchTextMax = bufsize // 2
     wpm = k32.WriteProcessMemory(int(h_proc), remote_item, ctypes.byref(item),
