@@ -27,6 +27,7 @@ import platform
 import re
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Optional
 
@@ -123,28 +124,32 @@ def find_window_by_title_prefix(prefix: str) -> int:
     return hwnd
 
 
-def get_clipboard_data():
+def get_clipboard_data(open_retries: int = 10):
     """读剪贴板文本。永不抛异常——失败返回 None，让调用方的重试循环继续。
 
     OpenClipboard 在别的进程占用剪贴板时会抛（拷贝表格 + 拷贝数据验证码弹窗期间
-    尤其常见）；GetClipboardData 在 CF_UNICODETEXT 格式还没就绪时也会抛。这些都不
-    该让整个读取崩掉（之前交割单近三月就是崩在这里）。
+    尤其常见）；剪贴板被别的进程锁通常只有几毫秒，直接放弃太浪费 → 退避重试若干次
+    再放弃。GetClipboardData 在 CF_UNICODETEXT 格式还没就绪时也会抛，这属于"本次没
+    数据"，不重试直接返回 None。
     """
-    try:
-        win32clipboard.OpenClipboard()
-    except Exception:
-        return None
-    try:
-        if not win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
-            return None
-        return win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
-    except Exception:
-        return None
-    finally:
+    for _ in range(max(1, open_retries)):
         try:
-            win32clipboard.CloseClipboard()
+            win32clipboard.OpenClipboard()
         except Exception:
-            pass
+            time.sleep(0.02)  # 被别的进程短暂锁住 → 退避重试
+            continue
+        try:
+            if not win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
+                return None
+            return win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+        except Exception:
+            return None
+        finally:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+    return None
 
 
 def hot_key(keys):
@@ -301,13 +306,51 @@ if platform.system() == "Windows":
         ]
 
 
+class ThsState:
+    """trader 内存态：存各查询的最近一次解析结果 + 时间戳。
+
+    数据流：剪贴板只做"拷贝→读取→立刻清空"的毫秒级中转，解析结果落到这里；消费方
+    可读 last-known（`get`），不必再触碰剪贴板。线程安全——order_watch 后台线程与
+    RPC 可能并发访问。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._store: dict[str, dict] = {}
+
+    def update(self, key: str, data: Any) -> None:
+        with self._lock:
+            self._store[key] = {"data": data, "ts": time.time()}
+
+    def get(self, key: str, max_age: Optional[float] = None) -> Any:
+        """取最近一次结果；传 max_age（秒）则超龄返回 None（避免拿到过时数据）。"""
+        with self._lock:
+            entry = self._store.get(key)
+        if not entry:
+            return None
+        if max_age is not None and (time.time() - entry["ts"]) > max_age:
+            return None
+        return entry["data"]
+
+    def snapshot(self) -> dict:
+        """各 key 的时间戳与行数概览（诊断用）。"""
+        with self._lock:
+            out = {}
+            for k, v in self._store.items():
+                d = v["data"]
+                out[k] = {"ts": v["ts"], "rows": len(d) if isinstance(d, list) else 1}
+            return out
+
+
 class WinThsBackend:
     def __init__(self):
         self.hwnd_main = None
-        # order_watch 与 RPC 共用：串行化对 THS 单窗口的访问，避免并发 copy_table。
+        # order_watch 与 RPC 共用：串行化对 THS 单窗口的访问，避免并发拷表。
         self.win_lock = asyncio.Lock()
         # agent 经 RPC 下单成功后登记的合同编号，供 order_watch 标记事件来源。
         self.agent_entrust_nos: set[str] = set()
+        # 内存态：查询结果的 last-known 存储（剪贴板仅作毫秒级中转）。
+        self.state = ThsState()
 
     def _ensure_bound(self) -> dict[str, Any] | None:
         """检查是否已绑定；否则 lazy bind，返回错误 dict 或 None（成功）"""
@@ -565,6 +608,7 @@ class WinThsBackend:
             ctrl = self._find_ctrl_by_id(hwnd, cid)
             if ctrl > 0:
                 data[key] = get_text(ctrl)
+        self.state.update("balance", data)
         return {"code": 0, "status": "succeed", "data": data}
 
     def get_position(self):
@@ -575,10 +619,11 @@ class WinThsBackend:
             self.refresh()
             hwnd = self.get_right_hwnd()
             ctrl = self._find_grid(hwnd)
-            self.copy_table(ctrl)
-            data = get_clipboard_data()
+            data = self.read_table_text(ctrl)
             if data:
-                return {"code": 0, "status": "succeed", "data": parse_table(data)}
+                parsed = parse_table(data)
+                self.state.update("position", parsed)
+                return {"code": 0, "status": "succeed", "data": parsed}
             time.sleep(sleep_time)
         return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
@@ -589,10 +634,11 @@ class WinThsBackend:
             self.refresh()
             hwnd = self.get_right_hwnd()
             ctrl = self._find_grid(hwnd)
-            self.copy_table(ctrl)
-            data = get_clipboard_data()
+            data = self.read_table_text(ctrl)
             if data:
-                return {"code": 0, "status": "succeed", "data": parse_table(data)}
+                parsed = parse_table(data)
+                self.state.update("gupiao", parsed)
+                return {"code": 0, "status": "succeed", "data": parsed}
             time.sleep(sleep_time)
         return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
@@ -605,10 +651,11 @@ class WinThsBackend:
             self.refresh()
             hwnd = self.get_right_hwnd()
             ctrl = self._find_grid(hwnd)
-            self.copy_table(ctrl)
-            data = get_clipboard_data()
+            data = self.read_table_text(ctrl)
             if data:
-                return {"code": 0, "status": "succeed", "data": parse_table(data)}
+                parsed = parse_table(data)
+                self.state.update("active_orders", parsed)
+                return {"code": 0, "status": "succeed", "data": parsed}
             time.sleep(sleep_time)
         return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
@@ -620,15 +667,11 @@ class WinThsBackend:
         self.refresh()
         hwnd = self.get_right_hwnd()
         ctrl = self._find_grid(hwnd)
-        self.copy_table(ctrl)
-        data = None
-        retry = 0
-        while not data and retry < retry_time:
-            retry += 1
-            time.sleep(sleep_time)
-            data = get_clipboard_data()
+        data = self.read_table_text(ctrl)
         if data:
-            return {"code": 0, "status": "succeed", "data": parse_table(data)}
+            parsed = parse_table(data)
+            self.state.update("filled_orders", parsed)
+            return {"code": 0, "status": "succeed", "data": parsed}
         return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
     # --- 交割单（低频，一次性拉一年做分析）----------------------------------
@@ -910,13 +953,7 @@ class WinThsBackend:
             # 的那次为准。get_clipboard_data 已永不抛异常（失败返回 None）。
             rows: list[dict] = []
             for attempt in range(3):
-                self.copy_table(ctrl)
-                data = None
-                for _ in range(retry_time + 2):
-                    time.sleep(sleep_time)
-                    data = get_clipboard_data()
-                    if data:
-                        break
+                data = self.read_table_text(ctrl)
                 if data:
                     parsed = parse_table(data)
                     if len(parsed) > len(rows):
@@ -936,6 +973,7 @@ class WinThsBackend:
                 return {"code": 1, "status": "failed",
                         "msg": "未能切到交割单面板（读到的是其它面板），请重试或人工确认",
                         "got_columns": list(cols)}
+            self.state.update("settlement", rows)
             return {
                 "code": 0,
                 "status": "succeed",
@@ -1132,19 +1170,9 @@ class WinThsBackend:
         ctrl = self._find_grid(hwnd)
         if not ctrl:
             return {"code": 1, "status": "failed", "msg": "table control 0x417 not found in F3 panel"}
-        self.copy_table(ctrl)
-        data = None
-        for _ in range(retry_time):
-            time.sleep(sleep_time)
-            try:
-                data = get_clipboard_data()
-            except Exception as e:
-                logger.warning("cancel clipboard read failed: %s", e)
-                continue
-            if data:
-                break
+        data = self.read_table_text(ctrl)
         if not data:
-            return {"code": 1, "status": "failed", "msg": "clipboard empty after copy_table"}
+            return {"code": 1, "status": "failed", "msg": "clipboard empty after copy"}
         entrusts = parse_table(data)
         if not entrusts:
             return {"code": 1, "status": "failed", "msg": "F3 table parsed empty"}
@@ -1275,11 +1303,51 @@ class WinThsBackend:
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         time.sleep(sleep_time)
 
-    def copy_table(self, hwnd):
-        os.system("echo off | clip")
+    def _empty_clipboard(self) -> bool:
+        """用 API 清空剪贴板，替代 os.system("echo off | clip")（后者慢且闪 cmd 窗）。
+        被别的进程锁住时退避重试。"""
+        for _ in range(10):
+            try:
+                win32clipboard.OpenClipboard()
+            except Exception:
+                time.sleep(0.02)
+                continue
+            try:
+                win32clipboard.EmptyClipboard()
+            except Exception:
+                pass
+            finally:
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+            return True
+        return False
+
+    def read_table_text(self, hwnd, timeout: float = 2.0):
+        """把表格拷进剪贴板→确认本次拷贝落定→读文本→立刻清空。剪贴板仅作毫秒级中转。
+
+        用 GetClipboardSequenceNumber 确认本次 Ctrl+C 真写入了新内容（系统级计数器，
+        任何进程改动剪贴板它就 +1）：清空后取基线 seq0，拷贝落定则 seq 变化。若超时
+        仍未变化 = 拷贝没落定（窗口没焦点 / 被验证码挡），返回 None 让调用方重试——
+        **绝不返回上一次遗留的陈旧表格**。读完立刻清空，剪贴板不留数据。
+        """
+        user32 = ctypes.windll.user32
+        self._empty_clipboard()
+        seq0 = user32.GetClipboardSequenceNumber()  # 清空后取基线，之后变化=本次拷贝
         _activate_window(hwnd)
         hot_key(["ctrl", "c"])
-        self.input_ocr()
+        self.input_ocr()  # 处理"检测到您正在拷贝数据"验证码（无弹窗立即返回）
+        deadline = time.time() + timeout
+        data = None
+        while time.time() < deadline:
+            if user32.GetClipboardSequenceNumber() != seq0:
+                data = get_clipboard_data()
+                if data:
+                    break
+            time.sleep(0.02)
+        self._empty_clipboard()  # 读完立刻清空——剪贴板只当毫秒级中转点
+        return data
 
     def _preprocess_captcha(self, image):
         """Upscale + grayscale + Otsu + sharpen — boosts tesseract accuracy on
