@@ -125,6 +125,44 @@ xiadan 是 32 位，`TVITEMW` 的 `hItem/pszText/lParam` 是 4 字节；64 位 P
 → 与上次 diff → 有变化经 WS 推 `watchlist_event`（含 `added`/`codes`/`partial`）。仿 `order_watch`。
 配置：`enable_watchlist_watch` / `watchlist_sync_hours`。
 
+## 7.6 市价委托路径（`buy`/`sell` 不传 price）
+
+`buy`/`sell` 有两条路径，在 `_do_buy`/`_do_sell` 内按 `price` 分派：
+
+- **传 `price`** → `_submit_trade("F1"/"F2", …)`：**限价挂单**（原逻辑），未成交留 `orders_active`，
+  由 agent 用 `cancel` 管理。
+- **不传 `price`（`None`）** → `_submit_market_trade(op, code, amount)`：走左树 **市价委托 └ 买入/卖出**
+  面板，**委托策略固定「五档即成剩撤」**——扫对手方最优五档立即成交、剩余自动撤销、**无残留挂单**。
+
+**为什么是五档即成剩撤**：市价 5 个策略里唯一同时满足"立即成交 + 剩余自动撤 + 沪深北全市场通用"。
+「对手方最优」只吃一档且深市会转限价留单、**上交所主板根本没有**；FOK 太刚。详见
+`docs/superpowers/specs/2026-07-04-ths-market-order-design.md`。
+
+**面板与控件（原生控件，非 CEF；新旧皮肤一致，见 `const.MARKET_*`）**：
+
+| 用途 | 控件 | ID |
+|---|---|---|
+| 证券代码 | Edit | `0x408`（与 F1/F2 同）|
+| 数量 | Edit | `0x40A`（与 F1/F2 同）|
+| 提交 | Button | `0x3EE` |
+| 委托策略 | ComboBox | `0x605`（标准 `ComboBox`）|
+
+**导航**：市价买入/卖出**无 F 快捷键**，且子节点文字"买入"/"卖出"与顶层"买入[F1]"前缀相同 →
+用 `_select_tree_child("市价委托", "买入"/"卖出")`：**先定位父节点、再在其直接子节点里整串精确匹配**
+（深度优先的 `_select_tree_node_by_text` 会先撞顶层，不能用）。跨进程 TreeView 读写/位数/DPI
+点击与 `_select_tree_node_by_text` 同构。
+
+**委托策略设置**：买卖下拉不同 → 用**键盘位置数字**切换（`_set_market_strategy`：`SetFocus` +
+`AttachThreadInput` + `WM_CHAR`，`CB_GETCURSEL` 校验，未命中回退 `CB_SETCURSEL`）。
+**买入**发 `"1"`（五档=index 0，已是默认）；**卖出**发 `"4"`（五档=index 3，默认 index 2=即成剩撤是
+**深市专有、沪市会拒** → 卖出必须显式设，否则下错单）。设不中即中止，不硬下。
+
+**回执**：五档即成剩撤下单后**几乎不留 `orders_active`**（全成→成交表；部分成→成交部分进成交表、
+剩余被撤）→ 市价回执**查成交表 `orders_filled`**（不是委托表），下单前快照 `before` 基线、下单后轮询
+差分（`_match_market_fill`）。可能**部分成交** → 回执带回真实 `filled_amount` / `avg_price`（按金额加权）
+和 `status`（`filled`/`partially_filled`）。8s 内查不到成交 → `status:"unknown"` 并提示**可能非连续
+竞价时段/涨跌停被拒/无成交**，绝不当成功。
+
 ## 8. 出新版本时怎么排查
 
 1. 切到目标皮肤、登录 xiadan。
