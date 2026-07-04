@@ -81,6 +81,8 @@ _LOG_FILE = _setup_file_logging()
 from . import bootstrap, config as trader_config, order_watch, tray, ui_dialogs, ws_client
 from .installer import auto_install
 from .main_window import MainWindow, SharedState
+from . import __version__ as _TRADER_VERSION
+from .selfupdate import apply as selfupdate_apply, check as selfupdate_check
 
 if platform.system() == "Windows":
     try:
@@ -229,11 +231,28 @@ async def _async_main(
         state.log(f"⚠ xiadan 准备失败: {e}")
         logger.exception("ensure_xiadan failed")
 
+    # Step 1.5: 自更新孤儿文件清理（上次更新可能留下 .old/.new）
+    if platform.system() == "Windows":
+        try:
+            selfupdate_apply.cleanup_orphan_files(Path(sys.executable).resolve().parent)
+        except Exception as e:
+            logger.warning("清理自更新孤儿文件失败（非致命）: %s", e)
+
     # Step 2: 升级检查
     try:
         await bootstrap.maybe_upgrade_async(on_event=on_event)
     except Exception as e:
         logger.warning("升级检查失败: %s", e)
+
+    # Step 2.5: guling-trader 自身更新检查（GitHub Releases，仅 Windows）
+    if platform.system() == "Windows":
+        try:
+            update_info = await selfupdate_check.check_for_update(_TRADER_VERSION)
+            if update_info:
+                state.update(self_update_info=update_info, self_update_status="idle")
+                state.log(f"发现 guling-trader 新版本：v{update_info.latest_version}")
+        except Exception as e:
+            logger.warning("guling-trader 自更新检查失败: %s", e)
 
     # Step 3: 冲突检测
     if platform.system() == "Windows" and bootstrap_result.found_xiadan_path:
@@ -471,6 +490,25 @@ def _enforce_single_instance() -> bool:
         return True  # 锁机制本身异常不阻断启动
 
 
+def release_singleton_mutex() -> None:
+    """自更新替换 exe 前显式释放单例 mutex。
+
+    正常运行期间 mutex 故意不释放（见上方 _SINGLETON_MUTEX 注释，防单例锁失效）；
+    这是唯一例外——必须在拉起新进程前释放，否则新进程的 _enforce_single_instance()
+    会撞见旧 mutex 还没关，误判"已有实例在跑"而直接退出。
+    """
+    global _SINGLETON_MUTEX
+    if _SINGLETON_MUTEX is None:
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.CloseHandle(_SINGLETON_MUTEX)
+    except Exception as e:
+        logger.warning("释放单例 mutex 失败（非致命）：%s", e)
+    finally:
+        _SINGLETON_MUTEX = None
+
+
 def run() -> None:
     # 单例：已有实例则提示并退出，避免双 trader 互踢导致隧道不稳。
     if not _enforce_single_instance():
@@ -592,6 +630,35 @@ def run() -> None:
         except Exception as e:
             state.log(f"⚠ 重置失败: {e}")
 
+    def on_apply_self_update() -> None:
+        """MainWindow「立即更新」按钮回调（主线程触发）：把 apply.run_update 丢给后台 loop 跑。"""
+        snap = state.snapshot()
+        if snap.get("self_update_status") == "downloading":
+            return  # 防重入：已经在下载中，忽略重复点击
+        info = snap.get("self_update_info")
+        if info is None:
+            return
+
+        loop = _ws_client_holder.get("loop")
+        if loop is None:
+            state.log("⚠ 无法启动更新：后台任务队列未就绪，请稍后重试")
+            return
+
+        state.update(self_update_status="downloading", self_update_progress=(0, 0))
+
+        def on_progress(done: int, total: int) -> None:
+            state.update(self_update_progress=(done, total))
+
+        async def _run() -> None:
+            try:
+                await selfupdate_apply.run_update(info, on_progress, release_singleton_mutex)
+            except Exception as e:
+                logger.warning("guling-trader 自更新失败: %s", e)
+                state.log(f"⚠ 自更新失败：{e}")
+                state.update(self_update_status="error")
+
+        asyncio.run_coroutine_threadsafe(_run(), loop)
+
     def on_main_exit() -> None:
         # 主窗口自身关闭时的清理钩子；asyncio thread 是 daemon，进程退它就停。
         pass
@@ -629,6 +696,7 @@ def run() -> None:
         on_exit=on_main_exit,
         on_redetect_xiadan=on_redetect_xiadan,
         on_set_xiadan_path=on_set_xiadan_path,
+        on_apply_self_update=on_apply_self_update,
         minimize_to_tray=(platform.system() == "Windows"),
     )
     # tray「显示窗口」回调在 mw 创建后才能绑定
