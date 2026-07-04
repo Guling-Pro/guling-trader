@@ -15,8 +15,6 @@ class TraderConfig:
     xiadan_path_manual: Optional[str] = None  # 用户手动指定的 xiadan.exe 路径
     ws_endpoint: Optional[str] = None  # 自定义中转地址：只填域名或 IP[:端口]，协议和路径自动补全
     enable_ths_plugin: bool = True  # 是否启用同花顺实盘交易插件，默认启用
-    enable_rpa_suite: bool = False  # 是否启用可选的桌面 RPA 扩展模块
-    chrome_cdp_port: int = 9222  # 本地 Edge/Chrome CDP 端口，默认 9222
     order_watch_idle_secs: int = 300   # order_watch 空闲轮询周期（秒）：默认 5 分钟
     order_watch_active_secs: int = 60  # 有未完成委托时的提速周期（秒）：默认 1 分钟
     enable_watchlist_watch: bool = True  # 是否定时同步自选股并推变化事件（新版 xiadan）
@@ -78,8 +76,6 @@ def load() -> TraderConfig:
             xiadan_path_manual=data.get("xiadan_path_manual"),
             ws_endpoint=data.get("ws_endpoint"),
             enable_ths_plugin=data.get("enable_ths_plugin", True),
-            enable_rpa_suite=data.get("enable_rpa_suite", False),
-            chrome_cdp_port=data.get("chrome_cdp_port", 9222),
             order_watch_idle_secs=data.get("order_watch_idle_secs", 300),
             order_watch_active_secs=data.get("order_watch_active_secs", 60),
             enable_watchlist_watch=data.get("enable_watchlist_watch", True),
@@ -101,8 +97,6 @@ def save(config: TraderConfig) -> None:
         "xiadan_path_manual": config.xiadan_path_manual,
         "ws_endpoint": config.ws_endpoint,
         "enable_ths_plugin": config.enable_ths_plugin,
-        "enable_rpa_suite": config.enable_rpa_suite,
-        "chrome_cdp_port": config.chrome_cdp_port,
         "order_watch_idle_secs": config.order_watch_idle_secs,
         "order_watch_active_secs": config.order_watch_active_secs,
         "enable_watchlist_watch": config.enable_watchlist_watch,

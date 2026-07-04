@@ -47,7 +47,6 @@ class SharedState:
     ths_refreshing: bool = False  # 配对码过期·正在刷新中
     agent_token: Optional[str] = None  # 永久凭证（仅 CONNECTED 时有用）
     enable_ths_plugin: bool = True  # 同花顺交易插件启用状态
-    enable_rpa_suite: bool = False  # 网页 RPA 发帖插件启用状态
     log_messages: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=500))
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -72,7 +71,6 @@ class SharedState:
                 "ths_refreshing": self.ths_refreshing,
                 "agent_token": self.agent_token,
                 "enable_ths_plugin": self.enable_ths_plugin,
-                "enable_rpa_suite": self.enable_rpa_suite,
                 "self_update_info": self.self_update_info,
                 "self_update_progress": self.self_update_progress,
                 "self_update_status": self.self_update_status,
@@ -173,7 +171,6 @@ class MainWindow:
         # 载入初始插件偏好
         snap = self.state.snapshot()
         self.enable_ths_plugin = snap.get("enable_ths_plugin", True)
-        self.enable_rpa_suite = snap.get("enable_rpa_suite", False)
 
         self._build_ui()
         self._schedule_poll()
@@ -474,65 +471,6 @@ class MainWindow:
         )
         self.ths_action_hint.pack(side="right")
 
-        # 插件 2：网页 RPA 社交发帖 (可选)
-        self.rpa_card = tk.Frame(right_frame, bg="#ffffff", highlightbackground="#d0d7de", highlightthickness=1)
-        self.rpa_card.pack(fill="x", pady=(0, 10))
-
-        # RPA 卡片 Header
-        self.rpa_header = tk.Frame(self.rpa_card, bg="#fcfcfc", height=32)
-        self.rpa_header.pack(fill="x")
-        self.rpa_header.pack_propagate(False)
-
-        self.rpa_title_label = tk.Label(
-            self.rpa_header, text="🌐 网页 RPA 社交发帖 (可选)", bg="#fcfcfc", fg="#24292f",
-            font=("Helvetica", 9, "bold")
-        )
-        self.rpa_title_label.pack(side="left", padx=10)
-
-        self.rpa_switch_btn = tk.Button(
-            self.rpa_header, text="已启用 🟢" if self.enable_rpa_suite else "已禁用 ⚪",
-            command=self._toggle_rpa_plugin, relief="flat", bg="#fafbfc",
-            fg="#00c800" if self.enable_rpa_suite else "#57606a",
-            font=("Helvetica", 8, "bold"), cursor="hand2", bd=0, padx=8, pady=2
-        )
-        self.rpa_switch_btn.pack(side="right", padx=10, pady=2)
-
-        # RPA 可折叠 Body
-        self.rpa_body = tk.Frame(self.rpa_card, bg="#ffffff")
-        if self.enable_rpa_suite:
-            self.rpa_body.pack(fill="x", padx=10, pady=10)
-
-        # RPA 动作行
-        rpa_action_row = tk.Frame(self.rpa_body, bg="#ffffff")
-        rpa_action_row.pack(fill="x", pady=(0, 8))
-
-        self.patch_browser_btn = tk.Button(
-            rpa_action_row, text="一键配置桌面浏览器参数", command=self._run_patch_browser,
-            relief="flat", bg="#b8913b", fg="#ffffff", font=("Helvetica", 9, "bold"),
-            padx=12, pady=4, cursor="hand2", bd=0
-        )
-        self.patch_browser_btn.pack(side="left")
-
-        rpa_action_hint = tk.Label(
-            rpa_action_row, text="支持 Edge/Chrome 自动修复",
-            bg="#ffffff", fg="#57606a", font=("Helvetica", 9)
-        )
-        rpa_action_hint.pack(side="right")
-
-        # 金色左边框说明提示卡
-        rpa_desc_border = tk.Frame(self.rpa_body, bg="#b8913b", padx=1)
-        rpa_desc_border.pack(fill="x", pady=(4, 0))
-
-        rpa_desc_inner = tk.Frame(rpa_desc_border, bg="#f8f9fa", padx=8, pady=8)
-        rpa_desc_inner.pack(fill="both")
-
-        desc_text = "💡 它如何工作：AI 自动调用\n启用后，AI 代理（如 yu-agent）获得自动发帖接口能力。股灵控制您本机日常登录的浏览器去静默填表，直接继承您的雪球已登录态，安全免登录。"
-        desc_lbl = tk.Label(
-            rpa_desc_inner, text=desc_text, bg="#f8f9fa", fg="#57606a",
-            font=("Helvetica", 9), justify="left", anchor="w", wraplength=340
-        )
-        desc_lbl.pack(fill="x")
-
         # 右分栏底部：退出程序排版
         right_footer = tk.Frame(right_frame, bg="#f6f8fa")
         right_footer.pack(fill="x", side="bottom", pady=(10, 0))
@@ -590,58 +528,6 @@ class MainWindow:
         else:
             self.ths_switch_btn.config(text="已禁用 ⚪", fg="#57606a", bg="#fafbfc")
             self.ths_body.pack_forget()
-
-    def _toggle_rpa_plugin(self) -> None:
-        """开启/折叠 RPA 网页发帖插件"""
-        self.enable_rpa_suite = not self.enable_rpa_suite
-        # 持久化到本地配置
-        try:
-            from . import config as _config
-            cfg = _config.load()
-            cfg.enable_rpa_suite = self.enable_rpa_suite
-            _config.save(cfg)
-            self.state.update(enable_rpa_suite=self.enable_rpa_suite)
-            self.state.log(f"[配置] 网页 RPA 发帖插件已{'启用' if self.enable_rpa_suite else '禁用'}")
-        except Exception as e:
-            self.state.log(f"⚠ 保存配置失败: {e}")
-
-        if self.enable_rpa_suite:
-            self.rpa_switch_btn.config(text="已启用 🟢", fg="#00c800", bg="#fafbfc")
-            self.rpa_body.pack(fill="x", padx=10, pady=10)
-        else:
-            self.rpa_switch_btn.config(text="已禁用 ⚪", fg="#57606a", bg="#fafbfc")
-            self.rpa_body.pack_forget()
-
-    def _run_patch_browser(self) -> None:
-        """快捷方式修补工具"""
-        self.state.log("[RPA] 开始修补桌面浏览器快捷方式...")
-        import platform as _platform
-        if _platform.system() != "Windows":
-            self.state.log("⚠ 该快捷工具仅支持 Windows 平台。")
-            self.state.log("💡 macOS/Linux 用户请打开终端执行：")
-            self.state.log("   open -a 'Google Chrome' --args --remote-debugging-port=9222")
-            return
-
-        try:
-            import os
-            from pathlib import Path as _Path
-            desktop = _Path(os.path.expanduser("~/Desktop"))
-            public_desktop = _Path("C:/Users/Public/Desktop")
-            
-            patched = False
-            for dt in [desktop, public_desktop]:
-                if not dt.exists():
-                    continue
-                for lnk in dt.glob("*.lnk"):
-                    if "edge" in lnk.name.lower() or "chrome" in lnk.name.lower():
-                        self.state.log(f"[RPA] 发现快捷方式: {lnk.name}")
-            
-            self.state.log("💡 一键快捷配置成功！快捷建议：在 Edge 属性中「目标」最后追加 --remote-debugging-port=9222")
-            self.state.log("✓ 已配置就绪")
-            from tkinter import messagebox
-            messagebox.showinfo("网页 RPA 助手", "配置就绪！\n\n已完成检测。如未开启，请完全关闭浏览器后，在 Edge/Chrome 快捷方式属性「目标」尾部空格并追加：\n\n--remote-debugging-port=9222\n\n之后重新打开即可激活 9222 调试端口。", parent=self.root)
-        except Exception as e:
-            self.state.log(f"⚠ 修补失败: {e}")
 
     def _schedule_poll(self) -> None:
         """tk after-loop 周期同步 SharedState → UI"""
