@@ -144,27 +144,6 @@ FALLBACK_TOOLS_SCHEMA = {
   ]
 }
 
-XUEQIU_RPA_TOOL = {
-  "name": "xueqiu_publish_review",
-  "description": "通过本地已登录的浏览器（Edge/Chrome），在雪球网发布实盘复盘、调仓日志或运营推文（安全拟真，免账号密码）",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "content": {
-        "type": "string",
-        "description": "发布的内容文案。支持包含 $个股名称(代码)$ 格式的雪球 Hashtag 标签。"
-      },
-      "semi_manual": {
-        "type": "boolean",
-        "default": True,
-        "description": "是否开启半人工模式。为 true 时在发帖框填入文案后悬停并弹窗提示用户确认；为 false 时自动点击发布。"
-      }
-    },
-    "required": ["content"],
-    "additionalProperties": False
-  }
-}
-
 from . import config as _config
 
 def load_tools_schema() -> dict[str, Any]:
@@ -188,9 +167,6 @@ def load_tools_schema() -> dict[str, Any]:
         trading_names = {"balance", "position", "orders_active", "orders_filled", "settlement", "watchlist", "buy", "sell", "cancel"}
         schema["tools"] = [t for t in schema["tools"] if t.get("name") not in trading_names]
 
-    if cfg.enable_rpa_suite:
-        schema["tools"].append(XUEQIU_RPA_TOOL)
-
     return schema
 
 METHOD_WHITELIST = {
@@ -204,7 +180,6 @@ METHOD_WHITELIST = {
     "buy",
     "sell",
     "cancel",
-    "xueqiu_publish_review",
 }
 
 
@@ -289,15 +264,6 @@ async def handle_call(
         elif method == "cancel":
             entrust_no = params.get("entrust_no")
             result = await backend.cancel(entrust_no)
-        elif method == "xueqiu_publish_review":
-            if not cfg.enable_rpa_suite:
-                result = {"code": 1, "error": "RPA 模块未启用，请先开启配置中的 enable_rpa_suite 开关"}
-            else:
-                from .rpa.xueqiu import XueqiuRpaBackend
-                content = params.get("content")
-                semi_manual = params.get("semi_manual", True)
-                rpa_backend = XueqiuRpaBackend()
-                result = await rpa_backend.publish_review(content, semi_manual)
         else:
             result = {"code": 1, "error": "内部错误"}
 

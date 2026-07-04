@@ -32,13 +32,12 @@ guling-trader 与同花顺、MCP 三合一，是这一范式落地 A 股的开�
 
 ## 怎样才能让 AI 帮我交易 A 股？
 
-三条路都能到达，按你的隐私诉求和技术门槛选一条：
+两条路都能到达，按你的技术门槛选一条：
 
 | 场景 | 路径 | 数据流向 | 难度 |
 |------|------|--------|------|
 | 最简单，已有 guling.pro 邀请码 | [**A · 托管版**](#路径-a--gulingpro-托管版) | 经 guling.pro 云 | ★ |
 | 用 Claude / Cursor / openclaw 等任意 AI | [**B · 云端自助**](#路径-b--任意-ai-客户端通过-mcpgulingpro-自助接入) | 经 mcp.guling.pro 云 | ★★ |
-| 极客用户，要求数据不出自己设备 | [**C · 本地直连**](#路径-c--本地-stdio--tailscale-规划中) 🚧 | 仅你的设备 | ★★★ |
 
 > **第一步对所有路径相同**：先把 Windows 端跑起来。
 
@@ -86,25 +85,6 @@ AI 会自动抓取该网址的安装向导，一步步完成配对和接入—�
 **原理一句话**：向 `https://mcp.guling.pro/pair` 用 6 位码换一个永久 `agent_token`，再用 `Authorization: Bearer <token>` 请求头把 MCP 服务器挂上即可。
 
 **为什么要经过 mcp.guling.pro？** 你家里的 Windows 端和 AI 客户端通常各自在内网，彼此找不到——需要一台公网服务器当"汇合点"。guling.pro 免费提供这条中转隧道，只加密转发你的指令，让你免去自建公网服务器的麻烦，开箱即用、安全又简单。
-
-如果连这条隧道也不想经过，请走下面的 [路径 C](#路径-c--本地-stdio--tailscale-规划中)。
-
----
-
-## 路径 C · 本地 stdio + Tailscale（规划中）
-
-🚧 **状态：设计已定，代码尚未入库。** 本节为预览；落地后转正。完整设计见 [`docs/local_only_stdio_mcp_setup.md`](docs/local_only_stdio_mcp_setup.md)。
-
-面向隐私要求最高的用户：**交易数据全程不经过任何云服务器**。
-
-- **拓扑**：Windows 交易端 ↔ 你的 Mac（通过 Tailscale 私有网络直连）→ 本地 AI 客户端（Cursor / Claude）通过 stdio 与轻量 relay 进程通信。
-- **规划提供**：`mcp/` 文件夹 + Python relay 脚本（`mcp_local_relay.py`），帮你本地把 stdio ↔ WebSocket 桥接。
-- **你需做**：安装并配置 Tailscale；编辑 `guling-trader-data\config.json`，把 `ws_endpoint` 填成 Mac 的 Tailscale 地址（格式：`100.x.x.x:8080`）。
-
-### 待落地的清单
-- [ ] 新增 `mcp/` 目录与 `mcp_local_relay.py`
-- [ ] relay 安装/运行说明与 Cursor / Claude 的 stdio 对接示例
-- [ ] Tailscale 内网端到端联调，本节转正
 
 ---
 
@@ -260,15 +240,13 @@ guling-trader/
 ├── docs/
 │   ├── PROTOCOL.md          # MCP 帧协议文档
 │   ├── tools_schema.json    # 工具 Schema
-│   ├── local_only_stdio_mcp_setup.md  # 路径 C 设计稿（规划中）
+│   ├── local_only_stdio_mcp_setup.md  # 本地私有化接入设计稿（暂未开放）
 │   └── specs/               # 规格文档
 ├── pyproject.toml           # 项目元数据和依赖
 ├── LICENSE                  # GPL-3.0
 └── guling-trader-data/      # 运行时数据目录
     └── trader.log           # 诊断日志输出位置
 ```
-
-**注**：MCP 网关、relay 与 `mcp/` 目录为路径 C（本地直连）落地时新增。
 
 </details>
 

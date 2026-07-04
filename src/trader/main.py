@@ -557,7 +557,6 @@ def run() -> None:
         account_name=result.config.account_name or "",
         agent_token=result.config.agent_token or None,
         enable_ths_plugin=result.config.enable_ths_plugin,
-        enable_rpa_suite=result.config.enable_rpa_suite,
     )
 
     def on_open_xiadan() -> None:
