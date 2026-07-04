@@ -39,6 +39,9 @@ class SharedState:
     last_pong_at: Optional[float] = None
     fatal_reason: Optional[str] = None
     install_progress: Optional[tuple[int, int]] = None  # (done, total)
+    self_update_info: Optional[UpdateInfo] = None  # 检测到的新版本信息，None=无更新
+    self_update_progress: Optional[tuple[int, int]] = None  # (done, total)
+    self_update_status: str = "idle"  # idle | downloading | error
     ths_steps_complete: int = 0  # [0..4] 已完成 of THS 步数
     ths_expanded: bool = True  # THS 区展开/折叠
     ths_refreshing: bool = False  # 配对码过期·正在刷新中
@@ -70,6 +73,9 @@ class SharedState:
                 "agent_token": self.agent_token,
                 "enable_ths_plugin": self.enable_ths_plugin,
                 "enable_rpa_suite": self.enable_rpa_suite,
+                "self_update_info": self.self_update_info,
+                "self_update_progress": self.self_update_progress,
+                "self_update_status": self.self_update_status,
             }
 
     def log(self, message: str) -> None:
@@ -119,6 +125,7 @@ class MainWindow:
         on_exit: Optional[Callable[[], None]] = None,
         on_redetect_xiadan: Optional[Callable[[], None]] = None,
         on_set_xiadan_path: Optional[Callable[[str], None]] = None,
+        on_apply_self_update: Optional[Callable[[], None]] = None,
         minimize_to_tray: bool = False,
     ):
         self.state = state
@@ -127,6 +134,7 @@ class MainWindow:
         self.on_exit_cb = on_exit
         self.on_redetect_xiadan = on_redetect_xiadan
         self.on_set_xiadan_path = on_set_xiadan_path
+        self.on_apply_self_update = on_apply_self_update
         self._minimize_to_tray = minimize_to_tray
 
         self.root = tk.Tk()
@@ -182,10 +190,49 @@ class MainWindow:
         main_pane = tk.Frame(self.root, bg="#f6f8fa")
         main_pane.pack(fill="both", expand=True)
 
+        # 【自更新提示横幅】跨两栏，默认隐藏；_sync_state 检测到新版本时显示。
+        # 用 before=self.left_frame 固定插回 pack 顺序最上方——pack_forget() 会清除顺序
+        # 记忆，重新 pack 若不指定 before/after 会被追加到当前 slave 列表末尾（即
+        # left_frame/right_frame 之后），横幅会被挤到没有剩余空间的位置而实际不可见。
+        self.self_update_box = tk.Frame(
+            main_pane, bg="#fff8e1", highlightbackground="#e0b656", highlightthickness=1
+        )
+
+        self.self_update_label = tk.Label(
+            self.self_update_box, text="", bg="#fff8e1", fg="#24292f",
+            font=("Helvetica", 9, "bold")
+        )
+        self.self_update_label.pack(side="left", padx=10, pady=6)
+
+        self.self_update_progress_var = tk.DoubleVar(master=self.root, value=0.0)
+        self.self_update_progress_bar = ttk.Progressbar(
+            self.self_update_box, variable=self.self_update_progress_var,
+            maximum=100.0, length=120,
+        )
+        # 进度条只在 downloading 状态才 pack 出来，见 _sync_state
+
+        self.self_update_skip_btn = tk.Button(
+            self.self_update_box, text="跳过", command=self._on_click_self_update_skip,
+            relief="flat", bg="#ffffff", fg="#57606a", font=("Helvetica", 8),
+            padx=8, pady=2, cursor="hand2", bd=0,
+            highlightbackground="#d0d7de", highlightthickness=1
+        )
+        self.self_update_skip_btn.pack(side="right", padx=(0, 4), pady=6)
+
+        self.self_update_btn = tk.Button(
+            self.self_update_box, text="立即更新", command=self._on_click_self_update,
+            relief="flat", bg="#e0b656", fg="#ffffff", font=("Helvetica", 8, "bold"),
+            padx=8, pady=2, cursor="hand2", bd=0
+        )
+        self.self_update_btn.pack(side="right", padx=10, pady=6)
+        # self_update_box 本身默认不 pack（不加入 main_pane 的显示），子控件的 pack
+        # 状态不受影响——_sync_state 检测到新版本时才把 self_update_box 本身 pack 出来
+
         # ==========================================
         # 【左分栏】MCP 网关连接与监控舱 (固定宽 300px)
         # ==========================================
         left_frame = tk.Frame(main_pane, bg="#f6f8fa", width=310)
+        self.left_frame = left_frame  # 供自更新横幅 pack(before=...) 稳定定位
         left_frame.pack(side="left", fill="both", padx=(12, 6), pady=(12, 4))
         left_frame.pack_propagate(False)  # 强制宽度锁定
 
@@ -516,6 +563,13 @@ class MainWindow:
         website_link.pack(side="right")
         website_link.bind("<Button-1>", self._on_footer_link_click)
 
+    def _on_click_self_update(self) -> None:
+        if self.on_apply_self_update:
+            self.on_apply_self_update()
+
+    def _on_click_self_update_skip(self) -> None:
+        self.state.update(self_update_info=None)
+
     def _toggle_ths_plugin(self) -> None:
         """开启/折叠同花顺交易插件"""
         self.enable_ths_plugin = not self.enable_ths_plugin
@@ -710,6 +764,44 @@ class MainWindow:
                     else:
                         circle.config(text=str(s_num), bg="#fafbfc", fg="#999999", highlightbackground="#d0d7de")
                         hint.config(text="")
+
+        # 3. 自更新提示横幅状态自适应
+        update_info = snap.get("self_update_info")
+        update_status = snap.get("self_update_status", "idle")
+
+        if update_info is None:
+            if self.self_update_box.winfo_ismapped():
+                self.self_update_box.pack_forget()
+        else:
+            if not self.self_update_box.winfo_ismapped():
+                self.self_update_box.pack(fill="x", padx=12, pady=(12, 0), before=self.left_frame)
+
+            if update_status == "downloading":
+                done, total = snap.get("self_update_progress") or (0, 0)
+                pct = (done / total * 100) if total > 0 else 0
+                self.self_update_label.config(text=f"正在更新到 v{update_info.latest_version}...")
+                self.self_update_progress_var.set(pct)
+                if not self.self_update_progress_bar.winfo_ismapped():
+                    self.self_update_progress_bar.pack(side="left", padx=10, pady=6)
+                self.self_update_btn.config(state="disabled")
+                if self.self_update_skip_btn.winfo_ismapped():
+                    self.self_update_skip_btn.pack_forget()
+            elif update_status == "error":
+                self.self_update_label.config(text="更新失败，可重试或前往 GitHub Releases 手动下载")
+                if self.self_update_progress_bar.winfo_ismapped():
+                    self.self_update_progress_bar.pack_forget()
+                self.self_update_btn.config(state="normal", text="重试更新")
+                if not self.self_update_skip_btn.winfo_ismapped():
+                    self.self_update_skip_btn.pack(side="right", padx=(0, 4), pady=6)
+            else:
+                self.self_update_label.config(
+                    text=f"发现新版本 v{update_info.latest_version}（当前 v{update_info.current_version}）"
+                )
+                if self.self_update_progress_bar.winfo_ismapped():
+                    self.self_update_progress_bar.pack_forget()
+                self.self_update_btn.config(state="normal", text="立即更新")
+                if not self.self_update_skip_btn.winfo_ismapped():
+                    self.self_update_skip_btn.pack(side="right", padx=(0, 4), pady=6)
 
     def _drain_log_queue(self) -> None:
         """把 SharedState.log_messages 队列里的内容刷到 log_text 区"""
