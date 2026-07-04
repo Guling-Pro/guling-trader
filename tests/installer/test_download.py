@@ -194,3 +194,106 @@ async def test_verify_sha256_mismatch():
         )
 
         assert result is False
+
+
+@pytest.mark.asyncio
+async def test_download_retries_then_succeeds(tmp_path, monkeypatch):
+    """首次尝试网络失败 → 自动重试 → 第二次成功（验证重试逻辑，不再一抖动就整体失败）"""
+    from trader.installer import download
+
+    dest = tmp_path / "f.exe"
+    progress = []
+
+    class GoodResp:
+        status = 200
+        headers = {"Content-Length": "4"}
+
+        def __init__(self):
+            self.content = self
+
+        async def iter_chunked(self, size):
+            yield b"abcd"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+    class FailSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        def get(self, *a, **kw):
+            raise ConnectionError("boom")
+
+    class GoodSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        def get(self, *a, **kw):
+            return GoodResp()
+
+    sessions = iter([FailSession(), GoodSession()])
+    monkeypatch.setattr("aiohttp.ClientSession", lambda *a, **kw: next(sessions))
+    monkeypatch.setattr(download.asyncio, "sleep", AsyncMock())  # 别真等退避
+
+    result = await download.download_with_progress(
+        "https://example.com/f.exe", dest, on_progress=lambda d, t: progress.append((d, t))
+    )
+
+    assert result == dest
+    assert dest.read_bytes() == b"abcd"
+    assert progress[-1] == (4, 4)
+
+
+@pytest.mark.asyncio
+async def test_download_resumes_with_range_header(tmp_path, monkeypatch):
+    """已存在半成品 → 带 Range 头续传 → 拼接完整（验证断点续传，不从 0 重来）"""
+    from trader.installer import download
+
+    dest = tmp_path / "f.exe"
+    dest.write_bytes(b"AB")  # 上次已下 2 字节
+
+    captured = {}
+
+    class Resp206:
+        status = 206
+        headers = {"Content-Length": "2"}  # 剩余 2 字节
+
+        def __init__(self):
+            self.content = self
+
+        async def iter_chunked(self, size):
+            yield b"CD"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        def get(self, url, headers=None, timeout=None):
+            captured["headers"] = headers or {}
+            return Resp206()
+
+    monkeypatch.setattr("aiohttp.ClientSession", lambda *a, **kw: Session())
+    monkeypatch.setattr(download.asyncio, "sleep", AsyncMock())
+
+    result = await download.download_with_progress("https://example.com/f.exe", dest)
+
+    assert captured["headers"].get("Range") == "bytes=2-"
+    assert dest.read_bytes() == b"ABCD"  # 续传拼接,未从头覆盖

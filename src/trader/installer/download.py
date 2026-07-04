@@ -37,15 +37,25 @@ async def download_with_progress(
     dest: Path | str,
     on_progress: Optional[Callable[[int, int], None]] = None,
     chunk_size: int = 65536,
+    max_retries: int = 4,
 ) -> Path:
     """
-    异步下载文件，支持 Range 续传和进度回调。
+    异步下载文件：单次 GET + 自动重试 + 断点续传 + 进度回调。
+
+    针对慢/不稳的链路（如国内访问 GitHub Release CDN）优化：
+    - **单 GET**：一次请求既拿大小又下数据（旧实现会先发一个 GET 只读 Content-Length
+      再发第二个 GET 真正下载，在慢链路上等于翻倍建连与失败面）。
+    - **自动重试 + 续传**：单次尝试失败时**保留已下的半成品**，下次尝试带 `Range` 头接着下，
+      指数退避；只有重试全部耗尽才向上抛异常。失败时不删半成品，好让上层"重试"按钮也能续传。
+    - **慢链路友好超时**：不设总时长上限（大文件慢下也不该被总时长砍掉），只在"连不上"
+      （connect）和"卡住不再有数据"（sock_read）时超时失败。
 
     Args:
         url: 下载 URL
         dest: 目标路径
         on_progress: 进度回调，接收 (bytes_downloaded, total_bytes)
         chunk_size: 单次读取大小
+        max_retries: 最大尝试次数（含首次）
 
     Returns:
         目标文件 Path
@@ -53,50 +63,54 @@ async def download_with_progress(
     dest_path = Path(dest)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 检查断点续传条件
-    resume_from = 0
-    if dest_path.exists():
-        resume_from = dest_path.stat().st_size
-        logger.info("断点续传：从 %d 字节继续", resume_from)
+    # 连不上快速失败；下载中只要还有数据就耐心等，不给总时长封顶。
+    timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=60)
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            headers = {}
-            if resume_from > 0:
-                headers["Range"] = f"bytes={resume_from}-"
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        resume_from = dest_path.stat().st_size if dest_path.exists() else 0
+        headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 else {}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=timeout) as resp:
+                    content_len = int(resp.headers.get("Content-Length", 0))
+                    if resp.status == 206:  # Partial Content：服务器接受续传
+                        total_size = resume_from + content_len
+                        mode = "ab"
+                    elif resp.status == 200:  # 全新下载或服务器不支持 Range
+                        resume_from = 0
+                        total_size = content_len
+                        mode = "wb"
+                    else:
+                        raise Exception(f"HTTP {resp.status}")
 
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3600)) as resp:
-                # 检查 Content-Length
-                total_size = int(resp.headers.get("Content-Length", 0))
-                if resume_from > 0 and resp.status == 206:  # Partial Content
-                    # Range 续传时，加上已下载的大小
-                    total_size = resume_from + total_size
-                elif resp.status == 200:
-                    resume_from = 0  # 服务器不支持 Range，重新开始
-                    dest_path.unlink(missing_ok=True)
-                else:
-                    raise Exception(f"HTTP {resp.status}")
+                    logger.info(
+                        "下载(第%d/%d次) url=%s resume=%d total=%d",
+                        attempt, max_retries, url, resume_from, total_size,
+                    )
+                    bytes_downloaded = resume_from
+                    with open(dest_path, mode) as f:
+                        async for chunk in resp.content.iter_chunked(chunk_size):
+                            f.write(chunk)
+                            bytes_downloaded += len(chunk)
+                            if on_progress:
+                                on_progress(bytes_downloaded, total_size)
 
-                logger.info("开始下载：url=%s total=%d bytes", url, total_size)
+            logger.info("下载完成：%s（%d bytes）", dest_path, bytes_downloaded)
+            return dest_path
 
-                bytes_downloaded = resume_from
-                async with aiohttp.ClientSession() as session2:
-                    async with session2.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3600)) as resp2:
-                        mode = "ab" if resume_from > 0 else "wb"
-                        with open(dest_path, mode) as f:
-                            async for chunk in resp2.content.iter_chunked(chunk_size):
-                                f.write(chunk)
-                                bytes_downloaded += len(chunk)
-                                if on_progress:
-                                    on_progress(bytes_downloaded, total_size)
+        except Exception as e:
+            last_err = e
+            have = dest_path.stat().st_size if dest_path.exists() else 0
+            logger.warning(
+                "下载第 %d/%d 次失败：%s（保留已下 %d 字节，重试将续传）",
+                attempt, max_retries, e, have,
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(min(2 ** attempt, 10))  # 指数退避，封顶 10s
 
-                logger.info("下载完成：%s（%d bytes）", dest_path, bytes_downloaded)
-                return dest_path
-
-    except Exception as e:
-        logger.error("下载失败：%s", e)
-        dest_path.unlink(missing_ok=True)
-        raise
+    logger.error("下载最终失败（%d 次尝试后）：%s", max_retries, last_err)
+    raise last_err if last_err else Exception("下载失败")
 
 
 async def verify_sha256(file_path: Path, expected_sha256: str) -> bool:

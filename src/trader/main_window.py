@@ -13,6 +13,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from dataclasses import dataclass, field
 from tkinter import scrolledtext, ttk
 from typing import Callable, Optional
@@ -208,22 +209,32 @@ class MainWindow:
         )
         # 进度条只在 downloading 状态才 pack 出来，见 _sync_state
 
+        # 三个操作按钮都在 _build_ui 阶段创建、但**不在这里 pack**——它们的显隐完全由
+        # _render_self_update_banner 按状态统一控制（下载中一个都不显示，只留进度条；避免
+        # Windows 上 disabled 按钮看着仍可点的歧义）。
         self.self_update_skip_btn = tk.Button(
             self.self_update_box, text="跳过", command=self._on_click_self_update_skip,
             relief="flat", bg="#ffffff", fg="#57606a", font=("Helvetica", 8),
             padx=8, pady=2, cursor="hand2", bd=0,
             highlightbackground="#d0d7de", highlightthickness=1
         )
-        self.self_update_skip_btn.pack(side="right", padx=(0, 4), pady=6)
+
+        # 「手动下载」：错误态兜底，用系统浏览器打开新版 exe 直链
+        self.self_update_manual_btn = tk.Button(
+            self.self_update_box, text="手动下载", command=self._on_click_self_update_manual,
+            relief="flat", bg="#ffffff", fg="#0969da", font=("Helvetica", 8),
+            padx=8, pady=2, cursor="hand2", bd=0,
+            highlightbackground="#d0d7de", highlightthickness=1
+        )
 
         self.self_update_btn = tk.Button(
             self.self_update_box, text="立即更新", command=self._on_click_self_update,
             relief="flat", bg="#e0b656", fg="#ffffff", font=("Helvetica", 8, "bold"),
             padx=8, pady=2, cursor="hand2", bd=0
         )
-        self.self_update_btn.pack(side="right", padx=10, pady=6)
         # self_update_box 本身默认不 pack（不加入 main_pane 的显示），子控件的 pack
         # 状态不受影响——_sync_state 检测到新版本时才把 self_update_box 本身 pack 出来
+        self._self_update_rendered = None  # 记录上次渲染的 (status, version)，避免每帧重排闪烁
 
         # ==========================================
         # 【左分栏】MCP 网关连接与监控舱 (固定宽 300px)
@@ -508,6 +519,50 @@ class MainWindow:
     def _on_click_self_update_skip(self) -> None:
         self.state.update(self_update_info=None)
 
+    def _on_click_self_update_manual(self) -> None:
+        """错误态「手动下载」：用系统浏览器打开新版 exe 直链。
+
+        程序内下载在慢/不稳的链路上可能反复失败，浏览器或下载工具往往更快更稳；
+        点了不至于卡在"失败了不知道怎么办"。
+        """
+        info = self.state.snapshot().get("self_update_info")
+        url = getattr(info, "exe_url", None) or \
+            "https://github.com/Guling-Pro/guling-trader/releases/latest"
+        try:
+            webbrowser.open(url)
+            self.state.log(f"已在浏览器打开下载链接：{url}")
+        except Exception as e:
+            self.state.log(f"⚠ 打开浏览器失败，请手动访问 GitHub Releases：{e}")
+
+    def _render_self_update_banner(self, status: str, info) -> None:
+        """按状态统一摆放横幅内的进度条/按钮：先全部收起，再摆出该状态需要的控件。
+
+        这样做不残留、不串台，且**下载中一个按钮都不显示**（只留进度条），彻底避免
+        Windows 上 disabled 按钮视觉变化太弱、看着仍可点的歧义。
+        """
+        for w in (self.self_update_progress_bar, self.self_update_btn,
+                  self.self_update_manual_btn, self.self_update_skip_btn):
+            if w.winfo_ismapped():
+                w.pack_forget()
+
+        if status == "downloading":
+            # 下载中：只显示进度条，无任何按钮
+            self.self_update_label.config(text=f"正在更新到 v{info.latest_version}…")
+            self.self_update_progress_bar.pack(side="left", padx=10, pady=6)
+        elif status == "error":
+            self.self_update_label.config(text="更新失败 —— 可重试，或点「手动下载」用浏览器下载")
+            self.self_update_skip_btn.pack(side="right", padx=(0, 4), pady=6)
+            self.self_update_manual_btn.pack(side="right", padx=(0, 4), pady=6)
+            self.self_update_btn.config(state="normal", text="重试更新")
+            self.self_update_btn.pack(side="right", padx=10, pady=6)
+        else:  # idle：发现新版本
+            self.self_update_label.config(
+                text=f"发现新版本 v{info.latest_version}（当前 v{info.current_version}）"
+            )
+            self.self_update_skip_btn.pack(side="right", padx=(0, 4), pady=6)
+            self.self_update_btn.config(state="normal", text="立即更新")
+            self.self_update_btn.pack(side="right", padx=10, pady=6)
+
     def _toggle_ths_plugin(self) -> None:
         """开启/折叠同花顺交易插件"""
         self.enable_ths_plugin = not self.enable_ths_plugin
@@ -658,36 +713,22 @@ class MainWindow:
         if update_info is None:
             if self.self_update_box.winfo_ismapped():
                 self.self_update_box.pack_forget()
+            self._self_update_rendered = None
         else:
             if not self.self_update_box.winfo_ismapped():
                 self.self_update_box.pack(fill="x", padx=12, pady=(12, 0), before=self.left_frame)
 
+            # 进度条数值每帧刷新（便宜，不触发重排）
             if update_status == "downloading":
                 done, total = snap.get("self_update_progress") or (0, 0)
                 pct = (done / total * 100) if total > 0 else 0
-                self.self_update_label.config(text=f"正在更新到 v{update_info.latest_version}...")
                 self.self_update_progress_var.set(pct)
-                if not self.self_update_progress_bar.winfo_ismapped():
-                    self.self_update_progress_bar.pack(side="left", padx=10, pady=6)
-                self.self_update_btn.config(state="disabled")
-                if self.self_update_skip_btn.winfo_ismapped():
-                    self.self_update_skip_btn.pack_forget()
-            elif update_status == "error":
-                self.self_update_label.config(text="更新失败，可重试或前往 GitHub Releases 手动下载")
-                if self.self_update_progress_bar.winfo_ismapped():
-                    self.self_update_progress_bar.pack_forget()
-                self.self_update_btn.config(state="normal", text="重试更新")
-                if not self.self_update_skip_btn.winfo_ismapped():
-                    self.self_update_skip_btn.pack(side="right", padx=(0, 4), pady=6)
-            else:
-                self.self_update_label.config(
-                    text=f"发现新版本 v{update_info.latest_version}（当前 v{update_info.current_version}）"
-                )
-                if self.self_update_progress_bar.winfo_ismapped():
-                    self.self_update_progress_bar.pack_forget()
-                self.self_update_btn.config(state="normal", text="立即更新")
-                if not self.self_update_skip_btn.winfo_ismapped():
-                    self.self_update_skip_btn.pack(side="right", padx=(0, 4), pady=6)
+
+            # 控件显隐仅在 状态/版本 变化时重排一次，避免每 100ms 反复 pack 造成闪烁
+            render_key = (update_status, update_info.latest_version)
+            if self._self_update_rendered != render_key:
+                self._self_update_rendered = render_key
+                self._render_self_update_banner(update_status, update_info)
 
     def _drain_log_queue(self) -> None:
         """把 SharedState.log_messages 队列里的内容刷到 log_text 区"""

@@ -89,15 +89,17 @@ async def run_update(
         expected_sha256 = _parse_sha256_file(sha_text)
 
         if not await verify_sha256(new_path, expected_sha256):
+            # 校验不过 = 下到的字节不可信，删掉半成品，下次从头下载
+            new_path.unlink(missing_ok=True)
             raise SelfUpdateError("下载文件 SHA256 校验不匹配，可能下载不完整或被篡改")
 
         _swap_files(exe_path, new_path, old_path)
 
     except SelfUpdateError:
-        new_path.unlink(missing_ok=True)
         raise
     except Exception as e:
-        new_path.unlink(missing_ok=True)
+        # 下载/网络类失败：保留 .new 半成品，用户点"重试更新"时可断点续传，不从 0 重来。
+        # （下次启动时 cleanup_orphan_files 会兜底清掉遗留的 .new，不会长期堆积。）
         raise SelfUpdateError(f"下载或替换过程出错：{e}") from e
 
     release_singleton_mutex()
