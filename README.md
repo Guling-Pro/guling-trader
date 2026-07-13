@@ -48,6 +48,7 @@ guling-trader 与同花顺、MCP 三合一，是这一范式落地 A 股的开�
 你需要一台**7×24 运行的 Windows 机器**（物理机、云 VPS，或 Mac 虚拟机如 Parallels Desktop）。
 
 1. **登录同花顺**：打开同花顺独立委托客户端（`xiadan.exe`），用你的证券账户登录，停留在下单主页。**新版 / 旧版皮肤均可**——v0.5.0 起自动适配控件，无需再手动切"旧版"。请勿最小化。
+   - **建议关闭下单确认弹窗**（更快更稳）：在 xiadan 的系统设置中把「委托前确认/下单确认提示」类选项关掉（不同券商版本措辞略有差异）。关不掉的弹窗（验证码、废单提示、风险警示等）不用管——助手会自动处理并把弹窗内容记录进回执。
 
 2. **运行交易助手**：从 [GitHub Releases](https://github.com/Guling-Pro/guling-trader/releases/latest/download/guling-trader.exe) 下载 `guling-trader.exe`（单文件免安装），双击运行。
    - 首次启动会自动静默安装 Tesseract OCR（图形识别环境），无感进行。

@@ -1,4 +1,5 @@
 """RPC 分派：call frame → backend method → reply frame"""
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -7,6 +8,14 @@ from typing import Any, Optional
 from .ths.win import WinThsBackend
 
 logger = logging.getLogger(__name__)
+
+# 受控端单笔调用总预算：必须低于网关侧 30s 超时，保证网关永远等得到带
+# unknown 语义的 reply，而不是自造裸错误（-32003）。
+CALL_TIMEOUT_SECS = 25.0
+# win_lock 排队上限：持锁方被拖住时，排队方回 busy 而非无限饿死。
+LOCK_TIMEOUT_SECS = 5.0
+# 会真实改变账户状态的方法：超时/busy 回执必须带「可能已提交，先核单」语义。
+ORDER_METHODS = {"buy", "sell", "cancel"}
 
 # Fallback tools schema in case the external JSON file cannot be found (e.g., in a packaged PyInstaller environment)
 FALLBACK_TOOLS_SCHEMA = {
@@ -225,47 +234,76 @@ async def handle_call(
         return reply
 
     # 串行化 THS 单窗口访问：order_watch 轮询与下单/查询共用 backend.win_lock。
+    # 拿锁带超时：持锁方若被弹窗/慢操作拖住，排队方不能无限饿死——回 busy
+    # 让调用方稍后重试，并提醒先核实前序委托。
     needs_window = method in trading_methods
     if needs_window:
-        await backend.win_lock.acquire()
+        try:
+            await asyncio.wait_for(backend.win_lock.acquire(), LOCK_TIMEOUT_SECS)
+        except asyncio.TimeoutError:
+            msg = ("受控端正忙或被弹窗阻塞，本笔指令未执行。"
+                   "请先调 orders_active/orders_filled 核实前序委托状态后再重试")
+            reply["ok"] = False
+            reply["result"] = {"code": 2, "status": "busy", "msg": msg}
+            reply["error"] = msg
+            return reply
     try:
-        if method == "balance":
-            logger.info("[RPC] method=balance, frame_id=%s", frame_id)
-            result = await backend.balance()
-            logger.info("[RPC] balance → code=%s", result.get("code"))
-        elif method == "position":
-            result = await backend.position()
-        elif method == "orders_active":
-            result = await backend.orders_active()
-        elif method == "orders_filled":
-            result = await backend.orders_filled()
-        elif method == "settlement":
-            result = await backend.settlement(params.get("date_range", "近一年"))
-        elif method == "watchlist":
-            result = await backend.watchlist()
-        elif method == "buy":
-            stock_no = params.get("stock_no")
-            amount = params.get("amount")
-            price = params.get("price")
-            client_order_id = params.get("client_order_id")
-            result = await backend.buy(stock_no, amount, price, client_order_id)
-            _eno = (result or {}).get("entrust_no")
-            if _eno:
-                backend.agent_entrust_nos.add(str(_eno))
-        elif method == "sell":
-            stock_no = params.get("stock_no")
-            amount = params.get("amount")
-            price = params.get("price")
-            client_order_id = params.get("client_order_id")
-            result = await backend.sell(stock_no, amount, price, client_order_id)
-            _eno = (result or {}).get("entrust_no")
-            if _eno:
-                backend.agent_entrust_nos.add(str(_eno))
-        elif method == "cancel":
-            entrust_no = params.get("entrust_no")
-            result = await backend.cancel(entrust_no)
-        else:
-            result = {"code": 1, "error": "内部错误"}
+        # 上一笔调用超时（疑似弹窗阻塞）后进入 degraded：先清残留弹窗再干活。
+        # 清扫失败不阻断本次调用。
+        if getattr(backend, "degraded", False):
+            try:
+                await asyncio.to_thread(backend.dialog_cleanup)
+            except Exception:
+                logger.exception("degraded dialog_cleanup 失败")
+            backend.degraded = False
+
+        async def _invoke() -> Any:
+            if method == "balance":
+                logger.info("[RPC] method=balance, frame_id=%s", frame_id)
+                r = await backend.balance()
+                logger.info("[RPC] balance → code=%s", r.get("code"))
+                return r
+            if method == "position":
+                return await backend.position()
+            if method == "orders_active":
+                return await backend.orders_active()
+            if method == "orders_filled":
+                return await backend.orders_filled()
+            if method == "settlement":
+                return await backend.settlement(params.get("date_range", "近一年"))
+            if method == "watchlist":
+                return await backend.watchlist()
+            if method in ("buy", "sell"):
+                stock_no = params.get("stock_no")
+                amount = params.get("amount")
+                price = params.get("price")
+                client_order_id = params.get("client_order_id")
+                fn = backend.buy if method == "buy" else backend.sell
+                r = await fn(stock_no, amount, price, client_order_id)
+                _eno = (r or {}).get("entrust_no")
+                if _eno:
+                    backend.agent_entrust_nos.add(str(_eno))
+                return r
+            if method == "cancel":
+                return await backend.cancel(params.get("entrust_no"))
+            return {"code": 1, "error": "内部错误"}
+
+        try:
+            # 受控端总超时（低于网关 30s）：无论内部卡在哪，25s 内必有明确回执。
+            # 弹窗/无响应导致的超时绝不能表现为裸报错——委托可能已提交，
+            # 必须回 unknown + 核单指引（2026-07-13「报错但静默成交」事故）。
+            result = await asyncio.wait_for(_invoke(), CALL_TIMEOUT_SECS)
+        except asyncio.TimeoutError:
+            backend.degraded = True
+            logger.error("[RPC] %s 超过 %ss 未完成，标记 degraded，回 unknown",
+                         method, CALL_TIMEOUT_SECS)
+            if method in ORDER_METHODS:
+                msg = ("受控端处理超时（疑似弹窗或客户端无响应）。委托可能已提交，"
+                       "请调 orders_filled/orders_active 核实后再决定，勿直接重复下单")
+                result = {"code": 2, "status": "unknown", "msg": msg}
+            else:
+                result = {"code": 1, "status": "failed",
+                          "msg": "受控端查询超时（疑似弹窗或客户端无响应），请稍后重试"}
 
         if not isinstance(result, dict):
             reply["ok"] = False
