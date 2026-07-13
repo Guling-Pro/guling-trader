@@ -669,7 +669,18 @@ class WinThsBackend:
         hwnd = self.get_right_hwnd()
         data = {}
         for key, cid in BALANCE_CONTROL_ID_GROUP.items():
-            ctrl = self._find_ctrl_by_id(hwnd, cid)
+            # 多账户登录时每个账户各挂一套同 ID 资金控件，只有当前账户的可见；
+            # 不按可见性过滤会读到其他账户隐藏面板的数字（2026-07-14 双账户
+            # 切换演练：Alt+2 已切到账户二，balance 仍返回账户一全套数字）。
+            # 与 _find_grid/_find_input 同款「可见优先、放宽兜底」，兜底命中时
+            # 留 warning——多账户场景下该值可能来自其他账户。
+            ctrl = self._find_ctrl_by_id(hwnd, cid, visible=True)
+            if not ctrl:
+                ctrl = self._find_ctrl_by_id(hwnd, cid)
+                if ctrl:
+                    logger.warning(
+                        "balance 字段 %s(0x%X) 无可见控件，回退未过滤匹配", key, cid
+                    )
             if ctrl > 0:
                 data[key] = get_text(ctrl)
         self.state.update("balance", data)
