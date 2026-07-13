@@ -149,6 +149,23 @@ FALLBACK_TOOLS_SCHEMA = {
         "required": ["entrust_no"],
         "additionalProperties": False
       }
+    },
+    {
+      "name": "switch_account",
+      "description": "切换同花顺客户端当前活跃的资金账户（向 xiadan 窗口发送 Alt+N，N=账户在客户端账户下拉列表中的槽位序号）。仅在 xiadan 登录了多个账户时有意义。**盲切**：本工具不核验切换是否成功，受控端对账户身份无感知；切换后所有工具(查询/下单)都作用于新的当前账户。调用方必须紧接着用 balance/position 做指纹核对、确认账户无误后再继续操作。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "slot": {
+            "type": "integer",
+            "description": "账户槽位序号（1-9），对应快捷键 Alt+N，与客户端账户下拉列表顺序一致",
+            "minimum": 1,
+            "maximum": 9
+          }
+        },
+        "required": ["slot"],
+        "additionalProperties": False
+      }
     }
   ]
 }
@@ -173,7 +190,7 @@ def load_tools_schema() -> dict[str, Any]:
         schema = json.loads(json.dumps(FALLBACK_TOOLS_SCHEMA))
 
     if not cfg.enable_ths_plugin:
-        trading_names = {"balance", "position", "orders_active", "orders_filled", "settlement", "watchlist", "buy", "sell", "cancel"}
+        trading_names = {"balance", "position", "orders_active", "orders_filled", "settlement", "watchlist", "buy", "sell", "cancel", "switch_account"}
         schema["tools"] = [t for t in schema["tools"] if t.get("name") not in trading_names]
 
     return schema
@@ -189,6 +206,7 @@ METHOD_WHITELIST = {
     "buy",
     "sell",
     "cancel",
+    "switch_account",
 }
 
 
@@ -227,6 +245,7 @@ async def handle_call(
         "buy",
         "sell",
         "cancel",
+        "switch_account",
     }
     if method in trading_methods and not cfg.enable_ths_plugin:
         reply["ok"] = False
@@ -286,6 +305,8 @@ async def handle_call(
                 return r
             if method == "cancel":
                 return await backend.cancel(params.get("entrust_no"))
+            if method == "switch_account":
+                return await backend.switch_account(params.get("slot"))
             return {"code": 1, "error": "内部错误"}
 
         try:

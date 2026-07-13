@@ -1928,3 +1928,41 @@ class WinThsBackend:
         if bound_err:
             return bound_err
         return await asyncio.to_thread(self._do_cancel, entrust_no)
+
+    async def switch_account(self, slot: Any) -> dict[str, Any]:
+        try:
+            slot = int(slot)
+        except (TypeError, ValueError):
+            return {"code": 1, "status": "failed",
+                    "msg": f"slot 参数无效：{slot!r}，须为 1-9 的整数"}
+        if not 1 <= slot <= 9:
+            return {"code": 1, "status": "failed",
+                    "msg": f"slot 超出范围：{slot}，须为 1-9 的整数"}
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
+        return await asyncio.to_thread(self.do_switch_account, slot)
+
+    def do_switch_account(self, slot: int):
+        """向 xiadan 发送 Alt+N，切换多账户登录下的当前活跃资金账户。
+
+        盲切：新版 xiadan 的账户下拉框给每个已登录账户注册了 Alt+1..Alt+9
+        加速键（与下拉列表顺序一致）。这里只负责把窗口拉到前台并发按键，
+        不核验切换结果——受控端对账户身份保持无感知，切换后由调用方用
+        balance/position 做指纹核对再继续操作。"""
+        _activate_window(self.hwnd_main)
+        hot_key(["alt", str(slot)])
+        # 切换会触发资金/持仓面板重载，稍等再放行后续操作。
+        time.sleep(sleep_time * 2)
+        return {
+            "code": 0,
+            "status": "succeed",
+            "data": {
+                "slot": slot,
+                "msg": (
+                    f"已向同花顺窗口发送 Alt+{slot}（盲切，未核验结果）。"
+                    "后续所有查询/下单都作用于切换后的当前账户，"
+                    "请先用 balance/position 核对账户身份再继续。"
+                ),
+            },
+        }
