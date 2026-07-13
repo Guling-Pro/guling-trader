@@ -53,6 +53,9 @@ class FakeBackend:
     async def cancel(self, entrust_no):
         return await self._run("cancel", entrust_no)
 
+    async def switch_account(self, slot):
+        return await self._run("switch_account", slot)
+
 
 def _call(frame, result):
     backend = FakeBackend(result)
@@ -181,9 +184,23 @@ def test_tools_list_returns_correct_schema():
     assert "buy" in tool_names
     assert "sell" in tool_names
     assert "cancel" in tool_names
-    
+    assert "switch_account" in tool_names
+
     # 确保没有多余的 code 字段嵌套在 result 中
     assert "code" not in reply["result"]
+
+
+def test_switch_account_forwards_slot_and_single_layer_reply():
+    """switch_account 路由到后端并透传 slot，回执保持单层信封。"""
+    frame = {"type": "call", "id": "sw-1", "method": "switch_account",
+             "params": {"slot": 2}}
+    reply, backend = _call(frame, {"code": 0, "status": "succeed",
+                                   "data": {"slot": 2}})
+
+    assert reply["ok"] is True
+    assert reply["id"] == "sw-1"
+    assert reply["result"]["data"]["slot"] == 2
+    assert backend.calls == [("switch_account", (2,))]
 
 
 def test_fallback_schema_matches_file_schema():
