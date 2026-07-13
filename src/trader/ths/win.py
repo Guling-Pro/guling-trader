@@ -663,28 +663,29 @@ class WinThsBackend:
         return self._bulk_cancel("last")
 
     def get_balance(self):
-        self.switch_to_normal()
-        hot_key(["F4"])
-        self.refresh()
-        hwnd = self.get_right_hwnd()
-        data = {}
-        for key, cid in BALANCE_CONTROL_ID_GROUP.items():
-            # 多账户登录时每个账户各挂一套同 ID 资金控件，只有当前账户的可见；
-            # 不按可见性过滤会读到其他账户隐藏面板的数字（2026-07-14 双账户
-            # 切换演练：Alt+2 已切到账户二，balance 仍返回账户一全套数字）。
-            # 与 _find_grid/_find_input 同款「可见优先、放宽兜底」，兜底命中时
-            # 留 warning——多账户场景下该值可能来自其他账户。
-            ctrl = self._find_ctrl_by_id(hwnd, cid, visible=True)
-            if not ctrl:
-                ctrl = self._find_ctrl_by_id(hwnd, cid)
-                if ctrl:
-                    logger.warning(
-                        "balance 字段 %s(0x%X) 无可见控件，回退未过滤匹配", key, cid
-                    )
-            if ctrl > 0:
-                data[key] = get_text(ctrl)
-        self.state.update("balance", data)
-        return {"code": 0, "status": "succeed", "data": data}
+        # 多账户登录时每个账户各挂一套同 ID 资金控件，只有当前账户的可见；
+        # 不按可见性过滤会读到其他账户隐藏面板的数字（2026-07-14 双账户
+        # 切换演练：Alt+2 已切到账户二，balance 仍返回账户一全套数字）。
+        # 只认可见控件、读不到重试后明确报错——不做未过滤兜底：兜底在面板
+        # 加载间隙同样可能抓到其他账户的隐藏副本，真钱 sizing 宁可失败不可读错。
+        for retry in range(retry_time):
+            self.switch_to_normal()
+            hot_key(["F4"])
+            self.refresh()
+            hwnd = self.get_right_hwnd()
+            data = {}
+            for key, cid in BALANCE_CONTROL_ID_GROUP.items():
+                ctrl = self._find_ctrl_by_id(hwnd, cid, visible=True)
+                if ctrl > 0:
+                    data[key] = get_text(ctrl)
+            if data:
+                self.state.update("balance", data)
+                return {"code": 0, "status": "succeed", "data": data}
+            time.sleep(sleep_time)
+        return {"code": 1, "status": "failed",
+                "msg": "未找到可见的资金面板控件（面板未加载完或客户端异常），"
+                       "已放弃读取——不回退读隐藏面板（多账户下可能是其他账户的数字），"
+                       "请稍后重试"}
 
     def get_position(self):
         for retry in range(retry_time):
