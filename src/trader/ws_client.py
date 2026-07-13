@@ -162,6 +162,8 @@ class WsClient:
         self.on_state_change = on_state_change
         self.on_rpc_log = on_rpc_log
         self.backend = backend or WinThsBackend()
+        # 在飞的 call 任务强引用（防 GC 提前回收），完成即自清。
+        self._call_tasks: set[asyncio.Task] = set()
 
     def _set_state(self, new_state: ConnectionState) -> None:
         """更新状态并触发回调"""
@@ -318,30 +320,40 @@ class WsClient:
             raise SessionRejectedException(reason)
 
         elif frame_type == "call":
-            rpc_id = frame.get("id")
-            method = frame.get("method")
-            params = frame.get("params", {})
-            logger.info("收到 RPC call：id=%s, method=%s", rpc_id, method)
-            try:
-                # dispatcher.handle_call 已返回完整 reply 帧（type/id/ok/result|error）。
-                # 直接转发，不要再包一层 {ok:true, result:...}——否则外层永远 ok:true，
-                # 真实失败被掩盖，成功结果也多嵌一层导致下游解析错位。
-                reply = await dispatcher.handle_call(frame, self.backend)
-                if self.on_rpc_log:
-                    if reply.get("ok"):
-                        self.on_rpc_log(
-                            _format_rpc_log(method, params, result=reply.get("result"))
-                        )
-                    else:
-                        self.on_rpc_log(
-                            _format_rpc_log(method, params, error=reply.get("error"))
-                        )
-            except Exception as e:
-                reply = {"type": "reply", "id": rpc_id, "ok": False, "error": str(e)}
-                if self.on_rpc_log:
-                    self.on_rpc_log(_format_rpc_log(method, params, error=str(e)))
-            if self.ws:
-                await self.ws.send(json.dumps(reply, ensure_ascii=False))
+            # 后台 task 执行：单笔 RPC 卡住/变慢时，消息循环必须继续跑——否则
+            # 连用于核单的 orders_active/orders_filled 都进不来（2026-07-13 事故：
+            # 一笔卡死瘫痪整个受控端）。执行顺序不受影响：交易/查询本就由
+            # backend.win_lock（FIFO）串行。
+            task = asyncio.create_task(self._process_call(frame))
+            self._call_tasks.add(task)
+            task.add_done_callback(self._call_tasks.discard)
+
+    async def _process_call(self, frame: dict[str, Any]) -> None:
+        """执行一个 call 帧并回发 reply（在独立 task 中运行）。"""
+        rpc_id = frame.get("id")
+        method = frame.get("method")
+        params = frame.get("params", {})
+        logger.info("收到 RPC call：id=%s, method=%s", rpc_id, method)
+        try:
+            # dispatcher.handle_call 已返回完整 reply 帧（type/id/ok/result|error）。
+            # 直接转发，不要再包一层 {ok:true, result:...}——否则外层永远 ok:true，
+            # 真实失败被掩盖，成功结果也多嵌一层导致下游解析错位。
+            reply = await dispatcher.handle_call(frame, self.backend)
+            if self.on_rpc_log:
+                if reply.get("ok"):
+                    self.on_rpc_log(
+                        _format_rpc_log(method, params, result=reply.get("result"))
+                    )
+                else:
+                    self.on_rpc_log(
+                        _format_rpc_log(method, params, error=reply.get("error"))
+                    )
+        except Exception as e:
+            reply = {"type": "reply", "id": rpc_id, "ok": False, "error": str(e)}
+            if self.on_rpc_log:
+                self.on_rpc_log(_format_rpc_log(method, params, error=str(e)))
+        if self.ws:
+            await self.ws.send(json.dumps(reply, ensure_ascii=False))
 
     async def send_frame(self, frame: dict[str, Any]) -> None:
         """发送帧"""

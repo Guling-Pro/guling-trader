@@ -163,6 +163,29 @@ xiadan 是 32 位，`TVITEMW` 的 `hItem/pszText/lParam` 是 4 字节；64 位 P
 和 `status`（`filled`/`partially_filled`）。8s 内查不到成交 → `status:"unknown"` 并提示**可能非连续
 竞价时段/涨跌停被拒/无成交**，绝不当成功。
 
+## 7.7 交易弹窗处理（DialogSentry）与 PostMessage 铁律
+
+**铁律：对 xiadan 任何可能触发弹窗的动作（按钮 `BM_CLICK`、菜单）禁止同步
+`SendMessage`，一律 `PostMessage`。** `SendMessage` 是同步跨进程调用——按钮
+handler 弹出模态框后进入模态消息循环不返回，Python 线程死锁在这一行
+（2026-07-13 市价卖出事故根因，详见
+`docs/superpowers/specs/2026-07-13-ths-dialog-handling-design.md`）。
+
+**弹窗处理（`ths/dialogs.py` DialogSentry）**：下单/撤单提交后不再盲按
+Enter，改为 `pump()`「等待-发现-处置」循环。处置**不耦合弹窗内容**（不读
+正文做语义分类），只看结构，逐级兜底：
+
+1. 含 `Edit` 输入框 → 验证码类 → `input_ocr()`（回车关不掉，需输入）；
+2. 枚举到肯定按钮（是 > 确定 > 确认 > 同意 > 唯一按钮）→ `PostMessage(BM_CLICK)`；
+   多按钮无肯定项**绝不点否/取消**；
+3. 无可用按钮（自绘弹窗）→ 向弹窗投递回车（`WM_KEYDOWN VK_RETURN`，
+   真机验证新版「提示」框有效）；两次回车不消失才 `WM_CLOSE`；
+4. **禁止 ESC**（对确认框语义是「否」）。
+
+每个被处置的弹窗：截图存证到 work_dir、标题+全文+动作记入回执 `dialogs`
+字段；全文机会性提取合同编号。安全性靠委托表/成交表回查，不靠读懂弹窗。
+弹窗结构对不上时跑 `python tools/ths_dialog_dump.py`（开着弹窗）核对。
+
 ## 8. 出新版本时怎么排查
 
 1. 切到目标皮肤、登录 xiadan。

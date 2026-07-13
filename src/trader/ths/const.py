@@ -181,3 +181,9 @@ BALANCE_CONTROL_ID_GROUP = {
     "当日盈亏": 0x402,
     "当日盈亏比": 0x405,
 }
+
+# --- 交易弹窗结构化处理（DialogSentry，见 docs/superpowers/specs/2026-07-13-ths-dialog-handling-design.md）
+# 决策只看结构：弹窗含 Edit 输入框 → 验证码（input_ocr）；否则按按钮标签的
+# 肯定优先级点击。按钮标签是有限稳定集合（控件属性），不做正文语义分类。
+DIALOG_AFFIRM_LABELS = ("是", "确定", "确认", "同意")   # 点击优先级从左到右
+DIALOG_ENTRUST_NO_RE = r"合同编号[：:]?\s*(\d+)"        # 从弹窗全文提取合同编号（机会性）

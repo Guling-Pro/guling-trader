@@ -404,6 +404,22 @@ class WinThsBackend:
         self.agent_entrust_nos: set[str] = set()
         # 内存态：查询结果的 last-known 存储（剪贴板仅作毫秒级中转）。
         self.state = ThsState()
+        # dispatcher 侧调用超时后置位；下一次调用进入前先跑 dialog_cleanup 自愈。
+        self.degraded = False
+
+    def _pump_dialogs(self):
+        """提交动作后的弹窗「发现-处置-存证」循环（见 ths/dialogs.py）。"""
+        from .dialogs import DialogSentry
+        return DialogSentry(self).pump()
+
+    def dialog_cleanup(self):
+        """degraded 自愈入口：清掉残留弹窗并留存证（dispatcher 在超时后的
+        下一次调用前执行）。返回 PumpResult，内容进日志。"""
+        from .dialogs import DialogSentry
+        result = DialogSentry(self).cleanup()
+        if result.dialogs:
+            logger.warning("dialog_cleanup 清掉残留弹窗：%s", result.dialogs)
+        return result
 
     def _ensure_bound(self) -> dict[str, Any] | None:
         """检查是否已绑定；否则 lazy bind，返回错误 dict 或 None（成功）"""
@@ -625,19 +641,14 @@ class WinThsBackend:
         # BM_CLICK fires the button's WM_COMMAND. Cross-process safe.
         win32api.PostMessage(btn, win32con.BM_CLICK, 0, 0)
         time.sleep(sleep_time)
-        # xiadan typically pops a "您确定要撤销..." confirmation. The OK button
-        # is default-focused; Enter accepts it. If there's no confirmation
-        # (e.g. when there's nothing to cancel), Enter is a harmless no-op.
-        hot_key(["enter"])
-        time.sleep(sleep_time)
-        # Handle anti-bot captcha if it appears.
-        self.input_ocr()
-        return {
+        # "您确定要撤销..." 确认框 / 验证码：结构化处置 + 存证（取代盲 Enter）。
+        pump = self._pump_dialogs()
+        return pump.attach_to({
             "code": 0,
             "status": "succeed",
             "action": action,
             "button_id": f"0x{btn_id:04X}",
-        }
+        })
 
     def cancel_all(self):
         return self._bulk_cancel("all")
@@ -1299,20 +1310,17 @@ class WinThsBackend:
         ctrl = self._find_input(hwnd, 0x40A)
         set_text(ctrl, str(amount))
         time.sleep(sleep_time)
-        # Submit form → 确认买卖 dialog → confirm. THS may then pop an anti-bot
-        # captcha that blocks the whole window; input_ocr() solves it (and is a
-        # no-op when no popup is present). Only after the captcha clears does the
-        # "已成功提交" result popup show, so handle the captcha BETWEEN the confirm
-        # Enter and the final dismiss — three blind Enters alone can't dismiss a
-        # captcha (it needs the actual code typed) and leave the order stuck.
-        hot_key(["enter"])   # submit form → 确认买卖 dialog
-        hot_key(["enter"])   # confirm → 提交委托（可能弹验证码）
-        self.input_ocr()     # 处理反机器人验证码（无弹窗立即返回）
-        hot_key(["enter"])   # dismiss 结果弹窗
+        # Submit form（Enter 提交表单本身）→ 之后可能出现的确认框/验证码/结果框
+        # 交给 DialogSentry 结构化处置（发现弹窗→点肯定按钮→存证；含 Edit 的
+        # 验证码框走 input_ocr）。取代旧的三连盲 Enter：不再依赖焦点与时序，
+        # 弹窗标题/全文/所点按钮全部带回回执，绝不静默。
+        hot_key(["enter"])   # submit form → 可能弹「委托确认」
+        pump = self._pump_dialogs()
         time.sleep(sleep_time)
-        entrust_no = self._lookup_entrust_no(stock_no, op_keyword, amount, price)
+        entrust_no = pump.entrust_no or self._lookup_entrust_no(
+            stock_no, op_keyword, amount, price)
         if entrust_no:
-            return {
+            return pump.attach_to({
                 "code": 0,
                 "status": "succeed",
                 "entrust_no": entrust_no,
@@ -1320,12 +1328,20 @@ class WinThsBackend:
                 "amount": int(amount),
                 "price": float(price) if price is not None else None,
                 "op": op_keyword,
-            }
-        return {
+            })
+        if pump.texts:
+            # 回查无此单 + 有弹窗文本 ⇒ 大概率被拒/废单，把真实原因原文带回，
+            # 而不是让调用方拿着 unknown 干瞪眼。
+            return pump.attach_to({
+                "code": 1,
+                "status": "failed",
+                "msg": "委托未进入委托列表，客户端提示：" + "；".join(pump.texts),
+            })
+        return pump.attach_to({
             "code": 2,
             "status": "unknown",
             "msg": "已提交但未能在 orders/active 表中匹配到对应订单，请自行确认状态",
-        }
+        })
 
     def _do_sell(self, stock_no, amount, price):
         # price is None ⇒ 真·市价委托(五档即成剩撤)；有值 ⇒ F2 限价挂单(原逻辑)。
@@ -1408,16 +1424,17 @@ class WinThsBackend:
             return {"code": 1, "status": "failed",
                     "msg": "委托策略未能设为五档即成剩撤，已中止（避免下错单）"}
 
-        # 提交：点提交按钮（焦点无关，避开 combo 焦点吞 Enter）→ 确认框 →（可能验证码）→ 关弹窗
+        # 提交：点提交按钮（焦点无关，避开 combo 焦点吞 Enter）。
+        # 必须 PostMessage：SendMessage 是同步跨进程调用，按钮 handler 弹出模态
+        # 「委托确认」框时不返回 → 线程死锁（2026-07-13 事故根因），后续弹窗
+        # 处理代码永远执行不到。
         submit_btn = self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID, cls="Button", visible=True) \
             or self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID)
         if submit_btn:
-            win32api.SendMessage(submit_btn, win32con.BM_CLICK, 0, 0)
+            win32api.PostMessage(submit_btn, win32con.BM_CLICK, 0, 0)
         else:
             hot_key(["enter"])
-        hot_key(["enter"])   # 确认买卖 dialog
-        self.input_ocr()     # 反机器人验证码（无弹窗立即返回）
-        hot_key(["enter"])   # 关结果弹窗
+        pump = self._pump_dialogs()   # 确认框/验证码/结果框：结构化处置 + 存证
         time.sleep(sleep_time)
 
         # 回执：轮询成交表拿本次新增成交（五档即成剩撤成交极快，给足 8s）
@@ -1428,13 +1445,19 @@ class WinThsBackend:
                 r = _match_market_fill(before, post.get("data", []),
                                        stock_no, op_keyword, amount)
                 if r["code"] == 0:
-                    return r
+                    return pump.attach_to(r)
             time.sleep(0.3)
-        logger.warning("market submit unconfirmed stock=%s op=%s amount=%s",
-                       stock_no, op_keyword, amount)
-        return {"code": 2, "status": "unknown", "stock_no": str(stock_no),
-                "op": op_keyword, "requested_amount": int(amount), "filled_amount": 0,
-                "msg": "已提交但未在成交表确认成交，可能非连续竞价时段/涨跌停被拒/无成交，请自行核对成交与委托"}
+        logger.warning("market submit unconfirmed stock=%s op=%s amount=%s dialogs=%s",
+                       stock_no, op_keyword, amount, pump.dialogs)
+        if pump.texts:
+            msg = ("已提交但未在成交表确认成交，客户端提示：" + "；".join(pump.texts)
+                   + "。请自行核对成交与委托")
+        else:
+            msg = "已提交但未在成交表确认成交，可能非连续竞价时段/涨跌停被拒/无成交，请自行核对成交与委托"
+        return pump.attach_to({
+            "code": 2, "status": "unknown", "stock_no": str(stock_no),
+            "op": op_keyword, "requested_amount": int(amount), "filled_amount": 0,
+            "msg": msg})
 
     def _do_cancel(self, entrust_no):
         try:
@@ -1490,10 +1513,10 @@ class WinThsBackend:
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         time.sleep(sleep_time)
-        hot_key(["enter"])
-        time.sleep(sleep_time)
-        hot_key(["enter"])
-        return {"code": 0, "status": "succeed"}
+        # 双击委托行后可能弹「撤单确认」——结构化处置（取代两次盲 Enter），
+        # 弹窗内容带回回执。
+        pump = self._pump_dialogs()
+        return pump.attach_to({"code": 0, "status": "succeed"})
 
     def get_result(self, cid=0x3EC):
         tid, pid = win32process.GetWindowThreadProcessId(self.hwnd_main)
@@ -1768,7 +1791,9 @@ class WinThsBackend:
             )
             time.sleep(short_sleep_time)
             if ok_btn:
-                win32api.SendMessage(ok_btn, win32con.BM_CLICK, 0, 0)
+                # PostMessage：确定按钮的 handler 若再弹模态框（如"验证码错误"），
+                # SendMessage 会同步卡死本线程（同 2026-07-13 事故根因）。
+                win32api.PostMessage(ok_btn, win32con.BM_CLICK, 0, 0)
             else:
                 hot_key(["enter"])
             time.sleep(sleep_time)

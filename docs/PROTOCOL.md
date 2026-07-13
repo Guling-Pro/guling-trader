@@ -150,6 +150,26 @@ Crucial safety safeguard for network jitter, verification popups, or delay in lo
 ```
 *Relays/gateways MUST preserve this detailed error text to prevent the AI from mistaking this as a trade failure and issuing a duplicated buy order.*
 
+Since v0.7 the trader may additionally return `"status": "busy"` with `code == 2`
+(window lock contention — the command was **not** executed; retry after
+verifying pending orders), and any reply may carry a `dialogs` array recording
+client popups the trader auto-dismissed while executing the command
+(`[{"title", "text", "action"}]`, forensic evidence — no action required).
+
+#### Gateway-side call timeout (MANDATORY semantics):
+The trader answers every order command within its internal 25 s budget —
+deliberately below a gateway's typical 30 s wait. If a gateway's own timeout
+still fires with no `reply` (trader offline, network loss), the gateway MUST
+NOT surface a bare transport error (e.g. `-32003 指令下发超时`): a missing
+reply after an order command means the order **may have been submitted**. The
+MCP tool result MUST carry unknown-semantics text equivalent to:
+
+> `status: unknown`：受控端未在时限内响应，委托**可能已提交**。请先调用
+> `orders_filled` / `orders_active` 核实，**禁止直接重复下单**。
+
+Rationale: on 2026-07-13 a bare timeout error while the order actually filled
+("报错但静默成交") nearly caused a duplicated-order incident.
+
 #### Ordinary failure response (`code == 1`):
 ```json
 {
