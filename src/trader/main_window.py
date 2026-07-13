@@ -500,7 +500,7 @@ class MainWindow:
         footer_frame.pack(fill="x", side="bottom", padx=12, pady=(4, 6))
 
         version_label = tk.Label(
-            footer_frame, text="股灵交易助手 v0.7.0", fg="#999999", bg="#f6f8fa",
+            footer_frame, text="股灵交易助手 v0.7.1", fg="#999999", bg="#f6f8fa",
             font=("Helvetica", 8)
         )
         version_label.pack(side="left")
