@@ -1527,7 +1527,15 @@ class WinThsBackend:
         # 下单前快照成交表作 before 基线（差分辨"本次新增成交" vs 历史成交；~1-2s，
         # 换回执真实性，值得——市价单可能部分成交，必须拿准实际成交量/均价）。
         pre = self.get_filled_orders()
-        before = pre.get("data", []) if pre.get("code") == 0 else []
+        if pre.get("code") != 0:
+            # 基线拿不到就**不下单**。空基线会把当日同股同向的历史成交算成本次成交
+            # （回执差分认「after 里 before 没有的行」），直接污染真钱 sizing 的输入；
+            # 而市价单发出去就没法回收。宁可不下单让调用方重试，也不带着空基线提交。
+            return {"code": 1, "status": "failed",
+                    "msg": "下单前无法读取成交表作回执基线（" + str(pre.get("msg", "")) +
+                           "），已中止未提交——空基线会把历史成交误算成本次成交。请稍后重试",
+                    "submitted": False}
+        before = pre.get("data", [])
 
         if not self._select_tree_child(MARKET_TREE_PARENT, op_keyword):
             return {"code": 1, "status": "failed", "msg": "未能导航到市价委托面板"}
