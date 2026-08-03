@@ -35,8 +35,10 @@ def test_reads_only_visible_ctrl(monkeypatch):
         return VISIBLE if visible else HIDDEN
 
     result = _stubbed_backend(monkeypatch, find_ctrl).get_balance()
-    assert result["code"] == 0
-    assert set(result["data"].values()) == {"1.23"}
+    assert result["status"] == "succeed"
+    # 契约 v2：数值一律 number（元），键名钉死
+    assert result["data"]["总资产"] == 1.23
+    assert result["data"]["可用金额"] == 1.23
 
 
 def test_fails_loudly_when_no_visible_ctrl(monkeypatch):
@@ -46,7 +48,8 @@ def test_fails_loudly_when_no_visible_ctrl(monkeypatch):
         return 0 if visible else HIDDEN
 
     result = _stubbed_backend(monkeypatch, find_ctrl).get_balance()
-    assert result["code"] == 1
-    assert "不回退" in result["msg"]
+    assert result["status"] == "failed"
+    assert result["code"] == "read_failed"
+    assert "不回退" in result["error"]["message"]
     # 隐藏副本的数字绝不能出现在任何返回里
     assert "34915.47" not in str(result)

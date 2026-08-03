@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 from ctypes import wintypes
+import functools
 import logging
 import os
 import platform
@@ -44,12 +45,6 @@ if platform.system() == "Windows":
 
 from .const import (
     BALANCE_CONTROL_ID_GROUP,
-    FILLED_COL_AMOUNT,
-    FILLED_COL_CODE,
-    FILLED_COL_DEAL_NO,
-    FILLED_COL_OP,
-    FILLED_COL_PRICE,
-    FILLED_COL_QTY,
     MARKET_AMOUNT_ID,
     MARKET_CODE_ID,
     MARKET_STRATEGY,
@@ -58,6 +53,17 @@ from .const import (
     MARKET_TREE_PARENT,
     VK_CODE,
 )
+from .table_guard import check_table
+from .rows import (
+    normalize_active_row,
+    normalize_balance,
+    normalize_filled_row,
+    normalize_position_row,
+    normalize_settlement_row,
+    is_in_flight,
+)
+from .. import contract
+from ..contract import CLS_ABORTED, CLS_NOT_BOUND, CLS_READ_FAILED, CLS_TABLE_MISMATCH
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +76,8 @@ def _match_market_fill(before, after, stock_no, op_keyword, requested_amount):
     成交 → 回执带回真实成交数量与按金额加权的成交均价。
     """
     def _key(r):
-        return r.get(FILLED_COL_DEAL_NO, "").strip() or (
-            r.get(FILLED_COL_CODE, ""), r.get(FILLED_COL_QTY, ""),
-            r.get(FILLED_COL_PRICE, ""), r.get(FILLED_COL_AMOUNT, ""))
+        return (r.get("成交编号") or "") or (
+            r.get("证券代码"), r.get("成交数量"), r.get("成交均价"), r.get("成交金额"))
 
     seen = {_key(r) for r in before}
     filled_qty = 0
@@ -80,28 +85,30 @@ def _match_market_fill(before, after, stock_no, op_keyword, requested_amount):
     for r in after:
         if _key(r) in seen:
             continue
-        if r.get(FILLED_COL_CODE, "").strip() != str(stock_no):
+        if (r.get("证券代码") or "") != str(stock_no):
             continue
-        if op_keyword not in r.get(FILLED_COL_OP, ""):
+        if op_keyword not in (r.get("方向") or ""):
             continue
-        try:
-            qty = int(float(r.get(FILLED_COL_QTY, "0") or 0))
-            amt = float(r.get(FILLED_COL_AMOUNT, "0") or 0)
-        except ValueError:
+        q, a = r.get("成交数量"), r.get("成交金额")
+        if q is None or a is None:
             continue
-        filled_qty += qty
-        filled_amt += amt
+        filled_qty += int(q)
+        filled_amt += float(a)
 
+    payload = {"stock_no": str(stock_no), "方向": op_keyword,
+               "requested_amount": int(requested_amount)}
     if filled_qty <= 0:
-        return {"code": 2, "status": "unknown", "stock_no": str(stock_no),
-                "op": op_keyword, "requested_amount": int(requested_amount),
-                "filled_amount": 0}
+        payload["filled_amount"] = 0
+        return contract.submitted_unconfirmed(
+            "已提交但成交表尚未出现本次成交（可能非连续竞价时段/涨跌停被拒/尚未成交）。"
+            "请用同一 client_order_id 重发查询或调 query_order 核实，勿改单重下",
+            data=payload)
 
-    avg = round(filled_amt / filled_qty, 3)
-    status = "filled" if filled_qty >= int(requested_amount) else "partially_filled"
-    return {"code": 0, "status": status, "stock_no": str(stock_no),
-            "op": op_keyword, "requested_amount": int(requested_amount),
-            "filled_amount": filled_qty, "avg_price": avg}
+    payload["filled_amount"] = filled_qty
+    payload["成交均价"] = round(filled_amt / filled_qty, 3)
+    payload["成交金额"] = round(filled_amt, 2)
+    payload["fill_state"] = "filled" if filled_qty >= int(requested_amount) else "partially_filled"
+    return contract.ok(payload)
 
 # PyInstaller bundled Tesseract 路径绑定（仅 onefile 模式激活）
 if hasattr(sys, "_MEIPASS"):
@@ -270,6 +277,17 @@ def get_text(hwnd):
 _PHANTOM_VALUES = frozenset({"", "0", "0.0", "0.00", "0.000", "-", "--"})
 
 
+def table_columns(text):
+    """取 THS 剪贴板表格的表头列名（与 parse_table 同一套切分约定）。
+
+    单独一个函数是因为**空表也要能校验归属**：今天无挂单/无成交时 parse_table
+    返回 []，表头却仍在——归属校验只能看表头，不能看行。
+    """
+    if not text:
+        return []
+    return [c for c in text.split("\t\r\n")[0].split("\t") if c.strip()]
+
+
 def parse_table(text):
     """Parse THS clipboard table. Drops two kinds of noise rows:
     - completely blank lines (trailing \\t\\r\\n separator artefact)
@@ -395,6 +413,23 @@ class ThsState:
             return out
 
 
+class StaleCallAborted(RuntimeError):
+    """本线程所属的调用已被作废（dispatcher 超时后放锁），必须立刻停手。"""
+
+
+def guarded(fn):
+    """工作线程入口装饰器：登记调用代次，本笔被作废时在检查点中止。
+
+    装在同步实现上（而非 to_thread 调用点）——RPC 异步壳的形状保持不变，
+    代次跟着方法走，内部相互调用（下单→查成交表）自动继承同一代次。
+    """
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        return self._run_guarded(fn.__get__(self, type(self)), *args, **kwargs)
+
+    return wrapper
+
+
 class WinThsBackend:
     def __init__(self):
         self.hwnd_main = None
@@ -406,15 +441,72 @@ class WinThsBackend:
         self.state = ThsState()
         # dispatcher 侧调用超时后置位；下一次调用进入前先跑 dialog_cleanup 自愈。
         self.degraded = False
+        # 调用代次：dispatcher 超时后 +1，作废所有在飞的工作线程（见 _abort_if_stale）。
+        self._gen = 0
+        self._gen_lock = threading.Lock()
+        self._tls = threading.local()
+        # 下单台账（幂等 + client_order_id 回显）；懒加载，见 ledger 属性。
+        self._ledger = None
+
+    # --- 调用代次：治「超时线程脱缰」---------------------------------------
+    # dispatcher 的 25s 总超时用 asyncio.wait_for 包 asyncio.to_thread，超时只取消
+    # 等待协程——**线程取消不掉**，它还在发全局按键；而 finally 已经放了 win_lock，
+    # 下一笔立刻进场 → 两个线程同击一个 xiadan 窗口（页面被别人切走 = 抓错表；
+    # 弹窗被两边抢 = 验证码/确认框错点）。
+    # 代次机制让脱缰线程在下一个检查点自己退出：工作线程进场时记下当时的代次，
+    # 超时时 dispatcher 把代次 +1，线程在每个 UI 动作前对一次，不一致就抛
+    # StaleCallAborted 退出。检查点覆盖翻页(switch_to_normal/refresh)、抓表
+    # (read_table_text)、弹窗(input_ocr / dialogs.pump / dialog_cleanup)与下单提交。
+
+    def invalidate_inflight(self, reason: str = "") -> int:
+        """作废当前在飞的工作线程（dispatcher 超时时调用）。返回新代次。"""
+        with self._gen_lock:
+            self._gen += 1
+            gen = self._gen
+        logger.warning("调用代次 → %s，在飞线程已作废：%s", gen, reason or "(未注明)")
+        return gen
+
+    def _run_guarded(self, fn, *args, **kwargs):
+        """在工作线程里带代次运行 fn；被作废则中止并返回 failed（结果已无人接收）。
+
+        可重入：内层已登记代次时直接执行（如 _submit_market_trade 内部调
+        get_filled_orders），中止异常一路抛到最外层那次统一收口。
+        """
+        if getattr(self._tls, "gen", None) is not None:
+            return fn(*args, **kwargs)
+        with self._gen_lock:
+            self._tls.gen = self._gen
+        try:
+            return fn(*args, **kwargs)
+        except StaleCallAborted as e:
+            logger.warning("脱缰线程已在 %s 处停手（%s）", getattr(e, "where", "?"), e)
+            return contract.fail(contract.CODE_ABORTED, CLS_ABORTED, f"调用已作废：{e}")
+        finally:
+            self._tls.gen = None
+
+    def _abort_if_stale(self, where: str) -> None:
+        """代次检查点。非受管线程（UI/测试直调）不拦。"""
+        mine = getattr(self._tls, "gen", None)
+        if mine is None:
+            return
+        with self._gen_lock:
+            current = self._gen
+        if mine != current:
+            err = StaleCallAborted(
+                f"代次 {mine} 已被 {current} 取代，在 {where} 处放弃，避免与新调用同击一窗")
+            err.where = where
+            raise err
 
     def _pump_dialogs(self):
         """提交动作后的弹窗「发现-处置-存证」循环（见 ths/dialogs.py）。"""
+        self._abort_if_stale("pump_dialogs")
         from .dialogs import DialogSentry
         return DialogSentry(self).pump()
 
     def dialog_cleanup(self):
         """degraded 自愈入口：清掉残留弹窗并留存证（dispatcher 在超时后的
         下一次调用前执行）。返回 PumpResult，内容进日志。"""
+        self._abort_if_stale("dialog_cleanup")
         from .dialogs import DialogSentry
         result = DialogSentry(self).cleanup()
         if result.dialogs:
@@ -449,7 +541,8 @@ class WinThsBackend:
 
         # bind 失败
         logger.error("✗ 未检测到 xiadan 窗口（window_title 为空或窗口未运行）")
-        return {"code": 1, "error": "未检测到 xiadan 窗口（请确保同花顺已打开并登录）"}
+        return contract.fail(contract.CODE_NOT_BOUND, CLS_NOT_BOUND,
+                             "未检测到 xiadan 窗口（请确保同花顺已打开并登录）")
 
     def bind_client(self):
         # Try exact match first for backward compat, then prefix match.
@@ -662,6 +755,7 @@ class WinThsBackend:
     def cancel_last(self):
         return self._bulk_cancel("last")
 
+    @guarded
     def get_balance(self):
         # 多账户登录时每个账户各挂一套同 ID 资金控件，只有当前账户的可见；
         # 不按可见性过滤会读到其他账户隐藏面板的数字（2026-07-14 双账户
@@ -679,29 +773,88 @@ class WinThsBackend:
                 if ctrl > 0:
                     data[key] = get_text(ctrl)
             if data:
-                self.state.update("balance", data)
-                return {"code": 0, "status": "succeed", "data": data}
+                normalized = normalize_balance(data)
+                self.state.update("balance", normalized)
+                return contract.ok(normalized)
             time.sleep(sleep_time)
-        return {"code": 1, "status": "failed",
-                "msg": "未找到可见的资金面板控件（面板未加载完或客户端异常），"
-                       "已放弃读取——不回退读隐藏面板（多账户下可能是其他账户的数字），"
-                       "请稍后重试"}
+        return contract.fail(
+            contract.CODE_READ_FAILED, CLS_READ_FAILED,
+            "未找到可见的资金面板控件（面板未加载完或客户端异常），"
+            "已放弃读取——不回退读隐藏面板（多账户下可能是其他账户的数字），请稍后重试")
 
+    # 抓表重试上限：翻页键没落到 xiadan 时抓到的是上一张表，重抓一次通常就对了；
+    # 三次仍不对说明面板真的没切过去，明确失败 —— 绝不 succeed 携错表出门。
+    _GRID_ATTEMPTS = 3
+
+    @property
+    def ledger(self):
+        """下单台账（懒加载）。拿不到就返回 None——回显是增强字段，不阻断查询。"""
+        if self._ledger is None:
+            try:
+                from ..config import app_data_dir
+                from ..order_ledger import OrderLedger
+                self._ledger = OrderLedger(app_data_dir() / "orders.db")
+            except Exception:
+                logger.warning("下单台账不可用，client_order_id 本次不回显", exc_info=True)
+                return None
+        return self._ledger
+
+    def _coid_map(self) -> dict:
+        led = self.ledger
+        if led is None:
+            return {}
+        try:
+            return led.coid_by_entrust()
+        except Exception:
+            logger.warning("台账 join 失败，本次不回显 client_order_id", exc_info=True)
+            return {}
+
+    def _grab_grid(self, kind: str, goto, label: str, normalize=None):
+        """翻页→抓表→**校验表头归属**→解析。错表即重抓，仍不对则显式 failed。
+
+        2026-08-03 串线事故的正面修复：翻页快捷键是全局按键，没落到 xiadan 时
+        grid 里还是上一次查询的表，Ctrl+C 原样抓走，过去非空即 code=0 出门。
+        """
+        got_columns: list[str] = []
+        reason = ""
+        for attempt in range(1, self._GRID_ATTEMPTS + 1):
+            goto()
+            hwnd = self.get_right_hwnd()
+            ctrl = self._find_grid(hwnd)
+            data = self.read_table_text(ctrl) if ctrl else None
+            if data:
+                # 表头取自原始文本而非解析结果：空表（今天无挂单/无成交）是合法
+                # 结果，它照样有表头，必须能通过校验并以 data=[] 正常返回。
+                got_columns = table_columns(data)
+                reason = check_table(kind, got_columns) or ""
+                parsed = parse_table(data)
+                if not reason:
+                    rows = normalize(parsed) if normalize else parsed
+                    self.state.update(kind, rows)
+                    return contract.ok(rows)
+                logger.warning("%s 抓到错表（第 %d/%d 次）：%s cols=%r",
+                               label, attempt, self._GRID_ATTEMPTS, reason, got_columns)
+            time.sleep(sleep_time)
+        if reason:
+            return contract.fail(
+                contract.CODE_TABLE_MISMATCH, CLS_TABLE_MISMATCH,
+                f"{label}：抓到的不是本次请求的表（{reason}），"
+                f"重抓 {self._GRID_ATTEMPTS} 次仍不符，已拒绝返回错表，请稍后重试",
+                data={"got_columns": got_columns})
+        return contract.fail(contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                             f"{label}：读取数据失败（可能验证码弹窗或刷新超时），请稍后重试")
+
+    @guarded
     def get_position(self):
-        for retry in range(retry_time):
+        def goto():
             self.switch_to_normal()
             hot_key(["F1"])
             hot_key(["F6"])
             self.refresh()
-            hwnd = self.get_right_hwnd()
-            ctrl = self._find_grid(hwnd)
-            data = self.read_table_text(ctrl)
-            if data:
-                parsed = parse_table(data)
-                self.state.update("position", parsed)
-                return {"code": 0, "status": "succeed", "data": parsed}
-            time.sleep(sleep_time)
-        return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
+
+        return self._grab_grid(
+            "position", goto, "持仓查询",
+            normalize=lambda rows: [normalize_position_row(r) for r in rows])
 
     def get_gupiao(self):
         for retry in range(retry_time):
@@ -718,37 +871,61 @@ class WinThsBackend:
             time.sleep(sleep_time)
         return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
+    @guarded
     def get_active_orders(self):
-        for retry in range(retry_time):
+        # 最险的一条：错表被消费侧读成「无挂单」→ 孤儿单存活、止损哨兵被架空。
+        def goto():
             self.switch_to_normal()
             _activate_window(self.hwnd_main)
             hot_key(["F1"])
             hot_key(["F8"])
             self.refresh()
-            hwnd = self.get_right_hwnd()
-            ctrl = self._find_grid(hwnd)
-            data = self.read_table_text(ctrl)
-            if data:
-                parsed = parse_table(data)
-                self.state.update("active_orders", parsed)
-                return {"code": 0, "status": "succeed", "data": parsed}
-            time.sleep(sleep_time)
-        return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
+        # C3：只返回在飞单。终态（已成/已撤/废单/全部成交）不出现在本表；
+        # **状态识别不出来的一律按在飞返回**——宁可多给一行让消费侧看见，也不能
+        # 把一张活着的挂单藏起来（孤儿单架空止损哨兵是最险的失效模式）。
+        return self._grab_active(goto, include_terminal=False)
+
+    def get_active_orders_all(self):
+        """委托表全量（含终态），**内部用**：order_watch 靠终态行 diff 出
+        filled/canceled 事件，用过滤后的表会把这些事件全丢掉。
+        对外 RPC 的 orders_active 只给在飞单（C3）。"""
+        def goto():
+            self.switch_to_normal()
+            _activate_window(self.hwnd_main)
+            hot_key(["F1"])
+            hot_key(["F8"])
+            self.refresh()
+
+        return self._grab_active(goto, include_terminal=True)
+
+    def _grab_active(self, goto, include_terminal: bool):
+        coid_map = self._coid_map()
+
+        def normalize(rows):
+            out = []
+            for raw in rows:
+                row = normalize_active_row(raw, coid_map)
+                if include_terminal or is_in_flight(
+                        row["状态"], row["委托数量"], row["已成数量"]):
+                    out.append(row)
+            return out
+
+        return self._grab_grid("active_orders", goto, "委托查询", normalize=normalize)
+
+    @guarded
     def get_filled_orders(self):
-        self.switch_to_normal()
-        _activate_window(self.hwnd_main)
-        hot_key(["F2"])
-        hot_key(["F7"])
-        self.refresh()
-        hwnd = self.get_right_hwnd()
-        ctrl = self._find_grid(hwnd)
-        data = self.read_table_text(ctrl)
-        if data:
-            parsed = parse_table(data)
-            self.state.update("filled_orders", parsed)
-            return {"code": 0, "status": "succeed", "data": parsed}
-        return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
+        def goto():
+            self.switch_to_normal()
+            _activate_window(self.hwnd_main)
+            hot_key(["F2"])
+            hot_key(["F7"])
+            self.refresh()
+
+        coid_map = self._coid_map()
+        return self._grab_grid(
+            "filled_orders", goto, "成交查询",
+            normalize=lambda rows: [normalize_filled_row(r, coid_map) for r in rows])
 
     # --- 自选股（新版专有）------------------------------------------------
     # 新版 xiadan 的自选股是内嵌 CEF(Chromium) 渲染的网页，没有原生表格控件、无 CDP
@@ -808,13 +985,14 @@ class WinThsBackend:
                 out.append(t)
         return out
 
+    @guarded
     def get_watchlist(self):
         """读自选股代码（截图+OCR 代码列）。仅第一屏(顶部)——新增出现在顶部，足够检测
         新增；全量需滚屏(CEF 暂不支持)。旧版无此菜单会返回错误。"""
         self.switch_to_normal()
         if not self._select_tree_node_by_text("自选股"):
-            return {"code": 1, "status": "failed",
-                    "msg": "未找到自选股菜单（旧版 xiadan 无此菜单，请用新版）"}
+            return contract.fail(contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                                 "未找到自选股菜单（旧版 xiadan 无此菜单，请用新版）")
         time.sleep(1.0)  # 等内嵌 CEF 渲染出自选股（0.2s 太短）
         try:
             # 截整个窗口：PrintWindow(PW_RENDERFULLCONTENT) 会把内嵌 CEF 的自选股一并截到；
@@ -824,12 +1002,14 @@ class WinThsBackend:
             codes = self._ocr_leftmost_codes(img)
         except Exception as e:
             logger.exception("get_watchlist OCR failed")
-            return {"code": 1, "status": "failed", "msg": f"自选股截图/OCR 失败: {e}"}
+            return contract.fail(contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                                 f"自选股截图/OCR 失败: {e}")
         if not codes:
-            return {"code": 1, "status": "failed", "msg": "OCR 未识别到自选股代码（面板可能未切到自选 tab）"}
+            return contract.fail(contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                                 "OCR 未识别到自选股代码（面板可能未切到自选 tab）")
         self.state.update("watchlist", codes)
-        return {"code": 0, "status": "succeed", "count": len(codes),
-                "partial": True, "data": codes}  # partial: 仅顶部第一屏
+        # partial=True：仅顶部第一屏（CEF 不支持滚屏），契约里写明非全量。
+        return contract.ok({"count": len(codes), "partial": True, "codes": codes})
 
     # --- 交割单（低频，一次性拉一年做分析）----------------------------------
     def _select_tree_node_by_text(self, target: str, fallback_token: str = "") -> bool:
@@ -1189,6 +1369,7 @@ class WinThsBackend:
         else:
             logger.warning("settlement: 按标签导航「交割单」失败（树文字读取或节点缺失）")
 
+    @guarded
     def _do_settlement(self, date_range: str = "近一年"):
         """读取交割单（默认近一年）。低频功能，一次性尽量多拿。"""
         try:
@@ -1221,29 +1402,31 @@ class WinThsBackend:
                             break
                 time.sleep(refresh_sleep_time)
             if not rows:
-                return {"code": 1, "status": "failed",
-                        "msg": "交割单读取为空（大查询可能仍在超时，请稍后重试或改用更小时段）"}
+                return contract.fail(
+                    contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                    "交割单读取为空（大查询可能仍在超时，请稍后重试或改用更小时段）")
 
             # 列名校验：确认确实是交割单面板，避免把资金股票/持仓数据误当交割单返回。
             cols = set(rows[0].keys()) if rows else set()
             is_settlement = any(m in c for m in self._SETTLEMENT_MARKER_COLS for c in cols)
             if rows and not is_settlement:
                 logger.warning("settlement: 面板列名不像交割单，cols=%r", list(cols))
-                return {"code": 1, "status": "failed",
-                        "msg": "未能切到交割单面板（读到的是其它面板），请重试或人工确认",
-                        "got_columns": list(cols)}
-            self.state.update("settlement", rows)
-            return {
-                "code": 0,
-                "status": "succeed",
+                return contract.fail(
+                    contract.CODE_TABLE_MISMATCH, CLS_TABLE_MISMATCH,
+                    "未能切到交割单面板（读到的是其它面板），请重试或人工确认",
+                    data={"got_columns": list(cols)})
+            normalized = [normalize_settlement_row(r) for r in rows]
+            self.state.update("settlement", normalized)
+            return contract.ok({
                 "date_range": date_range,
                 "range_applied": ranged,   # False = 用了面板默认时段，需人工确认范围
-                "count": len(rows),
-                "data": rows,
-            }
+                "count": len(normalized),
+                "rows": normalized,
+            })
         except Exception as e:
             logger.exception("settlement failed")
-            return {"code": 1, "status": "failed", "msg": f"交割单读取异常: {e}"}
+            return contract.fail(contract.CODE_INTERNAL_ERROR,
+                                 contract.CLS_INTERNAL_ERROR, f"交割单读取异常: {e}")
 
     def _lookup_entrust_no(self, stock_no, op_keyword, amount, price, timeout=8.0):
         """After buy/sell submission, find the freshly-placed order in
@@ -1263,29 +1446,27 @@ class WinThsBackend:
         last_seen_rows = 0
         while time.time() < deadline:
             result = self.get_active_orders()
-            if result.get("code") == 0:
-                rows = result.get("data", [])
+            if contract.is_succeed(result):
+                # 契约 v2：行已规范化（数值为 number、方向/状态为枚举、id 键为 entrust_no）。
+                rows = result.get("data") or []
                 last_seen_rows = len(rows)
                 candidates = []
                 for r in rows:
-                    if r.get("证券代码", "").strip() != str(stock_no):
+                    if (r.get("证券代码") or "") != str(stock_no):
                         continue
-                    if op_keyword not in r.get("操作", ""):
+                    if op_keyword not in (r.get("方向") or ""):
                         continue
-                    if r.get("委托数量", "").strip() != target_amount:
+                    if r.get("委托数量") != int(target_amount):
                         continue
-                    if target_price is not None and r.get("委托价格", "").strip() != target_price:
-                        continue
-                    # Skip already-cancelled phantom rows.
-                    if "已撤" in r.get("备注", ""):
+                    if target_price is not None and r.get("委托价") != float(target_price):
                         continue
                     candidates.append(r)
                 if candidates:
                     candidates.sort(
-                        key=lambda r: int(r.get("合同编号", "0") or 0),
+                        key=lambda r: int(r.get("entrust_no") or 0),
                         reverse=True,
                     )
-                    eno = candidates[0].get("合同编号", "").strip()
+                    eno = (candidates[0].get("entrust_no") or "").strip()
                     if eno:
                         logger.info(
                             "lookup_entrust_no matched stock=%s op=%s qty=%s price=%s -> %s",
@@ -1326,41 +1507,43 @@ class WinThsBackend:
         # 交给 DialogSentry 结构化处置（发现弹窗→点肯定按钮→存证；含 Edit 的
         # 验证码框走 input_ocr）。取代旧的三连盲 Enter：不再依赖焦点与时序，
         # 弹窗标题/全文/所点按钮全部带回回执，绝不静默。
+        # 提交前最后一次对代次：填单到这里已过去约 1s，若本笔已被超时作废，
+        # 绝不能在下一笔正在操作同一窗口时又敲一次提交。
+        self._abort_if_stale("submit_trade")
         hot_key(["enter"])   # submit form → 可能弹「委托确认」
         pump = self._pump_dialogs()
         time.sleep(sleep_time)
         entrust_no = pump.entrust_no or self._lookup_entrust_no(
             stock_no, op_keyword, amount, price)
         if entrust_no:
-            return pump.attach_to({
-                "code": 0,
-                "status": "succeed",
+            return contract.ok(pump.attach_to({
                 "entrust_no": entrust_no,
                 "stock_no": str(stock_no),
-                "amount": int(amount),
-                "price": float(price) if price is not None else None,
-                "op": op_keyword,
-            })
+                "方向": op_keyword,
+                "委托数量": int(amount),
+                "委托价": float(price) if price is not None else None,
+                "submitted": True,
+            }))
         if pump.texts:
-            # 回查无此单 + 有弹窗文本 ⇒ 大概率被拒/废单，把真实原因原文带回，
-            # 而不是让调用方拿着 unknown 干瞪眼。
-            return pump.attach_to({
-                "code": 1,
-                "status": "failed",
-                "msg": "委托未进入委托列表，客户端提示：" + "；".join(pump.texts),
-            })
-        return pump.attach_to({
-            "code": 2,
-            "status": "unknown",
-            "msg": "已提交但未能在 orders/active 表中匹配到对应订单，请自行确认状态",
-        })
+            # 回查无此单 + 有弹窗文本 ⇒ 大概率被拒/废单：原文原样带回 broker_msg，
+            # class 由关键词表尽力映射（认不出即 unknown = 不可自动重试）。
+            return contract.broker_rejected(
+                "；".join(pump.texts),
+                message="委托未进入委托列表，客户端有提示",
+                data=pump.attach_to({"stock_no": str(stock_no), "submitted": True}))
+        return contract.submitted_unconfirmed(
+            "已提交但未能在委托表中匹配到对应订单，真相不可知。"
+            "安全动作=用同一 client_order_id 原样重发（幂等），或调 query_order 核实",
+            data=pump.attach_to({"stock_no": str(stock_no), "submitted": True}))
 
+    @guarded
     def _do_sell(self, stock_no, amount, price):
         # price is None ⇒ 真·市价委托(五档即成剩撤)；有值 ⇒ F2 限价挂单(原逻辑)。
         if price is None:
             return self._submit_market_trade("卖出", stock_no, amount)
         return self._submit_trade("F2", "卖出", stock_no, amount, price)
 
+    @guarded
     def _do_buy(self, stock_no, amount, price):
         if price is None:
             return self._submit_market_trade("买入", stock_no, amount)
@@ -1406,17 +1589,29 @@ class WinThsBackend:
         拒（回执查不到成交时返回 unknown 并提示可能非交易时段，不当成功）。"""
         strat = MARKET_STRATEGY.get(op_keyword)
         if not strat:
-            return {"code": 1, "status": "failed", "msg": f"未知方向 {op_keyword!r}"}
+            return contract.fail(contract.CODE_INVALID_PARAMS, contract.CLS_INVALID_PARAMS,
+                                 f"未知方向 {op_keyword!r}")
 
         self.switch_to_normal()
         _activate_window(self.hwnd_main)
         # 下单前快照成交表作 before 基线（差分辨"本次新增成交" vs 历史成交；~1-2s，
         # 换回执真实性，值得——市价单可能部分成交，必须拿准实际成交量/均价）。
         pre = self.get_filled_orders()
-        before = pre.get("data", []) if pre.get("code") == 0 else []
+        if pre.get("code") != 0:
+            # 基线拿不到就**不下单**。空基线会把当日同股同向的历史成交算成本次成交
+            # （回执差分认「after 里 before 没有的行」），直接污染真钱 sizing 的输入；
+            # 而市价单发出去就没法回收。宁可不下单让调用方重试，也不带着空基线提交。
+            reason = ((pre.get("error") or {}).get("message")) or ""
+            return contract.fail(
+                contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                f"下单前无法读取成交表作回执基线（{reason}），已中止未提交——"
+                "空基线会把历史成交误算成本次成交。请稍后重试",
+                data={"submitted": False})
+        before = pre.get("data") or []
 
         if not self._select_tree_child(MARKET_TREE_PARENT, op_keyword):
-            return {"code": 1, "status": "failed", "msg": "未能导航到市价委托面板"}
+            return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                                 "未能导航到市价委托面板", data={"submitted": False})
         time.sleep(sleep_time)
         hwnd = self.get_right_hwnd()
 
@@ -1430,16 +1625,19 @@ class WinThsBackend:
         combo = self._find_ctrl_by_id(hwnd, MARKET_STRATEGY_COMBO_ID, cls="ComboBox", visible=True) \
             or self._find_ctrl_by_id(hwnd, MARKET_STRATEGY_COMBO_ID)
         if not combo:
-            return {"code": 1, "status": "failed", "msg": "未找到委托策略下拉框"}
+            return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                                 "未找到委托策略下拉框", data={"submitted": False})
         if not self._set_market_strategy(combo, strat["key"], strat["index"]):
             logger.warning("market strategy not set to 五档即成剩撤 op=%s, abort", op_keyword)
-            return {"code": 1, "status": "failed",
-                    "msg": "委托策略未能设为五档即成剩撤，已中止（避免下错单）"}
+            return contract.fail(contract.CODE_INVALID_PARAMS, contract.CLS_INVALID_PARAMS,
+                                 "委托策略未能设为五档即成剩撤，已中止（避免下错单）",
+                                 data={"submitted": False})
 
         # 提交：点提交按钮（焦点无关，避开 combo 焦点吞 Enter）。
         # 必须 PostMessage：SendMessage 是同步跨进程调用，按钮 handler 弹出模态
         # 「委托确认」框时不返回 → 线程死锁（2026-07-13 事故根因），后续弹窗
         # 处理代码永远执行不到。
+        self._abort_if_stale("submit_market_trade")
         submit_btn = self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID, cls="Button", visible=True) \
             or self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID)
         if submit_btn:
@@ -1453,30 +1651,37 @@ class WinThsBackend:
         deadline = time.time() + 8.0
         while time.time() < deadline:
             post = self.get_filled_orders()
-            if post.get("code") == 0:
-                r = _match_market_fill(before, post.get("data", []),
+            if contract.is_succeed(post):
+                r = _match_market_fill(before, post.get("data") or [],
                                        stock_no, op_keyword, amount)
-                if r["code"] == 0:
-                    return pump.attach_to(r)
+                if contract.is_succeed(r):
+                    r["data"] = pump.attach_to(r["data"])
+                    return r
             time.sleep(0.3)
         logger.warning("market submit unconfirmed stock=%s op=%s amount=%s dialogs=%s",
                        stock_no, op_keyword, amount, pump.dialogs)
+        data = pump.attach_to({"stock_no": str(stock_no), "方向": op_keyword,
+                               "requested_amount": int(amount), "filled_amount": 0,
+                               "submitted": True})
         if pump.texts:
-            msg = ("已提交但未在成交表确认成交，客户端提示：" + "；".join(pump.texts)
-                   + "。请自行核对成交与委托")
-        else:
-            msg = "已提交但未在成交表确认成交，可能非连续竞价时段/涨跌停被拒/无成交，请自行核对成交与委托"
-        return pump.attach_to({
-            "code": 2, "status": "unknown", "stock_no": str(stock_no),
-            "op": op_keyword, "requested_amount": int(amount), "filled_amount": 0,
-            "msg": msg})
+            # 有柜台原文 ⇒ 大概率是明确拒绝，走 broker_rejected 让 class 可分流。
+            return contract.broker_rejected(
+                "；".join(pump.texts),
+                message="已提交但未在成交表确认成交，客户端有提示，请核对成交与委托",
+                data=data)
+        return contract.submitted_unconfirmed(
+            "已提交但未在成交表确认成交（可能非连续竞价时段/涨跌停被拒/无成交）。"
+            "安全动作=用同一 client_order_id 原样重发（幂等），或调 query_order 核实",
+            data=data)
 
+    @guarded
     def _do_cancel(self, entrust_no):
         try:
             return self._cancel_inner(entrust_no)
         except Exception as e:
             logger.exception("cancel(%s) unhandled exception", entrust_no)
-            return {"code": 1, "status": "failed", "msg": f"cancel error: {e}"}
+            return contract.fail(contract.CODE_INTERNAL_ERROR, contract.CLS_INTERNAL_ERROR,
+                                 f"cancel error: {e}")
 
     def _cancel_inner(self, entrust_no):
         self.switch_to_normal()
@@ -1484,16 +1689,20 @@ class WinThsBackend:
         self.refresh()
         hwnd = self.get_right_hwnd()
         if not hwnd:
-            return {"code": 1, "status": "failed", "msg": "right pane not found"}
+            return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                                 "撤单：未找到右侧面板")
         ctrl = self._find_grid(hwnd)
         if not ctrl:
-            return {"code": 1, "status": "failed", "msg": "table control 0x417 not found in F3 panel"}
+            return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                                 "撤单：F3 面板未找到委托表控件")
         data = self.read_table_text(ctrl)
         if not data:
-            return {"code": 1, "status": "failed", "msg": "clipboard empty after copy"}
+            return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                                 "撤单：拷贝委托表未落定（可能验证码弹窗）")
         entrusts = parse_table(data)
         if not entrusts:
-            return {"code": 1, "status": "failed", "msg": "F3 table parsed empty"}
+            return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                                 "撤单：F3 委托表解析为空")
         # F3 may show 委托编号 or 合同编号 depending on THS version/panel state.
         # _lookup_entrust_no returns 合同编号 from F1+F8; cancel must match either.
         id_col = None
@@ -1503,18 +1712,21 @@ class WinThsBackend:
                 break
         if not id_col:
             cols = list(entrusts[0].keys())
-            return {
-                "code": 1,
-                "status": "failed",
-                "msg": f"F3 table has neither 委托编号 nor 合同编号, columns: {cols}",
-            }
+            return contract.fail(
+                contract.CODE_TABLE_MISMATCH, contract.CLS_TABLE_MISMATCH,
+                f"撤单：F3 表既无委托编号也无合同编号，实得列 {cols}",
+                data={"got_columns": cols})
         find = None
         for i, entrust in enumerate(entrusts):
             if str(entrust[id_col]) == str(entrust_no):
                 find = i
                 break
         if find is None:
-            return {"code": 1, "status": "failed", "msg": f"没找到指定订单 {entrust_no}"}
+            return contract.fail(contract.CODE_NOT_FOUND, contract.CLS_NOT_FOUND,
+                                 f"撤单：委托表中没找到指定订单 {entrust_no}（可能已成/已撤）")
+        # 撤单是按行号算坐标的盲点击：本笔若已被作废，页面早被下一笔切走，
+        # 这两下点击会落到未知控件上 —— 提交类动作前必须对代次。
+        self._abort_if_stale("cancel_click")
         left, top, right, bottom = win32gui.GetWindowRect(ctrl)
         x = 50 + left
         y = 30 + 16 * find + top
@@ -1528,7 +1740,7 @@ class WinThsBackend:
         # 双击委托行后可能弹「撤单确认」——结构化处置（取代两次盲 Enter），
         # 弹窗内容带回回执。
         pump = self._pump_dialogs()
-        return pump.attach_to({"code": 0, "status": "succeed"})
+        return contract.ok(pump.attach_to({"entrust_no": str(entrust_no), "submitted": True}))
 
     def get_result(self, cid=0x3EC):
         tid, pid = win32process.GetWindowThreadProcessId(self.hwnd_main)
@@ -1570,6 +1782,7 @@ class WinThsBackend:
                 return {"code": 1, "status": "failed", "msg": text}
 
     def refresh(self):
+        self._abort_if_stale("refresh")
         hot_key(["F5"])
         time.sleep(refresh_sleep_time)
 
@@ -1579,6 +1792,9 @@ class WinThsBackend:
             time.sleep(sleep_time)
 
     def switch_to_normal(self):
+        # 翻页/抓表链路的第一个动作 —— 代次检查放这里，脱缰线程在发出任何
+        # 全局按键之前就退出。
+        self._abort_if_stale("switch_to_normal")
         tabs = self.get_left_bottom_tabs()
         left, top, right, bottom = win32gui.GetWindowRect(tabs)
         x = left + 10
@@ -1618,6 +1834,7 @@ class WinThsBackend:
         仍未变化 = 拷贝没落定（窗口没焦点 / 被验证码挡），返回 None 让调用方重试——
         **绝不返回上一次遗留的陈旧表格**。读完立刻清空，剪贴板不留数据。
         """
+        self._abort_if_stale("read_table_text")
         user32 = ctypes.windll.user32
         self._empty_clipboard()
         seq0 = user32.GetClipboardSequenceNumber()  # 清空后取基线，之后变化=本次拷贝
@@ -1702,6 +1919,9 @@ class WinThsBackend:
         )
         ocr_config = f"--psm 7 -c tessedit_char_whitelist={whitelist}"
         for attempt in range(1, max_retries + 1):
+            # 每轮都对代次：验证码流程最长可跑十几秒，脱缰线程绝不能在这里
+            # 继续点弹窗——那正是下一笔调用要处置的同一个框。
+            self._abort_if_stale(f"input_ocr#{attempt}")
             captcha_static = self.get_ocr_hwnd()
             if not captcha_static:
                 return
@@ -1889,6 +2109,13 @@ class WinThsBackend:
             return bound_err
         return await asyncio.to_thread(self.get_active_orders)
 
+    async def orders_active_all(self) -> dict[str, Any]:
+        """内部用（order_watch）：含终态的委托全量表。"""
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
+        return await asyncio.to_thread(self.get_active_orders_all)
+
     async def orders_filled(self) -> dict[str, Any]:
         bound_err = self._ensure_bound()
         if bound_err:
@@ -1945,16 +2172,17 @@ class WinThsBackend:
         try:
             slot = int(slot)
         except (TypeError, ValueError):
-            return {"code": 1, "status": "failed",
-                    "msg": f"slot 参数无效：{slot!r}，须为 1-9 的整数"}
+            return contract.fail(contract.CODE_INVALID_PARAMS, contract.CLS_INVALID_PARAMS,
+                                 f"slot 参数无效：{slot!r}，须为 1-9 的整数")
         if not 1 <= slot <= 9:
-            return {"code": 1, "status": "failed",
-                    "msg": f"slot 超出范围：{slot}，须为 1-9 的整数"}
+            return contract.fail(contract.CODE_INVALID_PARAMS, contract.CLS_INVALID_PARAMS,
+                                 f"slot 超出范围：{slot}，须为 1-9 的整数")
         bound_err = self._ensure_bound()
         if bound_err:
             return bound_err
         return await asyncio.to_thread(self.do_switch_account, slot)
 
+    @guarded
     def do_switch_account(self, slot: int):
         """向 xiadan 发送 Alt+N，切换多账户登录下的当前活跃资金账户。
 
@@ -1966,15 +2194,11 @@ class WinThsBackend:
         hot_key(["alt", str(slot)])
         # 切换会触发资金/持仓面板重载，稍等再放行后续操作。
         time.sleep(sleep_time * 2)
-        return {
-            "code": 0,
-            "status": "succeed",
-            "data": {
-                "slot": slot,
-                "msg": (
-                    f"已向同花顺窗口发送 Alt+{slot}（盲切，未核验结果）。"
-                    "后续所有查询/下单都作用于切换后的当前账户，"
-                    "请先用 balance/position 核对账户身份再继续。"
-                ),
-            },
-        }
+        return contract.ok({
+            "slot": slot,
+            "msg": (
+                f"已向同花顺窗口发送 Alt+{slot}（盲切，未核验结果）。"
+                "后续所有查询/下单都作用于切换后的当前账户，"
+                "请先用 balance/position 核对账户身份再继续。"
+            ),
+        })

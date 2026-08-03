@@ -39,3 +39,6 @@ ret1.png
 .pytest_cache/
 .coverage
 htmlcov/
+
+# 受控端运行期数据目录（日志 + 下单台账），绝不入库
+guling-trader-data/

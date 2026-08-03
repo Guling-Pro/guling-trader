@@ -203,6 +203,11 @@ class DialogSentry:
         quiet_since: Optional[float] = None
         handled: dict[int, float] = {}  # hwnd → 上次处置时刻（防对同一弹窗连点）
         while time.time() < deadline:
+            # 代次检查点：dispatcher 超时放锁后，脱缰线程不能继续抢弹窗——
+            # 下一笔调用的 dialog_cleanup 正在处置同一个框（2026-08-03 串线事故）。
+            check = getattr(self.backend, "_abort_if_stale", None)
+            if check:
+                check("dialogs.pump")
             dialogs = self.scan()
             if not dialogs:
                 now = time.time()

@@ -76,10 +76,10 @@ async def watchlist_watch_task(state, client) -> None:
 
             async with backend.win_lock:
                 res = await backend.watchlist()
-            if not res or res.get("code") != 0:
+            if not res or res.get("status") != "succeed":
                 logger.info("watchlist_watch 跳过：读取失败 %s", (res or {}).get("msg"))
                 continue
-            cur = list(res.get("data") or [])
+            cur = list((res.get("data") or {}).get("codes") or [])
             if prev is None:
                 prev = cur
                 logger.info("watchlist_watch 基线建立：顶部 %d 只", len(cur))

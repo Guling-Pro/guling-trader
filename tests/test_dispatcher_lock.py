@@ -1,7 +1,7 @@
 """dispatcher 锁 + agent 下单登记回归。沿用 asyncio.run 同步驱动约定。"""
 import asyncio
 
-from trader import dispatcher
+from trader import contract, dispatcher
 
 
 class LockFakeBackend:
@@ -20,13 +20,13 @@ class LockFakeBackend:
         return result
 
     async def orders_active(self):
-        return await self._hold({"code": 0, "status": "succeed", "data": []})
+        return await self._hold(contract.ok([]))
 
     async def buy(self, stock_no, amount, price, client_order_id):
-        return await self._hold({"code": 0, "entrust_no": "777"})
+        return await self._hold(contract.ok({"entrust_no": "777"}))
 
     async def sell(self, stock_no, amount, price, client_order_id):
-        return await self._hold({"code": 0, "entrust_no": "888"})
+        return await self._hold(contract.ok({"entrust_no": "888"}))
 
 
 def test_window_methods_serialized_by_lock():

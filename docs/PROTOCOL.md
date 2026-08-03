@@ -1,4 +1,4 @@
-# guling-trader & Gateway/Relay Communication Protocol (V1)
+# guling-trader & Gateway/Relay Communication Protocol (V1 传输层 / 回执契约 v2)
 
 This document formally specifies the communication protocol between the Windows Trader client (`guling-trader.exe`) and the Cloud Gateway (`guling-mcp-gateway` or any custom private relay). 
 
@@ -115,75 +115,166 @@ When the AI Client triggers a tool, the Gateway unwraps the tool parameter block
 ```
 *Note that the Gateway has completely stripped standard MCP `"tools/call"` wrappers here, presenting pure naked broker commands to the Trader.*
 
-### 3.2. Trader-to-Gateway: `reply` Envelope
-The Trader executes the transaction and responds with a single-layer reply frame:
+### 3.2. Trader-to-Gateway: `reply` Envelope（契约 v2）
 
-#### Successful response:
+reply 帧本身仍是单层 `{type,id,ok,result|error}`；**`result` 一律是契约 v2 信封**，
+所有工具无例外形（含 buy/sell/cancel，含失败与 busy）：
+
 ```json
 {
-  "type": "reply",
-  "id": "transaction-unique-id",
-  "ok": true,
-  "result": {
-    "code": 0,
-    "status": "succeed",
-    "entrust_no": "1928374",
-    "msg": "下单成功"
-  }
+  "status": "succeed" | "failed" | "busy",
+  "code": "<机器枚举串>",
+  "data": <载荷或 null>,
+  "error": {"class": "<枚举>", "broker_msg": "<柜台原文或 null>", "message": "<我方人话>"} | null,
+  "contract_version": "2"
 }
 ```
 
-#### Unconfirmed order response (`code == 2`):
-Crucial safety safeguard for network jitter, verification popups, or delay in local order reflection:
+`contract_version` 亦通过网关 `initialize` 的 `serverInfo.contract_version` 暴露，
+消费侧无需先调业务工具即可判版。
+
+#### `code` 值域（机器枚举）
+
+| code | 含义 | status |
+|---|---|---|
+| `ok` | 成功 | succeed |
+| `busy` | 受控端窗口忙，**本笔未执行** | busy |
+| `call_timeout` | 查询类超时 | failed |
+| `submitted_unconfirmed` | **已点提交，结果不可知** | failed |
+| `rejected` | 柜台明确拒绝 | failed |
+| `read_failed` | 抓不到数据 | failed |
+| `table_mismatch` | 抓到的不是本次请求的表（已拒绝返回错表） | failed |
+| `not_bound` | 未检测到 xiadan 窗口 | failed |
+| `plugin_disabled` | 交易插件被禁用 | failed |
+| `invalid_params` | 参数非法 / coid 复用冲突 | failed |
+| `ledger_unavailable` | 下单台账不可用（**已拒单**） | failed |
+| `not_found` | query_order 查无此单 / 撤单找不到该委托 | failed |
+| `aborted` | 本笔已被超时作废（代次机制） | failed |
+| `unsupported_method` | 方法不在白名单 | failed |
+| `internal_error` | 受控端内部错误 | failed |
+
+#### ⚠️ `status: failed` **不等于**「未提交」
+
+`code == submitted_unconfirmed` 时委托**可能已经在柜台**。判定必须看 `code`，不能看
+`status`。此时调用方唯一安全动作是**用同一 `client_order_id` 原样重发**（幂等，见
+3.2.3），或调 `query_order` 核实；**禁止改单重下**。
+
+#### `error.class` 两层分类（C2）
+
+* **结构性判定**（我方控制流得出，可靠）：`busy` `call_timeout` `unknown_outcome`
+  `not_bound` `plugin_disabled` `read_failed` `table_mismatch` `invalid_params`
+  `ledger_unavailable` `not_found` `aborted` `internal_error`
+* **柜台原文尽力映射**：`insufficient_funds` `price_out_of_limit` `invalid_quantity`
+  `suspended` `no_permission` `broker_timeout`，**认不出一律 `unknown`**。
+
+`broker_msg` 永远保留柜台原文。**`class == unknown` 与所有 unknown_outcome
+一律不可自动重试**——关键词表是尽力而为的，误判「可重试」会真的重复下单。
+不可自动重试集合：`unknown` `unknown_outcome` `insufficient_funds` `no_permission`
+`invalid_quantity` `invalid_params` `ledger_unavailable`。
+
+#### 3.2.1 busy 背压语义（G3）
+
+受控端对 THS 单窗口全程串行（`win_lock`）。排队超过 5 s 即回：
+
 ```json
-{
-  "type": "reply",
-  "id": "transaction-unique-id",
-  "ok": false,
-  "result": {
-    "code": 2,
-    "status": "unknown",
-    "msg": "已提交但未能在未成交委托列表中匹配到对应订单，请自行人工或重试查询确认状态"
-  },
-  "error": "已提交但未确认，请勿重复下单，需人工或查询确认状态"
-}
+{"status": "busy", "code": "busy", "data": {"submitted": false, "retry_after_secs": 3},
+ "error": {"class": "busy", "broker_msg": null, "message": "..."}, "contract_version": "2"}
 ```
-*Relays/gateways MUST preserve this detailed error text to prevent the AI from mistaking this as a trade failure and issuing a duplicated buy order.*
 
-Since v0.7 the trader may additionally return `"status": "busy"` with `code == 2`
-(window lock contention — the command was **not** executed; retry after
-verifying pending orders), and any reply may carry a `dialogs` array recording
-client popups the trader auto-dismissed while executing the command
-(`[{"title", "text", "action"}]`, forensic evidence — no action required).
+`submitted: false` 是硬保证——busy 时指令**根本没执行**。建议退避 `retry_after_secs`
+（当前 3 s）后重试。busy 是背压信号，不是故障。
 
-#### Gateway-side call timeout (MANDATORY semantics):
-The trader answers every order command within its internal 25 s budget —
-deliberately below a gateway's typical 30 s wait. If a gateway's own timeout
-still fires with no `reply` (trader offline, network loss), the gateway MUST
-NOT surface a bare transport error (e.g. `-32003 指令下发超时`): a missing
-reply after an order command means the order **may have been submitted**. The
-MCP tool result MUST carry unknown-semantics text equivalent to:
+受控端单笔总预算 25 s（低于网关 30 s），保证网关总能等到带语义的 reply。超时后受控端
+会作废在飞线程（代次机制）并置 degraded，下一笔进入前先清残留弹窗。
 
-> `status: unknown`：受控端未在时限内响应，委托**可能已提交**。请先调用
-> `orders_filled` / `orders_active` 核实，**禁止直接重复下单**。
+#### 3.2.2 空表语义（B3，永久锁定）
 
-Rationale: on 2026-07-13 a bare timeout error while the order actually filled
-("报错但静默成交") nearly caused a duplicated-order incident.
+**「真的没有」与「拿不到」必须可区分**，这是消费侧一切降级判断的地基：
 
-#### Ordinary failure response (`code == 1`):
-```json
-{
-  "type": "reply",
-  "id": "transaction-unique-id",
-  "ok": false,
-  "result": {
-    "code": 1,
-    "status": "failed",
-    "msg": "可用资金不足"
-  },
-  "error": "可用资金不足"
-}
-```
+* 今天无挂单 / 无成交 → `status: succeed`，`data: []`。**空表是成功**。
+* 抓不到 / 抓到错表 → `status: failed`，`code: read_failed | table_mismatch`，
+  **绝不返回空数组冒充「没有」**。
+
+#### 3.2.3 client_order_id 与幂等（C4/C5a）
+
+* coid **不写入柜台**（同花顺委托无自定义字段），仅存于受控端本地台账（SQLite，
+  保留 ≥5 交易日）。
+* **幂等**：`buy`/`sell`/`cancel` 传 coid 后，同 id 重复提交**绝不产生第二次提交**，
+  返回首次记录的回执；首次结果尚未落定时返回 `submitted_unconfirmed`——
+  这是合法态，不是 bug（最危险那一刻台账自己也不知道结果）。
+* 同 id **不同参数** → `invalid_params` 拒绝执行（调用方 id 复用 bug，不静默）。
+* **台账不可用一律拒单**（`ledger_unavailable`），禁静默降级为无幂等下单。
+* **回显是尽力而为**：`orders_active` / `orders_filled` 按 entrust_no join 回显 coid；
+  回查不到合同编号的单（超时那批）与外部/人工单为 `null`。**对账主键是 entrust_no，
+  coid 是增强关联**。
+* 建议 coid 全局唯一且含账户维度——受控端 `switch_account` 是盲切，对账户身份无感知。
+
+#### 3.2.4 查单（C5b）
+
+`query_order(client_order_id)` → `state` ∈ 未报/已报/部成/已成/已撤/废单/**未知**，
+并给出 `resolution`：`by_entrust_no`（精确命中）/ `heuristic`（台账无合同编号，按
+代码+数量匹配，**同参重复单存在歧义**）/ `unresolved`（零命中或多命中 → `state=未知`，
+需人工）。`unknown` 态被收窄到「回查确认前」，但**不可能被消灭**。
+
+#### 3.2.5 数值与单位（C6）
+
+数值字段一律 JSON number：金额单位元（取整到分）、价格单位元（到厘）、数量单位股（int）、
+百分比键名以 `_pct` 结尾（不带 % 符号）。**THS 的 `--`/空占位符一律映射 `null`，
+绝不映射 0**——0 是真实数字，把「没有」写成 0 会被下游当真值用。
+键名保留中文，与同花顺界面列名同字面（人工对屏审计零翻译成本）。
+
+#### 3.2.6 委托表语义（C3）
+
+`orders_active` **只返回在飞单**（未报/已报/部成）；已成/已撤/废单不出现。
+**状态识别不出的行按「在飞」保守返回**——宁可多给一行，也不能把一张活着的挂单藏起来
+（孤儿挂单架空止损哨兵是最险的失效模式）。行结构：`client_order_id, entrust_no,
+证券代码, 证券名称, 方向, 委托价, 委托数量, 已成数量, 成交均价, 状态, 柜台备注`。
+
+`order_event` 推送读的是**含终态的全量委托表**（内部通道），不受上述过滤影响。
+
+#### 3.2.7 成交时间与时区（B2）
+
+`orders_filled.成交时间` 为 ISO 8601 带偏移。THS 成交表只给 `HH:MM:SS`，
+**日期与时区由受控端本机时钟补齐，不是柜台时间**——对账时按此理解。
+
+任何 reply 都可能携带 `data.dialogs` 数组（受控端自动处置的客户端弹窗存证：
+`[{"title","text","action"}]`，仅作取证，无需动作）。
+
+#### Gateway-side call timeout (MANDATORY semantics)
+
+受控端在 25 s 内必给回执（低于网关 30 s）。若网关自身超时仍未收到 `reply`
+（受控端离线/断网），网关**不得**只回裸传输错误（如 `-32003`）：下单类命令缺回执
+意味着委托**可能已提交**，必须给出等价于 `submitted_unconfirmed` 的语义文本：
+
+> 受控端未在时限内响应，委托**可能已提交**。安全动作=用同一 `client_order_id`
+> 原样重发（幂等），或调 `query_order`/`orders_active` 核实；**禁止改单重下**。
+
+Rationale：2026-07-13「报错但静默成交」几乎导致重复下单。
+
+网关另有两条硬性要求：
+
+1. **失败也必须把完整信封交给客户端**（`isError: true` + `content[0].text` 为信封
+   JSON），只回一句散文等于在网关层丢掉机器分类能力；
+2. **回执配对键 = (agentToken, 网关自生成 id)**，客户端 JSON-RPC id 只回填响应、
+   **不参与配对**——id 唯一性不是客户端的契约义务（G1/G2；2026-08-03 串线事故根因）。
+
+#### 3.2.8 会话生命周期（G4）
+
+| 场景 | 返回 |
+|---|---|
+| sid 过期/失效 | JSON-RPC error `-32001`，文案含 `Session expired or invalid` → 重新握手 |
+| 未带凭证 | `-32001`，文案含 `Missing agent token` |
+| 受控端离线 | `-32001`，文案含「Windows 交易端 WebSocket 未在线」→ 非会话问题，勿重握手 |
+| 网关等待超时 | `-32003` + 上述 unknown 语义 |
+
+#### 3.2.9 消费侧节奏建议（S2）
+
+受控端对 THS 单窗口全程串行，吞吐上限由 RPA 决定，不是并发能力问题：
+
+* 单账户建议**并发 1**（多客户端并发只会互相 busy）；
+* 最小轮询间隔建议 ≥ 60 s（查询类单笔典型 1–3 s，交割单可达数十秒）；
+* 收到 busy 按 `retry_after_secs` 退避，不要立即重试；
+* 下单类务必带 coid，超时后**重发同 id**而不是新建单。
 
 ### 3.3. Trader-to-Gateway: `order_event` Push (Unsolicited)
 

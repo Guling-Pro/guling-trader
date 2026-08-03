@@ -6,6 +6,8 @@
 """
 import asyncio
 
+from trader import contract
+
 from trader.ths.win import WinThsBackend
 
 
@@ -16,15 +18,15 @@ def _switch(slot):
 def test_rejects_non_integer_slot():
     for bad in (None, "abc", [1], {}):
         result = _switch(bad)
-        assert result["code"] == 1
-        assert "slot 参数无效" in result["msg"]
+        assert result["code"] == "invalid_params"
+        assert "slot 参数无效" in result["error"]["message"]
 
 
 def test_rejects_out_of_range_slot():
     for bad in (0, -1, 10, 99):
         result = _switch(bad)
-        assert result["code"] == 1
-        assert "slot 超出范围" in result["msg"]
+        assert result["code"] == "invalid_params"
+        assert "slot 超出范围" in result["error"]["message"]
 
 
 def test_valid_slot_passes_gate_and_reaches_bind(monkeypatch):
@@ -44,8 +46,8 @@ def test_coerced_int_slot_forwarded_to_do_switch(monkeypatch):
     seen = []
     monkeypatch.setattr(
         backend, "do_switch_account",
-        lambda slot: (seen.append(slot) or {"code": 0, "data": {"slot": slot}}),
+        lambda slot: (seen.append(slot) or contract.ok({"slot": slot})),
     )
     result = asyncio.run(backend.switch_account("2"))
-    assert result["code"] == 0
+    assert result["status"] == "succeed"
     assert seen == [2]

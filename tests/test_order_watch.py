@@ -21,42 +21,48 @@ def test_in_trading_session_weekend_is_false():
 
 
 def _active(rows):
-    return {"code": 0, "status": "succeed", "data": rows}
+    """orders_active_all 的契约 v2 信封（行已规范化：number + 方向/状态枚举）。"""
+    return {"status": "succeed", "code": "ok", "data": rows,
+            "error": None, "contract_version": "2"}
+
+
+def _row(eno, qty, filled, state, code="600519", op="买入", price=1700.0, avg=None):
+    """规范化后的委托行（normalize_active_row 的产物形状）。"""
+    return {"client_order_id": None, "entrust_no": eno, "证券代码": code,
+            "证券名称": "贵州茅台", "方向": op, "委托价": price, "委托数量": qty,
+            "已成数量": filled, "成交均价": avg, "状态": state, "柜台备注": state}
 
 
 def test_build_snapshot_parses_real_headers():
-    snap = order_watch.build_snapshot(_active([
-        {
-            "证券代码": "600519", "操作": "买入", "委托数量": "100",
-            "委托价格": "1700.000", "成交数量": "0", "成交均价": "",
-            "合同编号": "12345", "备注": "已报",
-        },
-    ]))
+    snap = order_watch.build_snapshot(_active([_row("12345", 100, 0, "已报")]))
     assert set(snap) == {"12345"}
     o = snap["12345"]
     assert o["stock_no"] == "600519"
     assert o["op"] == "买入"
     assert o["order_qty"] == 100
-    assert o["order_price"] == "1700.000"
+    assert o["order_price"] == 1700.0
     assert o["filled_qty"] == 0
-    assert o["note"] == "已报"
+    assert o["state"] == "已报"
 
 
 def test_build_snapshot_skips_rows_without_entrust_no():
-    snap = order_watch.build_snapshot(_active([{"证券代码": "600519", "合同编号": ""}]))
+    snap = order_watch.build_snapshot(_active([{"证券代码": "600519", "entrust_no": ""}]))
     assert snap == {}
 
 
 def test_build_snapshot_empty_on_error_code():
-    assert order_watch.build_snapshot({"code": 1, "msg": "读取失败"}) == {}
+    assert order_watch.build_snapshot(
+        {"status": "failed", "code": "read_failed", "data": None,
+         "error": {"class": "read_failed", "broker_msg": None, "message": "读取失败"},
+         "contract_version": "2"}) == {}
     assert order_watch.build_snapshot(None) == {}
 
 
-def _order(eno, qty, filled, note, code="600519", op="买入", price="1700.000", avg=""):
+def _order(eno, qty, filled, state, code="600519", op="买入", price=1700.0, avg=None):
     return {
         "entrust_no": eno, "stock_no": code, "op": op,
         "order_qty": qty, "order_price": price,
-        "filled_qty": filled, "avg_price": avg, "note": note,
+        "filled_qty": filled, "avg_price": avg, "state": state, "note": state,
     }
 
 
@@ -75,13 +81,13 @@ def test_new_order_emits_placed():
 
 def test_placed_then_partial_then_full():
     s0 = {"1": _order("1", 100, 0, "已报")}
-    s1 = {"1": _order("1", 100, 60, "部成", avg="1699.500")}
-    s2 = {"1": _order("1", 100, 100, "已成", avg="1699.800")}
+    s1 = {"1": _order("1", 100, 60, "部成", avg=1699.5)}
+    s2 = {"1": _order("1", 100, 100, "已成", avg=1699.8)}
 
     e1 = order_watch.diff_snapshots(s0, s1, set())
     assert [e["event"] for e in e1] == ["partially_filled"]
     assert e1[0]["filled_qty"] == 60
-    assert e1[0]["avg_price"] == "1699.500"
+    assert e1[0]["avg_price"] == 1699.5
 
     e2 = order_watch.diff_snapshots(s1, s2, set())
     assert [e["event"] for e in e2] == ["filled"]
@@ -123,7 +129,8 @@ class WatchFakeBackend:
         self._scripted = list(scripted)   # 每次 orders_active 返回下一项
         self._i = 0
 
-    async def orders_active(self):
+    async def orders_active_all(self):
+        """order_watch 读全量表（含终态）——终态行正是 filled/canceled 事件的来源。"""
         item = self._scripted[min(self._i, len(self._scripted) - 1)]
         self._i += 1
         return item
@@ -139,10 +146,7 @@ class WatchFakeClient:
 
 
 def test_first_round_builds_baseline_no_emit():
-    backend = WatchFakeBackend([_active([
-        {"证券代码": "600519", "操作": "买入", "委托数量": "100", "委托价格": "1700.000",
-         "成交数量": "0", "成交均价": "", "合同编号": "1", "备注": "已报"},
-    ])])
+    backend = WatchFakeBackend([_active([_row("1", 100, 0, "已报")])])
     client = WatchFakeClient(backend)
 
     async def drive():
@@ -156,10 +160,8 @@ def test_first_round_builds_baseline_no_emit():
 
 
 def test_second_round_emits_fill_with_seq_and_ts():
-    r0 = _active([{"证券代码": "600519", "操作": "买入", "委托数量": "100", "委托价格": "1700.000",
-                   "成交数量": "0", "成交均价": "", "合同编号": "1", "备注": "已报"}])
-    r1 = _active([{"证券代码": "600519", "操作": "买入", "委托数量": "100", "委托价格": "1700.000",
-                   "成交数量": "100", "成交均价": "1699.800", "合同编号": "1", "备注": "已成"}])
+    r0 = _active([_row("1", 100, 0, "已报")])
+    r1 = _active([_row("1", 100, 100, "已成", avg=1699.8)])
     backend = WatchFakeBackend([r0, r1])
     client = WatchFakeClient(backend)
 
@@ -178,7 +180,10 @@ def test_second_round_emits_fill_with_seq_and_ts():
 
 
 def test_read_failure_skips_round():
-    backend = WatchFakeBackend([{"code": 1, "msg": "验证码弹窗"}])
+    backend = WatchFakeBackend([
+        {"status": "failed", "code": "read_failed", "data": None,
+         "error": {"class": "read_failed", "broker_msg": None, "message": "验证码弹窗"},
+         "contract_version": "2"}])
     client = WatchFakeClient(backend)
 
     async def drive():
@@ -214,10 +219,8 @@ def test_next_interval_idle_when_empty():
 
 def test_send_frame_failure_does_not_advance_baseline():
     """Regression: if send_frame raises, baseline should not advance; next round retries."""
-    r0 = _active([{"证券代码": "600519", "操作": "买入", "委托数量": "100", "委托价格": "1700.000",
-                   "成交数量": "0", "成交均价": "", "合同编号": "1", "备注": "已报"}])
-    r1 = _active([{"证券代码": "600519", "操作": "买入", "委托数量": "100", "委托价格": "1700.000",
-                   "成交数量": "100", "成交均价": "1699.800", "合同编号": "1", "备注": "已成"}])
+    r0 = _active([_row("1", 100, 0, "已报")])
+    r1 = _active([_row("1", 100, 100, "已成", avg=1699.8)])
     backend = WatchFakeBackend([r0, r1])
 
     # Client that raises on first send_frame call

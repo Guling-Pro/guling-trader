@@ -4,14 +4,14 @@
 - Bug 4：reply 帧曾被 ws_client 双层包裹 → 外层永远 ok:true，掩盖真实失败。
   这里锁定 dispatcher 只产出"单层"reply 帧（含 id/ok/result|error），ws_client
   直接转发即可。
-- Bug 1：非 code:0 的结果曾一律塌缩成"未知错误"。这里锁定 code/status/msg 被透传，
-  且 code:2（已提交未确认）给出明确不要重复下单的语义。
+- Bug 1：失败结果曾一律塌缩成"未知错误"。这里锁定契约 v2 信封被原样透传，
+  且 submitted_unconfirmed（已提交未确认）给出明确不要重复下单的语义。
 
 均为同步测试，用 asyncio.run 驱动 async handle_call，避免依赖 pytest-asyncio。
 """
 import asyncio
 
-from trader import dispatcher
+from trader import contract, dispatcher
 
 
 class FakeBackend:
@@ -66,56 +66,66 @@ def _call(frame, result):
 def test_success_is_single_layer_with_id_echoed():
     """code:0 → ok:true，result 就是后端原始 dict（不再多嵌一层 reply 帧）。"""
     frame = {"type": "call", "id": "abc-123", "method": "balance", "params": {}}
-    reply, _ = _call(frame, {"code": 0, "status": "succeed", "data": {"可用": "295.38"}})
+    reply, _ = _call(frame, contract.ok({"可用金额": 295.38}))
 
     assert reply["type"] == "reply"
     assert reply["id"] == "abc-123"          # id 必须回显（旧实现内层 id=null）
     assert reply["ok"] is True
     # result 直接是后端 dict，而不是 {"type":"reply", ...} 这样的再包一层。
-    assert reply["result"]["code"] == 0
-    assert reply["result"]["data"]["可用"] == "295.38"
+    assert reply["result"]["status"] == "succeed"
+    assert reply["result"]["code"] == "ok"
+    assert reply["result"]["contract_version"] == "2"
+    assert reply["result"]["data"]["可用金额"] == 295.38
     assert reply["result"].get("type") != "reply"
 
 
-def test_submitted_but_unconfirmed_code2_is_not_unknown_error():
-    """code:2（已提交未确认）必须给出明确文案 + 透传 result，绝不能塌成'未知错误'。"""
+def test_submitted_unconfirmed_is_not_unknown_error():
+    """已提交未确认必须给出明确文案 + 透传信封，绝不能塌成'未知错误'。"""
     frame = {"type": "call", "id": "id2", "method": "sell",
              "params": {"stock_no": "300459", "amount": 100}}
-    result = {"code": 2, "status": "unknown",
-              "msg": "已提交但未能在 orders/active 表中匹配到对应订单，请自行确认状态"}
+    result = contract.submitted_unconfirmed("已提交但未能在委托表中匹配到对应订单",
+                                            data={"submitted": True})
     reply, _ = _call(frame, result)
 
     assert reply["ok"] is False
-    assert reply["error"] == result["msg"]      # 用 msg，不是 "未知错误"
+    assert reply["error"] == result["error"]["message"]
     assert "未知错误" not in reply["error"]
-    assert reply["result"]["code"] == 2          # 透传，供 agent 区分"已提交"vs"被拒"
+    # 供调用方区分「已提交」vs「被拒」：code + class 都是机器枚举
+    assert reply["result"]["code"] == "submitted_unconfirmed"
+    assert reply["result"]["error"]["class"] == "unknown_outcome"
 
 
 def test_failed_query_propagates_msg_not_unknown_error():
     """读列表失败（code:1 带 msg）应透传 msg，不再是裸的'未知错误'。"""
     frame = {"type": "call", "id": "id3", "method": "orders_active", "params": {}}
-    result = {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
+    result = contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                           "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试")
     reply, _ = _call(frame, result)
 
     assert reply["ok"] is False
-    assert reply["error"] == result["msg"]
+    assert reply["error"] == result["error"]["message"]
     assert reply["result"]["status"] == "failed"
+    assert reply["result"]["code"] == "read_failed"
 
 
-def test_failed_without_detail_falls_back_to_unknown():
-    """既无 error 又无 msg 时才允许回退到'未知错误'。"""
+def test_non_contract_shape_is_rejected_loudly():
+    """后端若返回非契约形态（老信封/裸 dict），dispatcher 必须转成 internal_error 信封，
+    绝不放行——冻结后消费侧按契约解析，放行等于把解析崩溃推给对端。"""
     frame = {"type": "call", "id": "id4", "method": "position", "params": {}}
     reply, _ = _call(frame, {"code": 1})
     assert reply["ok"] is False
-    assert reply["error"] == "未知错误"
+    assert reply["result"]["code"] == "internal_error"
+    assert reply["result"]["contract_version"] == "2"
 
 
-def test_explicit_error_key_is_preferred():
+def test_broker_rejection_carries_class_and_raw_text():
+    """柜台拒单：class 可机器分流，broker_msg 保留原文（C2 两层分类）。"""
     frame = {"type": "call", "id": "id5", "method": "buy",
              "params": {"stock_no": "600000", "amount": 100}}
-    reply, _ = _call(frame, {"code": 1, "error": "可用资金不足"})
+    reply, _ = _call(frame, contract.broker_rejected("可用资金不足，无法委托"))
     assert reply["ok"] is False
-    assert reply["error"] == "可用资金不足"
+    assert reply["result"]["error"]["class"] == "insufficient_funds"
+    assert reply["result"]["error"]["broker_msg"] == "可用资金不足，无法委托"
 
 
 def test_method_not_whitelisted():
