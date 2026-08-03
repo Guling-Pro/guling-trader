@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 from ctypes import wintypes
+import functools
 import logging
 import os
 import platform
@@ -58,6 +59,7 @@ from .const import (
     MARKET_TREE_PARENT,
     VK_CODE,
 )
+from .table_guard import check_table
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +272,17 @@ def get_text(hwnd):
 _PHANTOM_VALUES = frozenset({"", "0", "0.0", "0.00", "0.000", "-", "--"})
 
 
+def table_columns(text):
+    """取 THS 剪贴板表格的表头列名（与 parse_table 同一套切分约定）。
+
+    单独一个函数是因为**空表也要能校验归属**：今天无挂单/无成交时 parse_table
+    返回 []，表头却仍在——归属校验只能看表头，不能看行。
+    """
+    if not text:
+        return []
+    return [c for c in text.split("\t\r\n")[0].split("\t") if c.strip()]
+
+
 def parse_table(text):
     """Parse THS clipboard table. Drops two kinds of noise rows:
     - completely blank lines (trailing \\t\\r\\n separator artefact)
@@ -395,6 +408,23 @@ class ThsState:
             return out
 
 
+class StaleCallAborted(RuntimeError):
+    """本线程所属的调用已被作废（dispatcher 超时后放锁），必须立刻停手。"""
+
+
+def guarded(fn):
+    """工作线程入口装饰器：登记调用代次，本笔被作废时在检查点中止。
+
+    装在同步实现上（而非 to_thread 调用点）——RPC 异步壳的形状保持不变，
+    代次跟着方法走，内部相互调用（下单→查成交表）自动继承同一代次。
+    """
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        return self._run_guarded(fn.__get__(self, type(self)), *args, **kwargs)
+
+    return wrapper
+
+
 class WinThsBackend:
     def __init__(self):
         self.hwnd_main = None
@@ -406,15 +436,70 @@ class WinThsBackend:
         self.state = ThsState()
         # dispatcher 侧调用超时后置位；下一次调用进入前先跑 dialog_cleanup 自愈。
         self.degraded = False
+        # 调用代次：dispatcher 超时后 +1，作废所有在飞的工作线程（见 _abort_if_stale）。
+        self._gen = 0
+        self._gen_lock = threading.Lock()
+        self._tls = threading.local()
+
+    # --- 调用代次：治「超时线程脱缰」---------------------------------------
+    # dispatcher 的 25s 总超时用 asyncio.wait_for 包 asyncio.to_thread，超时只取消
+    # 等待协程——**线程取消不掉**，它还在发全局按键；而 finally 已经放了 win_lock，
+    # 下一笔立刻进场 → 两个线程同击一个 xiadan 窗口（页面被别人切走 = 抓错表；
+    # 弹窗被两边抢 = 验证码/确认框错点）。
+    # 代次机制让脱缰线程在下一个检查点自己退出：工作线程进场时记下当时的代次，
+    # 超时时 dispatcher 把代次 +1，线程在每个 UI 动作前对一次，不一致就抛
+    # StaleCallAborted 退出。检查点覆盖翻页(switch_to_normal/refresh)、抓表
+    # (read_table_text)、弹窗(input_ocr / dialogs.pump / dialog_cleanup)与下单提交。
+
+    def invalidate_inflight(self, reason: str = "") -> int:
+        """作废当前在飞的工作线程（dispatcher 超时时调用）。返回新代次。"""
+        with self._gen_lock:
+            self._gen += 1
+            gen = self._gen
+        logger.warning("调用代次 → %s，在飞线程已作废：%s", gen, reason or "(未注明)")
+        return gen
+
+    def _run_guarded(self, fn, *args, **kwargs):
+        """在工作线程里带代次运行 fn；被作废则中止并返回 failed（结果已无人接收）。
+
+        可重入：内层已登记代次时直接执行（如 _submit_market_trade 内部调
+        get_filled_orders），中止异常一路抛到最外层那次统一收口。
+        """
+        if getattr(self._tls, "gen", None) is not None:
+            return fn(*args, **kwargs)
+        with self._gen_lock:
+            self._tls.gen = self._gen
+        try:
+            return fn(*args, **kwargs)
+        except StaleCallAborted as e:
+            logger.warning("脱缰线程已在 %s 处停手（%s）", getattr(e, "where", "?"), e)
+            return {"code": 1, "status": "failed", "msg": f"调用已作废：{e}"}
+        finally:
+            self._tls.gen = None
+
+    def _abort_if_stale(self, where: str) -> None:
+        """代次检查点。非受管线程（UI/测试直调）不拦。"""
+        mine = getattr(self._tls, "gen", None)
+        if mine is None:
+            return
+        with self._gen_lock:
+            current = self._gen
+        if mine != current:
+            err = StaleCallAborted(
+                f"代次 {mine} 已被 {current} 取代，在 {where} 处放弃，避免与新调用同击一窗")
+            err.where = where
+            raise err
 
     def _pump_dialogs(self):
         """提交动作后的弹窗「发现-处置-存证」循环（见 ths/dialogs.py）。"""
+        self._abort_if_stale("pump_dialogs")
         from .dialogs import DialogSentry
         return DialogSentry(self).pump()
 
     def dialog_cleanup(self):
         """degraded 自愈入口：清掉残留弹窗并留存证（dispatcher 在超时后的
         下一次调用前执行）。返回 PumpResult，内容进日志。"""
+        self._abort_if_stale("dialog_cleanup")
         from .dialogs import DialogSentry
         result = DialogSentry(self).cleanup()
         if result.dialogs:
@@ -662,6 +747,7 @@ class WinThsBackend:
     def cancel_last(self):
         return self._bulk_cancel("last")
 
+    @guarded
     def get_balance(self):
         # 多账户登录时每个账户各挂一套同 ID 资金控件，只有当前账户的可见；
         # 不按可见性过滤会读到其他账户隐藏面板的数字（2026-07-14 双账户
@@ -687,21 +773,51 @@ class WinThsBackend:
                        "已放弃读取——不回退读隐藏面板（多账户下可能是其他账户的数字），"
                        "请稍后重试"}
 
+    # 抓表重试上限：翻页键没落到 xiadan 时抓到的是上一张表，重抓一次通常就对了；
+    # 三次仍不对说明面板真的没切过去，明确失败 —— 绝不 succeed 携错表出门。
+    _GRID_ATTEMPTS = 3
+
+    def _grab_grid(self, kind: str, goto, label: str):
+        """翻页→抓表→**校验表头归属**→解析。错表即重抓，仍不对则显式 failed。
+
+        2026-08-03 串线事故的正面修复：翻页快捷键是全局按键，没落到 xiadan 时
+        grid 里还是上一次查询的表，Ctrl+C 原样抓走，过去非空即 code=0 出门。
+        """
+        got_columns: list[str] = []
+        reason = ""
+        for attempt in range(1, self._GRID_ATTEMPTS + 1):
+            goto()
+            hwnd = self.get_right_hwnd()
+            ctrl = self._find_grid(hwnd)
+            data = self.read_table_text(ctrl) if ctrl else None
+            if data:
+                # 表头取自原始文本而非解析结果：空表（今天无挂单/无成交）是合法
+                # 结果，它照样有表头，必须能通过校验并以 data=[] 正常返回。
+                got_columns = table_columns(data)
+                reason = check_table(kind, got_columns) or ""
+                parsed = parse_table(data)
+                if not reason:
+                    self.state.update(kind, parsed)
+                    return {"code": 0, "status": "succeed", "data": parsed}
+                logger.warning("%s 抓到错表（第 %d/%d 次）：%s cols=%r",
+                               label, attempt, self._GRID_ATTEMPTS, reason, got_columns)
+            time.sleep(sleep_time)
+        if reason:
+            return {"code": 1, "status": "failed",
+                    "msg": f"{label}：抓到的不是本次请求的表（{reason}），"
+                           f"重抓 {self._GRID_ATTEMPTS} 次仍不符，已拒绝返回错表，请稍后重试",
+                    "got_columns": got_columns}
+        return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
+
+    @guarded
     def get_position(self):
-        for retry in range(retry_time):
+        def goto():
             self.switch_to_normal()
             hot_key(["F1"])
             hot_key(["F6"])
             self.refresh()
-            hwnd = self.get_right_hwnd()
-            ctrl = self._find_grid(hwnd)
-            data = self.read_table_text(ctrl)
-            if data:
-                parsed = parse_table(data)
-                self.state.update("position", parsed)
-                return {"code": 0, "status": "succeed", "data": parsed}
-            time.sleep(sleep_time)
-        return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
+
+        return self._grab_grid("position", goto, "持仓查询")
 
     def get_gupiao(self):
         for retry in range(retry_time):
@@ -718,37 +834,28 @@ class WinThsBackend:
             time.sleep(sleep_time)
         return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
+    @guarded
     def get_active_orders(self):
-        for retry in range(retry_time):
+        # 最险的一条：错表被消费侧读成「无挂单」→ 孤儿单存活、止损哨兵被架空。
+        def goto():
             self.switch_to_normal()
             _activate_window(self.hwnd_main)
             hot_key(["F1"])
             hot_key(["F8"])
             self.refresh()
-            hwnd = self.get_right_hwnd()
-            ctrl = self._find_grid(hwnd)
-            data = self.read_table_text(ctrl)
-            if data:
-                parsed = parse_table(data)
-                self.state.update("active_orders", parsed)
-                return {"code": 0, "status": "succeed", "data": parsed}
-            time.sleep(sleep_time)
-        return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
 
+        return self._grab_grid("active_orders", goto, "委托查询")
+
+    @guarded
     def get_filled_orders(self):
-        self.switch_to_normal()
-        _activate_window(self.hwnd_main)
-        hot_key(["F2"])
-        hot_key(["F7"])
-        self.refresh()
-        hwnd = self.get_right_hwnd()
-        ctrl = self._find_grid(hwnd)
-        data = self.read_table_text(ctrl)
-        if data:
-            parsed = parse_table(data)
-            self.state.update("filled_orders", parsed)
-            return {"code": 0, "status": "succeed", "data": parsed}
-        return {"code": 1, "status": "failed", "msg": "读取数据失败（可能验证码弹窗或刷新超时），请稍后重试"}
+        def goto():
+            self.switch_to_normal()
+            _activate_window(self.hwnd_main)
+            hot_key(["F2"])
+            hot_key(["F7"])
+            self.refresh()
+
+        return self._grab_grid("filled_orders", goto, "成交查询")
 
     # --- 自选股（新版专有）------------------------------------------------
     # 新版 xiadan 的自选股是内嵌 CEF(Chromium) 渲染的网页，没有原生表格控件、无 CDP
@@ -808,6 +915,7 @@ class WinThsBackend:
                 out.append(t)
         return out
 
+    @guarded
     def get_watchlist(self):
         """读自选股代码（截图+OCR 代码列）。仅第一屏(顶部)——新增出现在顶部，足够检测
         新增；全量需滚屏(CEF 暂不支持)。旧版无此菜单会返回错误。"""
@@ -1189,6 +1297,7 @@ class WinThsBackend:
         else:
             logger.warning("settlement: 按标签导航「交割单」失败（树文字读取或节点缺失）")
 
+    @guarded
     def _do_settlement(self, date_range: str = "近一年"):
         """读取交割单（默认近一年）。低频功能，一次性尽量多拿。"""
         try:
@@ -1326,6 +1435,9 @@ class WinThsBackend:
         # 交给 DialogSentry 结构化处置（发现弹窗→点肯定按钮→存证；含 Edit 的
         # 验证码框走 input_ocr）。取代旧的三连盲 Enter：不再依赖焦点与时序，
         # 弹窗标题/全文/所点按钮全部带回回执，绝不静默。
+        # 提交前最后一次对代次：填单到这里已过去约 1s，若本笔已被超时作废，
+        # 绝不能在下一笔正在操作同一窗口时又敲一次提交。
+        self._abort_if_stale("submit_trade")
         hot_key(["enter"])   # submit form → 可能弹「委托确认」
         pump = self._pump_dialogs()
         time.sleep(sleep_time)
@@ -1355,12 +1467,14 @@ class WinThsBackend:
             "msg": "已提交但未能在 orders/active 表中匹配到对应订单，请自行确认状态",
         })
 
+    @guarded
     def _do_sell(self, stock_no, amount, price):
         # price is None ⇒ 真·市价委托(五档即成剩撤)；有值 ⇒ F2 限价挂单(原逻辑)。
         if price is None:
             return self._submit_market_trade("卖出", stock_no, amount)
         return self._submit_trade("F2", "卖出", stock_no, amount, price)
 
+    @guarded
     def _do_buy(self, stock_no, amount, price):
         if price is None:
             return self._submit_market_trade("买入", stock_no, amount)
@@ -1440,6 +1554,7 @@ class WinThsBackend:
         # 必须 PostMessage：SendMessage 是同步跨进程调用，按钮 handler 弹出模态
         # 「委托确认」框时不返回 → 线程死锁（2026-07-13 事故根因），后续弹窗
         # 处理代码永远执行不到。
+        self._abort_if_stale("submit_market_trade")
         submit_btn = self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID, cls="Button", visible=True) \
             or self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID)
         if submit_btn:
@@ -1471,6 +1586,7 @@ class WinThsBackend:
             "op": op_keyword, "requested_amount": int(amount), "filled_amount": 0,
             "msg": msg})
 
+    @guarded
     def _do_cancel(self, entrust_no):
         try:
             return self._cancel_inner(entrust_no)
@@ -1515,6 +1631,9 @@ class WinThsBackend:
                 break
         if find is None:
             return {"code": 1, "status": "failed", "msg": f"没找到指定订单 {entrust_no}"}
+        # 撤单是按行号算坐标的盲点击：本笔若已被作废，页面早被下一笔切走，
+        # 这两下点击会落到未知控件上 —— 提交类动作前必须对代次。
+        self._abort_if_stale("cancel_click")
         left, top, right, bottom = win32gui.GetWindowRect(ctrl)
         x = 50 + left
         y = 30 + 16 * find + top
@@ -1570,6 +1689,7 @@ class WinThsBackend:
                 return {"code": 1, "status": "failed", "msg": text}
 
     def refresh(self):
+        self._abort_if_stale("refresh")
         hot_key(["F5"])
         time.sleep(refresh_sleep_time)
 
@@ -1579,6 +1699,9 @@ class WinThsBackend:
             time.sleep(sleep_time)
 
     def switch_to_normal(self):
+        # 翻页/抓表链路的第一个动作 —— 代次检查放这里，脱缰线程在发出任何
+        # 全局按键之前就退出。
+        self._abort_if_stale("switch_to_normal")
         tabs = self.get_left_bottom_tabs()
         left, top, right, bottom = win32gui.GetWindowRect(tabs)
         x = left + 10
@@ -1618,6 +1741,7 @@ class WinThsBackend:
         仍未变化 = 拷贝没落定（窗口没焦点 / 被验证码挡），返回 None 让调用方重试——
         **绝不返回上一次遗留的陈旧表格**。读完立刻清空，剪贴板不留数据。
         """
+        self._abort_if_stale("read_table_text")
         user32 = ctypes.windll.user32
         self._empty_clipboard()
         seq0 = user32.GetClipboardSequenceNumber()  # 清空后取基线，之后变化=本次拷贝
@@ -1702,6 +1826,9 @@ class WinThsBackend:
         )
         ocr_config = f"--psm 7 -c tessedit_char_whitelist={whitelist}"
         for attempt in range(1, max_retries + 1):
+            # 每轮都对代次：验证码流程最长可跑十几秒，脱缰线程绝不能在这里
+            # 继续点弹窗——那正是下一笔调用要处置的同一个框。
+            self._abort_if_stale(f"input_ocr#{attempt}")
             captcha_static = self.get_ocr_hwnd()
             if not captcha_static:
                 return
@@ -1955,6 +2082,7 @@ class WinThsBackend:
             return bound_err
         return await asyncio.to_thread(self.do_switch_account, slot)
 
+    @guarded
     def do_switch_account(self, slot: int):
         """向 xiadan 发送 Alt+N，切换多账户登录下的当前活跃资金账户。
 

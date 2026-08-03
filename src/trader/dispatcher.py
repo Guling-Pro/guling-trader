@@ -316,6 +316,13 @@ async def handle_call(
             result = await asyncio.wait_for(_invoke(), CALL_TIMEOUT_SECS)
         except asyncio.TimeoutError:
             backend.degraded = True
+            # wait_for 只取消了等待协程——to_thread 起的工作线程取消不掉，它还在
+            # 发全局按键，而下面 finally 马上要放 win_lock 让下一笔进场。作废代次，
+            # 让那个线程在下一个检查点（翻页/抓表/弹窗/提交）自己停手，
+            # 否则两个线程同击一个 xiadan 窗口 → 抓错表、抢弹窗。
+            invalidate = getattr(backend, "invalidate_inflight", None)
+            if invalidate:
+                invalidate(f"{method} 超过 {CALL_TIMEOUT_SECS}s 未完成")
             logger.error("[RPC] %s 超过 %ss 未完成，标记 degraded，回 unknown",
                          method, CALL_TIMEOUT_SECS)
             if method in ORDER_METHODS:

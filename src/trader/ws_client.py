@@ -255,7 +255,7 @@ class WsClient:
             async for raw_msg in ws:
                 try:
                     frame = json.loads(raw_msg)
-                    await self._handle_frame(frame)
+                    await self._handle_frame(frame, ws)
                 except SessionRejectedException:
                     raise
                 except Exception as e:
@@ -267,8 +267,8 @@ class WsClient:
         except Exception as e:
             logger.error("主循环出错：%s", e)
 
-    async def _handle_frame(self, frame: dict[str, Any]) -> None:
-        """处理接收到的帧"""
+    async def _handle_frame(self, frame: dict[str, Any], origin_ws: Any = None) -> None:
+        """处理接收到的帧。origin_ws=收到该帧的那条连接（用于回执归属校验）。"""
         frame_type = frame.get("type")
 
         if frame_type == "pair_pending":
@@ -324,12 +324,18 @@ class WsClient:
             # 连用于核单的 orders_active/orders_filled 都进不来（2026-07-13 事故：
             # 一笔卡死瘫痪整个受控端）。执行顺序不受影响：交易/查询本就由
             # backend.win_lock（FIFO）串行。
-            task = asyncio.create_task(self._process_call(frame))
+            task = asyncio.create_task(self._process_call(frame, origin_ws))
             self._call_tasks.add(task)
             task.add_done_callback(self._call_tasks.discard)
 
-    async def _process_call(self, frame: dict[str, Any]) -> None:
-        """执行一个 call 帧并回发 reply（在独立 task 中运行）。"""
+    async def _process_call(self, frame: dict[str, Any], origin_ws: Any = None) -> None:
+        """执行一个 call 帧并回发 reply（在独立 task 中运行）。
+
+        origin_ws=收到该帧的连接。一笔 RPC 最长可跑 25s，其间完全可能断线重连；
+        若发送时 self.ws 已换成新连接，这条回执就是**跨会话错投**——它的 id 属于
+        旧会话，发到新连接上归属无从保证（能否配到别的请求头上取决于网关的 id
+        策略，不能靠对端兜底）。宁可丢弃并留痕：调用方那边本就已超时。
+        """
         rpc_id = frame.get("id")
         method = frame.get("method")
         params = frame.get("params", {})
@@ -352,6 +358,11 @@ class WsClient:
             reply = {"type": "reply", "id": rpc_id, "ok": False, "error": str(e)}
             if self.on_rpc_log:
                 self.on_rpc_log(_format_rpc_log(method, params, error=str(e)))
+        if origin_ws is not None and self.ws is not origin_ws:
+            logger.warning(
+                "丢弃跨连接回执：id=%s method=%s（执行期间已重连，回执归属无法保证）",
+                rpc_id, method)
+            return
         if self.ws:
             await self.ws.send(json.dumps(reply, ensure_ascii=False))
 

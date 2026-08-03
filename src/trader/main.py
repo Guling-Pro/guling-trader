@@ -15,22 +15,49 @@ import platform
 import sys
 import threading
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 
 # ---- 文件日志 + stderr/stdout 重定向 ----
 # PyInstaller --windowed 模式 stdout/stderr 被吞掉，wine 下 print 全部消失。
-# 启动期就把所有输出写到本地配置目录下的 trader.log（每次启动覆盖）。
+# 启动期就把所有输出写到本地配置目录下的 trader.log。
 # 这是 wine/CrossOver 用户的唯一诊断渠道——异常 traceback 也会写进去。
+#
+# 追加 + 滚动，不再每次启动覆盖：2026-08-04 查 08-03 查询串线时，受控端凌晨重启一次，
+# 'w' 模式把当天全部 RPC 日志（含每笔 call 的 id/method，正是定位串线归属的关键证据）
+# 抹干净，回溯路径直接灭失。日志无限增长的原顾虑改由体积滚动解决。
+
+LOG_MAX_BYTES = 5 * 1024 * 1024   # 单文件上限，超过则滚动
+LOG_KEEP = 5                      # 保留 trader.log.1 .. .5（约覆盖最近数个交易日）
+
+
+def _rotate_logs(log_file: Path) -> None:
+    """启动时按体积滚动：trader.log → .1 → .2 …，最老的丢弃。失败不阻断启动。"""
+    try:
+        if not log_file.exists() or log_file.stat().st_size < LOG_MAX_BYTES:
+            return
+        oldest = log_file.with_suffix(log_file.suffix + f".{LOG_KEEP}")
+        if oldest.exists():
+            oldest.unlink()
+        for i in range(LOG_KEEP - 1, 0, -1):
+            src = log_file.with_suffix(log_file.suffix + f".{i}")
+            if src.exists():
+                src.rename(log_file.with_suffix(log_file.suffix + f".{i + 1}"))
+        log_file.rename(log_file.with_suffix(log_file.suffix + ".1"))
+    except Exception:
+        pass  # 滚动失败就继续往原文件追加——丢日志比不启动好
+
 
 def _setup_file_logging() -> Path:
     from . import config as _config  # 延迟导入：本函数在模块顶层 import 之前就被调用
     log_dir = _config.app_data_dir()  # frozen → exe 同级 guling-trader-data/
 
     log_file = log_dir / "trader.log"
-    # 'w' 每次启动新建——避免日志无限增长
-    log_fh = open(log_file, "w", encoding="utf-8", buffering=1)
+    _rotate_logs(log_file)
+    log_fh = open(log_file, "a", encoding="utf-8", buffering=1)
+    log_fh.write(f"\n===== trader 启动 {datetime.now().isoformat(timespec='seconds')} =====\n")
 
     # 1) stdout / stderr 同时写到日志 + 原 sink（windowed 下原 sink 是 /dev/null，无副作用）
     class _Tee(io.TextIOBase):
