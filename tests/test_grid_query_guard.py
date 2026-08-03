@@ -53,7 +53,8 @@ def _backend(monkeypatch, texts):
 def test_correct_table_returns_succeed(monkeypatch, method, table):
     b = _backend(monkeypatch, [table])
     r = getattr(b, method)()
-    assert r["code"] == 0
+    assert r["status"] == "succeed"
+    assert r["contract_version"] == "2"
     assert len(r["data"]) == 1
 
 
@@ -62,7 +63,7 @@ def test_empty_table_is_still_success(monkeypatch):
     否则消费侧拿不到数据，与错表一样致盲。"""
     b = _backend(monkeypatch, [EMPTY_ACTIVE_TABLE])
     r = b.get_active_orders()
-    assert r["code"] == 0
+    assert r["status"] == "succeed"
     assert r["data"] == []
 
 
@@ -74,27 +75,29 @@ def test_empty_table_is_still_success(monkeypatch):
 def test_wrong_table_never_returns_succeed(monkeypatch, method, wrong):
     b = _backend(monkeypatch, [wrong] * WinThsBackend._GRID_ATTEMPTS)
     r = getattr(b, method)()
-    assert r["code"] == 1
     assert r["status"] == "failed"
-    assert "不是本次请求的表" in r["msg"]
-    assert r["got_columns"]              # 诊断用：实得表头进回执
-    assert "data" not in r               # 错表的行绝不出门
+    assert r["code"] == "table_mismatch"
+    assert r["error"]["class"] == "table_mismatch"
+    assert "不是本次请求的表" in r["error"]["message"]
+    assert r["data"]["got_columns"]      # 诊断用：实得表头进回执
+    assert "rows" not in r["data"]       # 错表的行绝不出门
 
 
 def test_retry_recovers_when_page_finally_switches(monkeypatch):
     """首次翻页键没落到 xiadan（抓到上一张表），重抓一次就对了。"""
     b = _backend(monkeypatch, [FILLED_TABLE, ACTIVE_TABLE])
     r = b.get_active_orders()
-    assert r["code"] == 0
-    assert r["data"][0]["合同编号"] == "123456"
+    assert r["status"] == "succeed"
+    assert r["data"][0]["entrust_no"] == "123456"
 
 
 def test_clipboard_failure_keeps_old_message(monkeypatch):
     """抓不到文本（验证码/拷贝没落定）仍是原来的读取失败语义，不误报错表。"""
     b = _backend(monkeypatch, [])
     r = b.get_position()
-    assert r["code"] == 1
-    assert "读取数据失败" in r["msg"]
+    assert r["status"] == "failed"
+    assert r["code"] == "read_failed"
+    assert "读取数据失败" in r["error"]["message"]
 
 
 def test_wrong_table_is_not_written_into_state(monkeypatch):

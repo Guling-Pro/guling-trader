@@ -33,8 +33,9 @@ def test_guarded_call_aborts_after_invalidation(monkeypatch):
         return {"code": 0, "status": "succeed"}
 
     result = b._run_guarded(work)
-    assert result["code"] == 1
-    assert "作废" in result["msg"]
+    assert result["status"] == "failed"
+    assert result["code"] == "aborted"
+    assert "作废" in result["error"]["message"]
 
 
 @pytest.mark.parametrize("action", [
@@ -81,7 +82,7 @@ def test_stale_query_stops_before_regrabbing(monkeypatch):
     monkeypatch.setattr(b, "read_table_text", read)
 
     r = b.get_active_orders()
-    assert r["code"] == 1
+    assert r["status"] == "failed"
     assert len(reads) == 1, "本笔已作废，绝不能再抓第二轮"
 
 

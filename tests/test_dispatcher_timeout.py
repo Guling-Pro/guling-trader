@@ -24,7 +24,8 @@ class HangingBackend:
         await asyncio.sleep(3600)
 
     async def orders_active(self):
-        return {"code": 0, "status": "succeed", "data": []}
+        from trader import contract
+        return contract.ok([])
 
     def dialog_cleanup(self):  # dispatcher 经 asyncio.to_thread 调用（同步）
         self.cleanup_calls += 1
@@ -41,11 +42,11 @@ def test_order_timeout_returns_unknown_not_bare_error(monkeypatch):
     backend = HangingBackend()
     reply = _call(backend, "sell", {"stock_no": "300458", "amount": 500})
     assert reply["ok"] is False
-    assert reply["result"]["code"] == 2
-    assert reply["result"]["status"] == "unknown"
+    assert reply["result"]["code"] == "submitted_unconfirmed"
+    assert reply["result"]["error"]["class"] == "unknown_outcome"
     # 核单指引必须在错误文本里，防调用方凭报错补单
-    assert "orders_filled" in reply["error"]
-    assert "勿直接重复下单" in reply["error"]
+    assert "query_order" in reply["error"] or "orders_active" in reply["error"]
+    assert "勿改单重下" in reply["error"]
     assert backend.degraded is True
 
 
@@ -58,7 +59,7 @@ def test_query_timeout_is_failed_not_unknown(monkeypatch):
 
     reply = _call(SlowQueryBackend(), "orders_active")
     assert reply["ok"] is False
-    assert reply["result"]["code"] == 1  # 查询超时是普通失败，不是「可能已提交」
+    assert reply["result"]["code"] == "call_timeout"  # 查询超时是普通失败，不是「可能已提交」
 
 
 def test_lock_busy_instead_of_starvation(monkeypatch):
@@ -74,6 +75,7 @@ def test_lock_busy_instead_of_starvation(monkeypatch):
     reply = asyncio.run(drive())
     assert reply["ok"] is False
     assert reply["result"]["status"] == "busy"
+    assert reply["result"]["code"] == "busy"
     assert "orders_active" in reply["error"]  # 下单类 busy 也要带核单提醒
 
 

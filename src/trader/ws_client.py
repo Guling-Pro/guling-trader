@@ -118,12 +118,13 @@ def _format_rpc_log(
     if result is None:
         return prefix
 
-    if isinstance(result, dict) and result.get("code") == 0:
+    if isinstance(result, dict) and result.get("status") == "succeed":
+        payload = result.get("data") if isinstance(result.get("data"), dict) else {}
         if method == "balance":
-            avail = result.get("available_cash") or result.get("available")
+            avail = payload.get("可用金额")
             tail = f"可用 {avail}" if avail is not None else "OK"
         elif method in ("buy", "sell"):
-            oid = result.get("entrust_no") or result.get("order_id")
+            oid = payload.get("entrust_no")
             tail = f"委托号 {oid}" if oid else "OK"
         elif method == "cancel":
             tail = "已撤单"

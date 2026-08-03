@@ -22,20 +22,23 @@ def _backend(monkeypatch, pre_result):
 
 
 def test_market_order_aborts_when_baseline_unreadable(monkeypatch):
-    b, calls = _backend(monkeypatch, {"code": 1, "status": "failed", "msg": "读取数据失败"})
+    from trader import contract
+    b, calls = _backend(monkeypatch, contract.fail(
+        contract.CODE_READ_FAILED, contract.CLS_READ_FAILED, "读取数据失败"))
     r = b._submit_market_trade("买入", "300458", 500)
-    assert r["code"] == 1
-    assert r["submitted"] is False
-    assert "基线" in r["msg"]
+    assert r["status"] == "failed"
+    assert r["data"]["submitted"] is False
+    assert "基线" in r["error"]["message"]
     assert calls == [], "基线失败后绝不能继续走到下单面板"
 
 
 def test_wrong_table_baseline_also_aborts(monkeypatch):
     """表头校验拦下的错表同样算基线失败——错表当基线比没有基线更糟。"""
-    b, calls = _backend(monkeypatch, {
-        "code": 1, "status": "failed",
-        "msg": "成交查询：抓到的不是本次请求的表（命中他表特征列 ['股票余额']）",
-        "got_columns": ["股票余额"]})
+    from trader import contract
+    b, calls = _backend(monkeypatch, contract.fail(
+        contract.CODE_TABLE_MISMATCH, contract.CLS_TABLE_MISMATCH,
+        "成交查询：抓到的不是本次请求的表（命中他表特征列 ['股票余额']）",
+        data={"got_columns": ["股票余额"]}))
     r = b._submit_market_trade("卖出", "300458", 500)
-    assert r["code"] == 1
+    assert r["status"] == "failed"
     assert calls == []

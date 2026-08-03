@@ -12,7 +12,8 @@ import time
 from datetime import datetime, time as dtime
 from typing import Any, Optional
 
-from . import config
+from . import config, contract
+from .ths.rows import ST_CANCELED, ST_FILLED, ST_PARTIAL, ST_REJECTED, is_in_flight
 
 logger = logging.getLogger(__name__)
 
@@ -20,15 +21,18 @@ IDLE_INTERVAL_DEFAULT = 300   # 空闲（无未完成委托）轮询周期：5 �
 ACTIVE_INTERVAL_DEFAULT = 60  # 有未完成委托挂着时提速：1 分钟（为及时抓成交）
 FRAME_TYPE = "order_event"
 
-# THS 真实表头（逐字）
+# 契约 v2 规范化后的键（不再是 THS 原始表头）。
+# 注意数据源：order_watch 读的是 orders_active_all（含终态），不是对外的
+# orders_active——后者按 C3 过滤掉终态行，用它会把 filled/canceled 事件全丢掉。
 COL_CODE = "证券代码"
-COL_OP = "操作"
+COL_OP = "方向"
 COL_ORDER_QTY = "委托数量"
-COL_ORDER_PRICE = "委托价格"
-COL_FILLED_QTY = "成交数量"
+COL_ORDER_PRICE = "委托价"
+COL_FILLED_QTY = "已成数量"
 COL_AVG_PRICE = "成交均价"
-COL_ENTRUST_NO = "合同编号"
-COL_NOTE = "备注"
+COL_ENTRUST_NO = "entrust_no"
+COL_STATE = "状态"
+COL_NOTE = "柜台备注"
 
 _MORNING = (dtime(9, 30), dtime(11, 30))
 _AFTERNOON = (dtime(13, 0), dtime(15, 0))
@@ -50,23 +54,24 @@ def _to_int(value: Any) -> int:
 
 
 def build_snapshot(active_result: Optional[dict]) -> dict[str, dict]:
-    """把 orders_active 返回解析为 {合同编号: order_state}。code!=0/空 → {}。"""
+    """把 orders_active_all 返回解析为 {entrust_no: order_state}。非 succeed/空 → {}。"""
     snap: dict[str, dict] = {}
-    if not active_result or active_result.get("code") != 0:
+    if not contract.is_succeed(active_result or {}):
         return snap
-    for row in active_result.get("data", []) or []:
-        eno = (row.get(COL_ENTRUST_NO) or "").strip()
+    for row in (active_result.get("data") or []):
+        eno = str(row.get(COL_ENTRUST_NO) or "").strip()
         if not eno:
             continue
         snap[eno] = {
             "entrust_no": eno,
-            "stock_no": (row.get(COL_CODE) or "").strip(),
-            "op": (row.get(COL_OP) or "").strip(),
+            "stock_no": row.get(COL_CODE) or "",
+            "op": row.get(COL_OP) or "",
             "order_qty": _to_int(row.get(COL_ORDER_QTY)),
-            "order_price": (row.get(COL_ORDER_PRICE) or "").strip(),
+            "order_price": row.get(COL_ORDER_PRICE),
             "filled_qty": _to_int(row.get(COL_FILLED_QTY)),
-            "avg_price": (row.get(COL_AVG_PRICE) or "").strip(),
-            "note": (row.get(COL_NOTE) or "").strip(),
+            "avg_price": row.get(COL_AVG_PRICE),
+            "state": row.get(COL_STATE) or "未知",
+            "note": row.get(COL_NOTE) or "",
         }
     return snap
 
@@ -76,11 +81,12 @@ def _is_full(o: dict) -> bool:
 
 
 def _classify_new(o: dict) -> str:
-    if "已撤" in o["note"]:
+    # 状态取自契约枚举（由柜台备注结构化而来），不再在这里做二次文本匹配。
+    if o.get("state") in (ST_CANCELED, ST_REJECTED):
         return "canceled"
-    if _is_full(o):
+    if o.get("state") == ST_FILLED or _is_full(o):
         return "filled"
-    if o["filled_qty"] > 0:
+    if o.get("state") == ST_PARTIAL or o["filled_qty"] > 0:
         return "partially_filled"
     return "placed"
 
@@ -110,7 +116,8 @@ def diff_snapshots(prev: dict[str, dict], cur: dict[str, dict],
         if before is None:
             events.append(_make_event(_classify_new(o), o, agent_entrust_nos))
             continue
-        if "已撤" in o["note"] and "已撤" not in before["note"]:
+        if (o.get("state") in (ST_CANCELED, ST_REJECTED)
+                and before.get("state") not in (ST_CANCELED, ST_REJECTED)):
             events.append(_make_event("canceled", o, agent_entrust_nos))
             continue
         if o["filled_qty"] > before["filled_qty"]:
@@ -120,12 +127,8 @@ def diff_snapshots(prev: dict[str, dict], cur: dict[str, dict],
 
 
 def _is_open(o: dict) -> bool:
-    """该委托是否仍未完成（可能继续成交）。"""
-    if "已撤" in o["note"] or "已成" in o["note"]:
-        return False
-    if o["order_qty"] > 0 and o["filled_qty"] >= o["order_qty"]:
-        return False
-    return True
+    """该委托是否仍未完成（可能继续成交）。与 orders_active 的在飞判据同源。"""
+    return is_in_flight(o.get("state") or "未知", o["order_qty"], o["filled_qty"])
 
 
 def next_interval(snapshot: dict, idle_secs: int, active_secs: int) -> int:
@@ -136,8 +139,9 @@ def next_interval(snapshot: dict, idle_secs: int, active_secs: int) -> int:
 async def _poll_once(backend, client, prev: Optional[dict], seq: int) -> tuple[Optional[dict], int, bool]:
     """单轮：取委托快照 → diff → 发帧。返回 (new_prev, new_seq, ok)。"""
     async with backend.win_lock:
-        active = await backend.orders_active()
-    if not active or active.get("code") != 0:
+        # 全量表（含终态）：终态行正是 filled/canceled 事件的来源。
+        active = await backend.orders_active_all()
+    if not contract.is_succeed(active or {}):
         return prev, seq, False                      # 未绑定/验证码/读失败 → 跳过本轮
     cur = build_snapshot(active)
     if prev is None:
