@@ -30,3 +30,30 @@ def test_shared_state_self_update_fields_roundtrip():
     assert snap["self_update_info"].latest_version == "0.6.0"
     assert snap["self_update_progress"] == (10, 100)
     assert snap["self_update_status"] == "downloading"
+
+
+def test_shared_state_ocr_fields_roundtrip():
+    from trader.main_window import SharedState
+
+    state = SharedState()
+    assert state.snapshot()["ocr_status"] == "checking"
+
+    state.update(ocr_status="unavailable", ocr_message="自动安装失败")
+    snap = state.snapshot()
+
+    assert snap["ocr_status"] == "unavailable"
+    assert snap["ocr_message"] == "自动安装失败"
+
+
+def test_display_path_keeps_drive_and_executable_name():
+    from trader.main_window import _display_path
+
+    path = r"C:\同花顺软件\同花顺\very-long-folder-name\xiadan.exe"
+
+    assert _display_path(path, max_chars=26) == r"C:\...\xiadan.exe"
+
+
+def test_display_path_leaves_short_paths_unchanged():
+    from trader.main_window import _display_path
+
+    assert _display_path(r"C:\ths\xiadan.exe") == r"C:\ths\xiadan.exe"

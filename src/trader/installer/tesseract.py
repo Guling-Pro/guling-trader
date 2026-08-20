@@ -37,6 +37,15 @@ def detect_tesseract() -> Optional[str]:
     - 具体路径 → 在固定安装目录命中
     - ``None`` → 未安装
     """
+    try:
+        from .. import config
+
+        manual = config.load().tesseract_path_manual
+        if manual and Path(manual).is_file():
+            return manual
+    except Exception:
+        logger.debug("读取手动 Tesseract 路径失败", exc_info=True)
+
     if shutil.which("tesseract"):
         return ""
     for p in TESSERACT_COMMON_PATHS:
@@ -81,11 +90,11 @@ async def ensure_tesseract(
         return existing
 
     if not shutil.which("winget"):
-        log("⚠ 未找到 winget，无法自动安装 Tesseract（手动：winget install "
-            f"{WINGET_PACKAGE_ID}）")
+        log("⚠ 未找到 winget，无法自动安装 Tesseract。请选择本地 tesseract.exe，"
+            f"或手动运行：winget install -e --id {WINGET_PACKAGE_ID}")
         return None
 
-    log("正在通过 winget 安装 Tesseract OCR（首次约 1-2 分钟）...")
+    log("正在通过 winget 后台尝试安装 Tesseract OCR；不影响连接和窗口检测...")
     cmd = [
         "winget", "install", "-e", "--id", WINGET_PACKAGE_ID,
         "--silent",
@@ -117,9 +126,14 @@ async def ensure_tesseract(
             return found
         await asyncio.sleep(1.5)
 
-    # 仍没有：多半是 winget 静默安装需要管理员权限（UB-Mannheim 是 per-machine 装），
-    # 无提权时静默失败。明确引导手动安装。
-    log(f"⚠ Tesseract 自动安装未成功（winget rc={rc}）。请用【管理员】PowerShell 运行："
-        f"winget install -e --id {WINGET_PACKAGE_ID}  装好后重启 trader。"
-        "（在此之前下单验证码需手动输入）")
+    unsigned_rc = (rc or 0) & 0xFFFFFFFF
+    code = f"0x{unsigned_rc:08X}"
+    if "InternetOpenUrl() failed" in out or unsigned_rc == 0x80072EE2:
+        reason = "下载 GitHub 安装包超时，请检查虚拟机网络，或选择本地 tesseract.exe"
+    elif unsigned_rc == 0xC000013A:
+        reason = "安装进程已中断"
+    else:
+        reason = "winget 未完成安装"
+    log(f"⚠ Tesseract 自动安装失败（{code}）：{reason}。"
+        "OCR 已跳过，不影响连接和交易窗口检测。")
     return None
