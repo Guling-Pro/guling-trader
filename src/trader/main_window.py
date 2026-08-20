@@ -28,6 +28,20 @@ def _format_pair_code(code: Optional[str]) -> str:
     return code or ""
 
 
+def _display_path(path: Optional[str], max_chars: int = 42) -> str:
+    """在紧凑状态栏展示路径，保留盘符和可执行文件名。"""
+    if not path or len(path) <= max_chars:
+        return path or ""
+
+    normalized = path.replace("/", "\\")
+    filename = normalized.rsplit("\\", 1)[-1]
+    prefix = normalized[:3] if len(normalized) >= 3 and normalized[1:3] == ":\\" else ""
+    compact = f"{prefix}...\\{filename}"
+    if len(compact) <= max_chars:
+        return compact
+    return f"...{filename[-(max_chars - 3):]}"
+
+
 @dataclass
 class SharedState:
     """主线程 + asyncio 线程共享状态。需要 lock 才能安全修改。"""
@@ -168,9 +182,9 @@ class MainWindow:
             except Exception as e:
                 logger.debug("set window iconbitmap failed: %s", e)
 
-        # 宽几何排版设计，锁定最小宽高
-        self.root.geometry("740x480+200+200")
-        self.root.minsize(700, 420)
+        # 两栏都有常用操作，给右栏保留足够的按钮和状态文字宽度。
+        self.root.geometry("900x620+160+120")
+        self.root.minsize(820, 540)
 
         # Windows + tray 可用时：关闭按钮最小化到托盘；否则真退出
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -243,9 +257,9 @@ class MainWindow:
         self._self_update_rendered = None  # 记录上次渲染的 (status, version)，避免每帧重排闪烁
 
         # ==========================================
-        # 【左分栏】MCP 网关连接与监控舱 (固定宽 300px)
+        # 【左分栏】MCP 网关连接与监控舱 (固定宽 330px)
         # ==========================================
-        left_frame = tk.Frame(main_pane, bg="#f6f8fa", width=310)
+        left_frame = tk.Frame(main_pane, bg="#f6f8fa", width=330)
         self.left_frame = left_frame  # 供自更新横幅 pack(before=...) 稳定定位
         left_frame.pack(side="left", fill="both", padx=(12, 6), pady=(12, 4))
         left_frame.pack_propagate(False)  # 强制宽度锁定
@@ -416,26 +430,28 @@ class MainWindow:
         for s_idx in range(1, 4):
             step_frame = tk.Frame(self.ths_wizard_box, bg="#ffffff")
             step_frame.pack(fill="x", pady=3)
+            step_title_row = tk.Frame(step_frame, bg="#ffffff")
+            step_title_row.pack(fill="x")
 
             # 圆圈样式标签
             circle = tk.Label(
-                step_frame, text=str(s_idx), bg="#fafbfc", fg="#57606a",
+                step_title_row, text=str(s_idx), bg="#fafbfc", fg="#57606a",
                 bd=1, relief="solid", font=("Helvetica", 8, "bold"),
                 width=2, height=1
             )
             circle.pack(side="left", padx=(0, 8))
 
             text_lbl = tk.Label(
-                step_frame, text=step_names[s_idx - 1], bg="#ffffff", fg="#24292f",
+                step_title_row, text=step_names[s_idx - 1], bg="#ffffff", fg="#24292f",
                 font=("Helvetica", 9)
             )
             text_lbl.pack(side="left")
 
             hint_lbl = tk.Label(
                 step_frame, text="", bg="#ffffff", fg="#e67e22",
-                font=("Helvetica", 9)
+                font=("Helvetica", 9), anchor="w", justify="left", wraplength=400,
             )
-            hint_lbl.pack(side="left", padx=8)
+            hint_lbl.pack(fill="x", padx=(30, 0), pady=(2, 0))
 
             self.ths_steps_display.append({
                 "step_num": s_idx,
@@ -468,22 +484,25 @@ class MainWindow:
         )
         self.change_path_btn.pack(side="right")
 
-        # 同花顺卡片操作底部 row
+        # 同花顺卡片操作区：操作与状态分行，避免窄屏时互相挤压。
         self.ths_action_footer_row = tk.Frame(self.ths_body, bg="#ffffff")
         self.ths_action_footer_row.pack(fill="x", pady=(8, 0))
 
         sep = tk.Frame(self.ths_action_footer_row, height=1, bg="#f0f2f5")
         sep.pack(fill="x", side="top", pady=(0, 6))
 
+        self.ths_action_buttons_row = tk.Frame(self.ths_action_footer_row, bg="#ffffff")
+        self.ths_action_buttons_row.pack(fill="x")
+
         self.open_ths_btn = tk.Button(
-            self.ths_action_footer_row, text="启动并打开同花顺", command=self._open_xiadan,
+            self.ths_action_buttons_row, text="启动并打开同花顺", command=self._open_xiadan,
             relief="flat", bg="#b8913b", fg="#ffffff", font=("Helvetica", 9, "bold"),
             padx=12, pady=4, cursor="hand2", bd=0
         )
         self.open_ths_btn.pack(side="left")
 
         self.pick_xiadan_btn = tk.Button(
-            self.ths_action_footer_row, text="选择 xiadan.exe...", command=self._pick_xiadan_path,
+            self.ths_action_buttons_row, text="选择 xiadan.exe...", command=self._pick_xiadan_path,
             relief="flat", bg="#ffffff", fg="#0969da", font=("Helvetica", 8),
             padx=8, pady=3, cursor="hand2", bd=0,
             highlightbackground="#d0d7de", highlightthickness=1,
@@ -491,7 +510,7 @@ class MainWindow:
         self.pick_xiadan_btn.pack(side="left", padx=(8, 0))
 
         self.redetect_xiadan_btn = tk.Button(
-            self.ths_action_footer_row, text="重新检测", command=self._redetect_xiadan,
+            self.ths_action_buttons_row, text="重新检测", command=self._redetect_xiadan,
             relief="flat", bg="#ffffff", fg="#57606a", font=("Helvetica", 8),
             padx=8, pady=3, cursor="hand2", bd=0,
             highlightbackground="#d0d7de", highlightthickness=1,
@@ -500,17 +519,22 @@ class MainWindow:
 
         self.ths_action_hint = tk.Label(
             self.ths_action_footer_row, text="未启动，请点击唤起客户端",
-            bg="#ffffff", fg="#57606a", font=("Helvetica", 9)
+            bg="#ffffff", fg="#57606a", font=("Helvetica", 9), anchor="w", justify="left",
+            wraplength=400,
         )
-        self.ths_action_hint.pack(side="right")
+        self.ths_action_hint.pack(fill="x", pady=(6, 0))
 
         self.ocr_status_row = tk.Frame(self.ths_body, bg="#ffffff")
         self.ocr_status_row.pack(fill="x", pady=(8, 0))
         self.ocr_status_label = tk.Label(
             self.ocr_status_row, text="OCR: 检查中", bg="#ffffff", fg="#57606a",
-            font=("Helvetica", 8), anchor="w",
+            font=("Helvetica", 8), anchor="w", justify="left",
         )
-        self.ocr_status_label.pack(side="left", fill="x", expand=True)
+        self.ocr_status_label.pack(fill="x")
+        self.ocr_status_row.bind(
+            "<Configure>",
+            lambda event: self.ocr_status_label.config(wraplength=max(260, event.width - 2)),
+        )
         self.pick_tesseract_btn = tk.Button(
             self.ocr_status_row, text="选择本地 Tesseract...", command=self._pick_tesseract_path,
             relief="flat", bg="#ffffff", fg="#0969da", font=("Helvetica", 8),
@@ -706,7 +730,7 @@ class MainWindow:
                     self.ths_ready_box.pack(fill="x", pady=4)
                 
                 if snap.get("xiadan_path"):
-                    self.ths_done_path_label.config(text=snap["xiadan_path"])
+                    self.ths_done_path_label.config(text=_display_path(snap["xiadan_path"]))
                 self.ths_action_hint.config(text="✓ 客户端自检就绪", fg="#00c800")
             else:
                 self.ths_status_badge.config(text="等待启动 ⏳", bg="#fffbe6", fg="#e67e22")
@@ -757,7 +781,7 @@ class MainWindow:
         )
         if ocr_status in ("installing", "unavailable"):
             if not self.pick_tesseract_btn.winfo_ismapped():
-                self.pick_tesseract_btn.pack(side="right")
+                self.pick_tesseract_btn.pack(anchor="w", pady=(4, 0))
         elif self.pick_tesseract_btn.winfo_ismapped():
             self.pick_tesseract_btn.pack_forget()
 

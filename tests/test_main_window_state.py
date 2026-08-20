@@ -43,3 +43,17 @@ def test_shared_state_ocr_fields_roundtrip():
 
     assert snap["ocr_status"] == "unavailable"
     assert snap["ocr_message"] == "自动安装失败"
+
+
+def test_display_path_keeps_drive_and_executable_name():
+    from trader.main_window import _display_path
+
+    path = r"C:\同花顺软件\同花顺\very-long-folder-name\xiadan.exe"
+
+    assert _display_path(path, max_chars=26) == r"C:\...\xiadan.exe"
+
+
+def test_display_path_leaves_short_paths_unchanged():
+    from trader.main_window import _display_path
+
+    assert _display_path(r"C:\ths\xiadan.exe") == r"C:\ths\xiadan.exe"
