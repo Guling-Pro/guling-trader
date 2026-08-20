@@ -64,8 +64,8 @@ async def ensure_xiadan(
     确保 xiadan.exe 可用——纯检测，不自动下载。
 
     返回 None 时，调用方应该让用户：
-    - 点「下载同花顺」按钮 → 看 README 手动装
-    - 或点「指定路径...」→ 选 xiadan.exe 写到 config
+    - 选择本机已安装的 xiadan.exe 写到 config
+    - 或从同花顺官方渠道安装后重新检测
 
     历史：早期版本 (v0.2.0-v0.2.6) 这里走 ensure_private_install 自动下载 214MB
     + silent install。实测 HTTP 403（CDN 屏蔽）+ 同花顺 EULA 不允许第三方分发，
@@ -83,7 +83,7 @@ async def ensure_xiadan(
         ))
         return detected
 
-    logger.info("未检测到 xiadan——等用户在 UI 点「下载同花顺」或「指定路径」")
+    logger.info("未检测到 xiadan——等待用户选择路径或完成官方安装后重新检测")
     return None
 
 

@@ -54,6 +54,21 @@ def test_found_in_common_path_skips_winget(monkeypatch, tmp_path):
     assert result == str(fake_exe)
 
 
+def test_manual_path_has_priority_over_path(monkeypatch, tmp_path):
+    manual_exe = tmp_path / "tesseract.exe"
+    manual_exe.write_text("x")
+    from trader import config
+
+    monkeypatch.setattr(
+        config,
+        "load",
+        lambda: config.TraderConfig(device_id="test", tesseract_path_manual=str(manual_exe)),
+    )
+    monkeypatch.setattr(tess.shutil, "which", lambda name: "C:/PATH/tesseract.exe")
+
+    assert tess.detect_tesseract() == str(manual_exe)
+
+
 def test_missing_and_no_winget_returns_none(monkeypatch):
     _force_windows(monkeypatch)
     # tesseract 未装、winget 也不存在
@@ -104,6 +119,20 @@ def test_winget_runs_but_still_missing_returns_none(monkeypatch):
     monkeypatch.setattr(tess.asyncio, "create_subprocess_exec", fake_subprocess)
     result = asyncio.run(tess.ensure_tesseract())
     assert result is None
+
+
+def test_winget_timeout_explains_local_fallback(monkeypatch):
+    _force_windows(monkeypatch)
+    monkeypatch.setattr(tess.shutil, "which", lambda name: "C:/winget.exe" if name == "winget" else None)
+    monkeypatch.setattr(tess, "TESSERACT_COMMON_PATHS", [])
+
+    async def fake_subprocess(*args, **kwargs):
+        return _FakeProc(out=b"InternetOpenUrl() failed.", rc=-2147012894)
+
+    monkeypatch.setattr(tess.asyncio, "create_subprocess_exec", fake_subprocess)
+    logs = []
+    assert asyncio.run(tess.ensure_tesseract(on_log=logs.append)) is None
+    assert any("超时" in message and "本地" in message for message in logs)
 
 
 def test_non_windows_returns_none(monkeypatch):

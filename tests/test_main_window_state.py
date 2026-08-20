@@ -30,3 +30,16 @@ def test_shared_state_self_update_fields_roundtrip():
     assert snap["self_update_info"].latest_version == "0.6.0"
     assert snap["self_update_progress"] == (10, 100)
     assert snap["self_update_status"] == "downloading"
+
+
+def test_shared_state_ocr_fields_roundtrip():
+    from trader.main_window import SharedState
+
+    state = SharedState()
+    assert state.snapshot()["ocr_status"] == "checking"
+
+    state.update(ocr_status="unavailable", ocr_message="自动安装失败")
+    snap = state.snapshot()
+
+    assert snap["ocr_status"] == "unavailable"
+    assert snap["ocr_message"] == "自动安装失败"

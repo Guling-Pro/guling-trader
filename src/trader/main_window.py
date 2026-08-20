@@ -40,6 +40,8 @@ class SharedState:
     last_pong_at: Optional[float] = None
     fatal_reason: Optional[str] = None
     install_progress: Optional[tuple[int, int]] = None  # (done, total)
+    ocr_status: str = "checking"  # checking | installing | ready | unavailable
+    ocr_message: str = ""
     self_update_info: Optional[UpdateInfo] = None  # 检测到的新版本信息，None=无更新
     self_update_progress: Optional[tuple[int, int]] = None  # (done, total)
     self_update_status: str = "idle"  # idle | downloading | error
@@ -67,6 +69,8 @@ class SharedState:
                 "last_pong_at": self.last_pong_at,
                 "fatal_reason": self.fatal_reason,
                 "install_progress": self.install_progress,
+                "ocr_status": self.ocr_status,
+                "ocr_message": self.ocr_message,
                 "ths_steps_complete": self.ths_steps_complete,
                 "ths_expanded": self.ths_expanded,
                 "ths_refreshing": self.ths_refreshing,
@@ -124,6 +128,7 @@ class MainWindow:
         on_exit: Optional[Callable[[], None]] = None,
         on_redetect_xiadan: Optional[Callable[[], None]] = None,
         on_set_xiadan_path: Optional[Callable[[str], None]] = None,
+        on_set_tesseract_path: Optional[Callable[[str], None]] = None,
         on_apply_self_update: Optional[Callable[[], None]] = None,
         minimize_to_tray: bool = False,
     ):
@@ -133,6 +138,7 @@ class MainWindow:
         self.on_exit_cb = on_exit
         self.on_redetect_xiadan = on_redetect_xiadan
         self.on_set_xiadan_path = on_set_xiadan_path
+        self.on_set_tesseract_path = on_set_tesseract_path
         self.on_apply_self_update = on_apply_self_update
         self._minimize_to_tray = minimize_to_tray
 
@@ -476,11 +482,41 @@ class MainWindow:
         )
         self.open_ths_btn.pack(side="left")
 
+        self.pick_xiadan_btn = tk.Button(
+            self.ths_action_footer_row, text="选择 xiadan.exe...", command=self._pick_xiadan_path,
+            relief="flat", bg="#ffffff", fg="#0969da", font=("Helvetica", 8),
+            padx=8, pady=3, cursor="hand2", bd=0,
+            highlightbackground="#d0d7de", highlightthickness=1,
+        )
+        self.pick_xiadan_btn.pack(side="left", padx=(8, 0))
+
+        self.redetect_xiadan_btn = tk.Button(
+            self.ths_action_footer_row, text="重新检测", command=self._redetect_xiadan,
+            relief="flat", bg="#ffffff", fg="#57606a", font=("Helvetica", 8),
+            padx=8, pady=3, cursor="hand2", bd=0,
+            highlightbackground="#d0d7de", highlightthickness=1,
+        )
+        self.redetect_xiadan_btn.pack(side="left", padx=(6, 0))
+
         self.ths_action_hint = tk.Label(
             self.ths_action_footer_row, text="未启动，请点击唤起客户端",
             bg="#ffffff", fg="#57606a", font=("Helvetica", 9)
         )
         self.ths_action_hint.pack(side="right")
+
+        self.ocr_status_row = tk.Frame(self.ths_body, bg="#ffffff")
+        self.ocr_status_row.pack(fill="x", pady=(8, 0))
+        self.ocr_status_label = tk.Label(
+            self.ocr_status_row, text="OCR: 检查中", bg="#ffffff", fg="#57606a",
+            font=("Helvetica", 8), anchor="w",
+        )
+        self.ocr_status_label.pack(side="left", fill="x", expand=True)
+        self.pick_tesseract_btn = tk.Button(
+            self.ocr_status_row, text="选择本地 Tesseract...", command=self._pick_tesseract_path,
+            relief="flat", bg="#ffffff", fg="#0969da", font=("Helvetica", 8),
+            padx=8, pady=3, cursor="hand2", bd=0,
+            highlightbackground="#d0d7de", highlightthickness=1,
+        )
 
         # 右分栏底部：退出程序排版
         right_footer = tk.Frame(right_frame, bg="#f6f8fa")
@@ -706,6 +742,25 @@ class MainWindow:
                         circle.config(text=str(s_num), bg="#fafbfc", fg="#999999", highlightbackground="#d0d7de")
                         hint.config(text="")
 
+        # 3. OCR 状态与离线恢复入口
+        ocr_status = snap.get("ocr_status", "checking")
+        ocr_message = snap.get("ocr_message", "")
+        ocr_text = {
+            "checking": "OCR: 检查中",
+            "installing": "OCR: 后台安装中（不影响连接）",
+            "ready": "OCR: 已就绪",
+            "unavailable": "OCR: 不可用（验证码与自选股识别不可用）",
+        }.get(ocr_status, "OCR: 状态未知")
+        self.ocr_status_label.config(
+            text=f"{ocr_text}{f' - {ocr_message}' if ocr_message else ''}",
+            fg="#00a35a" if ocr_status == "ready" else "#e67e22" if ocr_status == "installing" else "#cf222e" if ocr_status == "unavailable" else "#57606a",
+        )
+        if ocr_status in ("installing", "unavailable"):
+            if not self.pick_tesseract_btn.winfo_ismapped():
+                self.pick_tesseract_btn.pack(side="right")
+        elif self.pick_tesseract_btn.winfo_ismapped():
+            self.pick_tesseract_btn.pack_forget()
+
         # 3. 自更新提示横幅状态自适应
         update_info = snap.get("self_update_info")
         update_status = snap.get("self_update_status", "idle")
@@ -796,6 +851,28 @@ class MainWindow:
             self.on_set_xiadan_path(path)
         else:
             self.state.log(f"⚠ 路径设置回调未注册（选了 {path}）")
+
+    def _redetect_xiadan(self) -> None:
+        if self.on_redetect_xiadan:
+            self.on_redetect_xiadan()
+        else:
+            self.state.log("⚠ 重新检测：未注册回调")
+
+    def _pick_tesseract_path(self) -> None:
+        """选择离线安装或解压后的 tesseract.exe。"""
+        from tkinter import filedialog
+
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="选择 tesseract.exe",
+            filetypes=[("tesseract.exe", "tesseract.exe"), ("所有 exe", "*.exe"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        if self.on_set_tesseract_path:
+            self.on_set_tesseract_path(path)
+        else:
+            self.state.log(f"⚠ Tesseract 路径设置回调未注册（选了 {path}）")
 
     def _on_footer_link_click(self, event=None) -> None:
         """官网链接点击处理"""

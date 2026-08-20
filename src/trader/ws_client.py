@@ -205,7 +205,11 @@ class WsClient:
                         logger.error("握手失败：%s", result.error)
                         self._set_state(ConnectionState.UNPAIRED)
                         if result.should_clear_config:
-                            config.save(config.TraderConfig(device_id=cfg.device_id))
+                            latest_cfg = config.load()
+                            latest_cfg.agent_token = None
+                            latest_cfg.account_name = None
+                            latest_cfg.paired_at = None
+                            config.save(latest_cfg)
                         # 握手失败（如网络、服务不可用）退避 5 秒重试
                         await asyncio.sleep(5)
                         continue
@@ -316,7 +320,10 @@ class WsClient:
             if reason in ("token_invalid", "account_removed"):
                 cfg = config.load()
                 logger.warning("Token 失效或账户已移除，清空本地 agent_token 配置...")
-                config.save(config.TraderConfig(device_id=cfg.device_id))
+                cfg.agent_token = None
+                cfg.account_name = None
+                cfg.paired_at = None
+                config.save(cfg)
                 
             raise SessionRejectedException(reason)
 

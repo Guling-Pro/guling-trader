@@ -13,6 +13,7 @@ class TraderConfig:
     account_name: Optional[str] = None
     paired_at: Optional[str] = None
     xiadan_path_manual: Optional[str] = None  # 用户手动指定的 xiadan.exe 路径
+    tesseract_path_manual: Optional[str] = None  # 用户手动指定的 tesseract.exe 路径
     ws_endpoint: Optional[str] = None  # 自定义中转地址：只填域名或 IP[:端口]，协议和路径自动补全
     enable_ths_plugin: bool = True  # 是否启用同花顺实盘交易插件，默认启用
     order_watch_idle_secs: int = 300   # order_watch 空闲轮询周期（秒）：默认 5 分钟
@@ -74,6 +75,7 @@ def load() -> TraderConfig:
             account_name=data.get("account_name"),
             paired_at=data.get("paired_at"),
             xiadan_path_manual=data.get("xiadan_path_manual"),
+            tesseract_path_manual=data.get("tesseract_path_manual"),
             ws_endpoint=data.get("ws_endpoint"),
             enable_ths_plugin=data.get("enable_ths_plugin", True),
             order_watch_idle_secs=data.get("order_watch_idle_secs", 300),
@@ -95,6 +97,7 @@ def save(config: TraderConfig) -> None:
         "account_name": config.account_name,
         "paired_at": config.paired_at,
         "xiadan_path_manual": config.xiadan_path_manual,
+        "tesseract_path_manual": config.tesseract_path_manual,
         "ws_endpoint": config.ws_endpoint,
         "enable_ths_plugin": config.enable_ths_plugin,
         "order_watch_idle_secs": config.order_watch_idle_secs,
@@ -105,5 +108,4 @@ def save(config: TraderConfig) -> None:
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-
 

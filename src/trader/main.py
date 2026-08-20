@@ -285,30 +285,27 @@ async def _async_main(
     if platform.system() == "Windows" and bootstrap_result.found_xiadan_path:
         _check_xiadan_conflict(state)
 
-    # Step 3.5: 确保 Tesseract OCR 就绪（缺则 winget 静默安装），再喂给 OCR 后端。
-    # 旧架构在 server.py 启动时调 thsauto_setup(window_title, tesseract_cmd)；PH-061
-    # 迁到本仓库时这步丢了 → pytesseract 只认 PATH，验证码识别静默失效。这里恢复该
-    # setup 调用，并补上旧版没有的"自动安装"。None=没装→装；""=在 PATH；具体路径=已应用。
+    # Step 3.5: 先接通已有 OCR；缺失时的 winget 安装转为后台任务，绝不能阻塞
+    # xiadan 窗口检测或网关连接。None=未装；""=PATH；具体路径=已应用。
     if platform.system() == "Windows":
         try:
-            from .installer.tesseract import ensure_tesseract
+            from .installer.tesseract import verify_ocr_runnable
             from .ths.win import setup as ths_setup
             tesseract_cmd = bootstrap_result.found_tesseract_cmd
-            if tesseract_cmd is None:
-                tesseract_cmd = await ensure_tesseract(on_log=state.log)
-                bootstrap_result.found_tesseract_cmd = tesseract_cmd
             ths_setup("网上股票交易系统5.0", tesseract_cmd or "", str(trader_config.tmp_dir()))
             if tesseract_cmd is None:
-                state.log("⚠ Tesseract 仍不可用，下单验证码无法自动识别")
+                state.update(ocr_status="installing", ocr_message="正在后台尝试安装")
+                state.log("OCR 未安装，正在后台尝试安装；不影响连接和窗口检测")
             else:
-                # 启动自检：确认 OCR 真能跑，而不只是文件在。
-                from .installer.tesseract import verify_ocr_runnable
                 ocr_ok, ocr_info = verify_ocr_runnable()
                 if ocr_ok:
+                    state.update(ocr_status="ready", ocr_message=str(ocr_info))
                     state.log(f"✓ OCR 就绪（Tesseract {ocr_info}）")
                 else:
+                    state.update(ocr_status="unavailable", ocr_message="OCR 自检失败")
                     state.log(f"⚠ OCR 自检失败：{ocr_info}（下单验证码可能无法识别）")
         except Exception as e:
+            state.update(ocr_status="unavailable", ocr_message="OCR 初始化失败")
             logger.warning("Tesseract 准备失败: %s", e)
 
     # Step 4: WS 连接
@@ -372,6 +369,37 @@ async def _async_main(
     order_event_task = asyncio.create_task(order_watch.order_watch_task(state, client))
     from . import watchlist_watch
     watchlist_task = asyncio.create_task(watchlist_watch.watchlist_watch_task(state, client))
+    ocr_task = None
+    if platform.system() == "Windows" and bootstrap_result.found_tesseract_cmd is None:
+        async def _install_ocr_in_background() -> None:
+            try:
+                from .installer.tesseract import ensure_tesseract, verify_ocr_runnable
+                from .ths.win import setup as ths_setup
+
+                installed = await ensure_tesseract(on_log=state.log)
+                # 用户在安装期间已选择有效的离线程序时，保留其选择和当前状态。
+                if trader_config.load().tesseract_path_manual:
+                    return
+                if installed is None:
+                    state.update(ocr_status="unavailable", ocr_message="自动安装失败，可选择本地 tesseract.exe")
+                    return
+                ths_setup("网上股票交易系统5.0", installed, str(trader_config.tmp_dir()))
+                ok, info = verify_ocr_runnable()
+                if ok:
+                    bootstrap_result.found_tesseract_cmd = installed
+                    state.update(ocr_status="ready", ocr_message=str(info))
+                    state.log(f"✓ OCR 就绪（Tesseract {info}）")
+                else:
+                    state.update(ocr_status="unavailable", ocr_message="安装后自检失败")
+                    state.log(f"⚠ Tesseract 安装后自检失败：{info}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                state.update(ocr_status="unavailable", ocr_message="自动安装异常，可选择本地 tesseract.exe")
+                state.log(f"⚠ Tesseract 后台安装异常：{e}")
+                logger.exception("Tesseract 后台安装失败")
+
+        ocr_task = asyncio.create_task(_install_ocr_in_background())
     try:
         await client.run()
     except asyncio.CancelledError:
@@ -385,7 +413,11 @@ async def _async_main(
         order_event_task.cancel()
         watchlist_task.cancel()
         try:
-            await asyncio.gather(polling_task, refresh_task, order_event_task, watchlist_task, return_exceptions=True)
+            tasks = [polling_task, refresh_task, order_event_task, watchlist_task]
+            if ocr_task is not None:
+                ocr_task.cancel()
+                tasks.append(ocr_task)
+            await asyncio.gather(*tasks, return_exceptions=True)
         except Exception:
             pass
 
@@ -597,7 +629,7 @@ def run() -> None:
             except Exception as e:
                 state.log(f"⚠ 启动同花顺失败: {e}")
         else:
-            state.log("⚠ xiadan 路径未知。先点「指定路径...」选 xiadan.exe，或「下载同花顺」装一份")
+            state.log("⚠ xiadan 路径未知。请选择 xiadan.exe，或从同花顺官方渠道安装后重新检测。")
 
     def on_redetect_xiadan() -> None:
         """重新检测 xiadan 路径"""
@@ -611,7 +643,7 @@ def run() -> None:
                 state.log(f"✓ 重新检测命中：{found}")
             else:
                 state.update(xiadan_path=None)
-                state.log("⚠ 重新检测未找到 xiadan。点「下载同花顺」或「指定路径...」")
+                state.log("⚠ 重新检测未找到 xiadan。请选择 xiadan.exe，或确认已从同花顺官方渠道安装。")
         except Exception as e:
             state.log(f"⚠ 检测异常: {e}")
 
@@ -636,6 +668,32 @@ def run() -> None:
             state.log(f"✓ 已设置 xiadan 路径：{p}")
         except Exception as e:
             state.log(f"⚠ 设置路径失败: {e}")
+
+    def on_set_tesseract_path(path: str) -> None:
+        """接入用户离线提供的 tesseract.exe，并立即验证。"""
+        try:
+            from pathlib import Path as _P
+            from .installer.tesseract import verify_ocr_runnable
+            from .ths.win import setup as ths_setup
+
+            p = _P(path)
+            if not p.is_file():
+                state.log(f"⚠ 指定的 Tesseract 路径不是文件：{path}")
+                return
+            ths_setup("网上股票交易系统5.0", str(p), str(trader_config.tmp_dir()))
+            ok, info = verify_ocr_runnable()
+            if not ok:
+                state.update(ocr_status="unavailable", ocr_message="所选程序无法运行")
+                state.log(f"⚠ 所选 Tesseract 无法运行：{info}")
+                return
+            result.config.tesseract_path_manual = str(p)
+            trader_config.save(result.config)
+            bootstrap_result.found_tesseract_cmd = str(p)
+            state.update(ocr_status="ready", ocr_message=str(info))
+            state.log(f"✓ 已设置本地 Tesseract：{p}")
+        except Exception as e:
+            state.update(ocr_status="unavailable", ocr_message="设置本地 OCR 失败")
+            state.log(f"⚠ 设置 Tesseract 路径失败：{e}")
 
     def on_reset_pair() -> None:
         try:
@@ -722,6 +780,7 @@ def run() -> None:
         on_exit=on_main_exit,
         on_redetect_xiadan=on_redetect_xiadan,
         on_set_xiadan_path=on_set_xiadan_path,
+        on_set_tesseract_path=on_set_tesseract_path,
         on_apply_self_update=on_apply_self_update,
         minimize_to_tray=(platform.system() == "Windows"),
     )
