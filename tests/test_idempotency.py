@@ -66,10 +66,12 @@ class OrderBackend:
         self.degraded = False
         self.ledger = ledger
         self.submits = 0
+        self.client_order_ids: list[str] = []
         self._result = result or contract.ok({"entrust_no": "777"})
 
     async def buy(self, stock_no, amount, price, client_order_id):
         self.submits += 1
+        self.client_order_ids.append(client_order_id)
         return self._result
 
     async def orders_active(self):
@@ -79,10 +81,13 @@ class OrderBackend:
         return contract.ok([])
 
 
-def _buy(backend, coid, amount=100):
+def _buy(backend, coid=None, amount=100, rpc_id="x"):
+    params = {"stock_no": "600000", "amount": amount, "price": 8.1}
+    if coid is not None:
+        params["client_order_id"] = coid
     frame = {"type": "call", "id": "x", "method": "buy",
-             "params": {"stock_no": "600000", "amount": amount, "price": 8.1,
-                        "client_order_id": coid}}
+             "params": params}
+    frame["id"] = rpc_id
     return asyncio.run(dispatcher.handle_call(frame, backend))
 
 
@@ -130,14 +135,27 @@ def test_ledger_unavailable_rejects_order(tmp_path):
     assert reply["result"]["error"]["class"] == "ledger_unavailable"
 
 
-def test_order_without_coid_still_works(ledger):
-    """不传 coid 仍可下单（不享受幂等）——不强制，但契约里写明后果。"""
+def test_order_without_coid_uses_rpc_id_and_is_idempotent(ledger):
+    """调用方无需填写 coid；同 RPC id 重发仍只能提交一次。"""
     backend = OrderBackend(ledger)
-    frame = {"type": "call", "id": "x", "method": "buy",
-             "params": {"stock_no": "600000", "amount": 100, "price": 8.1}}
-    reply = asyncio.run(dispatcher.handle_call(frame, backend))
-    assert reply["ok"] is True
+    first = _buy(backend, rpc_id="auto-42")
+    second = _buy(backend, rpc_id="auto-42")
+
+    assert first["ok"] is True
     assert backend.submits == 1
+    assert backend.client_order_ids == ["rpc:buy:auto-42"]
+    assert first["result"]["data"]["client_order_id"] == "rpc:buy:auto-42"
+    assert second["result"]["data"]["idempotent_replay"] is True
+
+
+def test_order_without_rpc_id_is_rejected_before_submit(ledger):
+    backend = OrderBackend(ledger)
+    reply = _buy(backend, rpc_id=None)
+
+    assert reply["ok"] is False
+    assert reply["result"]["code"] == "invalid_params"
+    assert reply["result"]["data"]["submitted"] is False
+    assert backend.submits == 0
 
 
 # --- C5b query_order ---------------------------------------------------------

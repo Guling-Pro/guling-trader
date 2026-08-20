@@ -14,6 +14,19 @@ import asyncio
 from trader import contract, dispatcher
 
 
+class FakeLedger:
+    """普通路由测试只需模拟可用台账；幂等细节由 test_idempotency 覆盖。"""
+
+    def reserve(self, client_order_id, method, params):
+        return "new", None
+
+    def complete(self, client_order_id, receipt, entrust_no=None):
+        pass
+
+    def release(self, client_order_id):
+        pass
+
+
 class FakeBackend:
     """按方法名返回预置 result dict 的假后端。"""
 
@@ -22,6 +35,7 @@ class FakeBackend:
         self.calls = []
         self.win_lock = asyncio.Lock()
         self.agent_entrust_nos: set[str] = set()
+        self.ledger = FakeLedger()
 
     async def _run(self, name, *args):
         self.calls.append((name, args))

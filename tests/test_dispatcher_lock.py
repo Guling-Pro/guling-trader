@@ -2,6 +2,7 @@
 import asyncio
 
 from trader import contract, dispatcher
+from trader.order_ledger import OrderLedger
 
 
 class LockFakeBackend:
@@ -40,8 +41,9 @@ def test_window_methods_serialized_by_lock():
     assert backend.max_concurrent == 1  # 串行化：临界区任意时刻至多 1 个
 
 
-def test_buy_registers_entrust_no():
+def test_buy_registers_entrust_no(tmp_path):
     backend = LockFakeBackend()
+    backend.ledger = OrderLedger(tmp_path / "orders.db")
     frame = {"type": "call", "id": "b", "method": "buy",
              "params": {"stock_no": "600519", "amount": 100, "price": 1700.0}}
     reply = asyncio.run(dispatcher.handle_call(frame, backend))

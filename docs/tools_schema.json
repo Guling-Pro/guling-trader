@@ -88,7 +88,7 @@
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+            "description": "客户端订单 ID，**幂等键**。调用方无需填写：未传时受控端会由本次 RPC id 自动分配；同一 RPC id 重发只会下单一次。调用方也可显式传入，用于跨请求重试。该 id 不写入柜台，仅存于受控端台账，并在回执中回显。"
           }
         },
         "required": [
@@ -118,7 +118,7 @@
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+            "description": "客户端订单 ID，**幂等键**。调用方无需填写：未传时受控端会由本次 RPC id 自动分配；同一 RPC id 重发只会下单一次。调用方也可显式传入，用于跨请求重试。该 id 不写入柜台，仅存于受控端台账，并在回执中回显。"
           }
         },
         "required": [
@@ -140,7 +140,7 @@
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+            "description": "客户端订单 ID，**幂等键**。调用方无需填写：未传时受控端会由本次 RPC id 自动分配；同一 RPC id 重发只会下单一次。调用方也可显式传入，用于跨请求重试。该 id 不写入柜台，仅存于受控端台账，并在回执中回显。"
           }
         },
         "required": [

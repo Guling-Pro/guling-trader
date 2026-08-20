@@ -9,6 +9,7 @@
 import asyncio
 
 from trader import dispatcher
+from trader.order_ledger import OrderLedger
 
 
 class HangingBackend:
@@ -37,9 +38,10 @@ def _call(backend, method, params=None, **frame_extra):
     return asyncio.run(dispatcher.handle_call(frame, backend))
 
 
-def test_order_timeout_returns_unknown_not_bare_error(monkeypatch):
+def test_order_timeout_returns_unknown_not_bare_error(monkeypatch, tmp_path):
     monkeypatch.setattr(dispatcher, "CALL_TIMEOUT_SECS", 0.05)
     backend = HangingBackend()
+    backend.ledger = OrderLedger(tmp_path / "orders.db")
     reply = _call(backend, "sell", {"stock_no": "300458", "amount": 500})
     assert reply["ok"] is False
     assert reply["result"]["code"] == "submitted_unconfirmed"
@@ -62,9 +64,10 @@ def test_query_timeout_is_failed_not_unknown(monkeypatch):
     assert reply["result"]["code"] == "call_timeout"  # 查询超时是普通失败，不是「可能已提交」
 
 
-def test_lock_busy_instead_of_starvation(monkeypatch):
+def test_lock_busy_instead_of_starvation(monkeypatch, tmp_path):
     monkeypatch.setattr(dispatcher, "LOCK_TIMEOUT_SECS", 0.05)
     backend = HangingBackend()
+    backend.ledger = OrderLedger(tmp_path / "orders.db")
 
     async def drive():
         await backend.win_lock.acquire()  # 模拟持锁方被拖住

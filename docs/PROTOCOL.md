@@ -199,8 +199,8 @@ reply 帧本身仍是单层 `{type,id,ok,result|error}`；**`result` 一律是�
 
 * coid **不写入柜台**（同花顺委托无自定义字段），仅存于受控端本地台账（SQLite，
   保留 ≥5 交易日）。
-* **幂等**：`buy`/`sell`/`cancel` 传 coid 后，同 id 重复提交**绝不产生第二次提交**，
-  返回首次记录的回执；首次结果尚未落定时返回 `submitted_unconfirmed`——
+* **幂等**：`buy`/`sell`/`cancel` 未传 coid 时，受控端由本次 RPC `id` 自动派生；
+  同一 RPC `id` 重发或显式同 coid 重复提交**绝不产生第二次提交**，返回首次记录的回执；首次结果尚未落定时返回 `submitted_unconfirmed`——
   这是合法态，不是 bug（最危险那一刻台账自己也不知道结果）。
 * 同 id **不同参数** → `invalid_params` 拒绝执行（调用方 id 复用 bug，不静默）。
 * **台账不可用一律拒单**（`ledger_unavailable`），禁静默降级为无幂等下单。

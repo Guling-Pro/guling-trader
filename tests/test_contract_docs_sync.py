@@ -62,7 +62,7 @@ def test_query_order_is_exposed():
 def test_order_tools_document_idempotency(name):
     tool = next(t for t in SCHEMA["tools"] if t["name"] == name)
     desc = tool["inputSchema"]["properties"]["client_order_id"]["description"]
-    assert "幂等" in desc and "重发" in desc
+    assert "幂等" in desc and "重发" in desc and "自动分配" in desc
 
 
 def test_protocol_states_failed_is_not_not_submitted():
