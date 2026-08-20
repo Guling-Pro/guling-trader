@@ -184,9 +184,9 @@ AI 助手部分（Claude、Cursor 等）在任何系统都能跑；只需确保�
 | `orders_filled` | 当日已成交记录 | — |
 | `settlement` | 交割单查询 | `date_range`：近一周/近一月/近三月/近一年 |
 | `watchlist` | 读同花顺自选股代码（新版）| —（顶部第一屏，按同花顺习惯最新在顶部）|
-| `buy` | 买入（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单)；幂等 ID 默认由 RPC 自动分配 |
-| `sell` | 卖出（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单)；幂等 ID 默认由 RPC 自动分配 |
-| `cancel` | 撤销未成交单 | `entrust_no`；幂等 ID 默认由 RPC 自动分配 |
+| `buy` | 买入（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(可选) |
+| `sell` | 卖出（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(可选) |
+| `cancel` | 撤销未成交单 | `entrust_no` |
 
 > 未配对时仅暴露 `pair_with_code` 一个工具；完整帧协议（握手、call、reply、reject、心跳）见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
 

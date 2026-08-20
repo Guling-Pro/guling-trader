@@ -27,22 +27,6 @@ IDEMPOTENT_METHODS = {"buy", "sell", "cancel"}
 # busy 是背压信号：告诉调用方等多久再来，别让它自己猜（G3）。
 BUSY_BACKOFF_HINT_SECS = 3
 
-
-def _resolve_client_order_id(method: str, params: dict[str, Any], frame_id: Any) -> Optional[str]:
-    """返回调用方指定的幂等键，或由稳定 RPC id 派生一个。
-
-    MCP 调用方通常不会管理交易幂等键。网关会把原始 RPC ``id`` 原样转发，
-    因而以它派生的键能让同一 RPC 帧的重发命中同一条本地台账记录。没有
-    有效 RPC id 时绝不能随机生成，否则丢回执后的重发仍可能变成第二笔订单。
-    """
-    explicit = params.get("client_order_id")
-    if explicit is not None and str(explicit).strip():
-        return str(explicit).strip()
-    if isinstance(frame_id, bool) or frame_id is None:
-        return None
-    rpc_id = str(frame_id).strip()
-    return f"rpc:{method}:{rpc_id}" if rpc_id else None
-
 # Fallback tools schema in case the external JSON file cannot be found (e.g., in a packaged PyInstaller environment)
 FALLBACK_TOOLS_SCHEMA = {
   "$schema": "https://json-schema.org/draft/2020-12",
@@ -134,7 +118,7 @@ FALLBACK_TOOLS_SCHEMA = {
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**。调用方无需填写：未传时受控端会由本次 RPC id 自动分配；同一 RPC id 重发只会下单一次。调用方也可显式传入，用于跨请求重试。该 id 不写入柜台，仅存于受控端台账，并在回执中回显。"
+            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
           }
         },
         "required": [
@@ -164,7 +148,7 @@ FALLBACK_TOOLS_SCHEMA = {
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**。调用方无需填写：未传时受控端会由本次 RPC id 自动分配；同一 RPC id 重发只会下单一次。调用方也可显式传入，用于跨请求重试。该 id 不写入柜台，仅存于受控端台账，并在回执中回显。"
+            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
           }
         },
         "required": [
@@ -186,7 +170,7 @@ FALLBACK_TOOLS_SCHEMA = {
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**。调用方无需填写：未传时受控端会由本次 RPC id 自动分配；同一 RPC id 重发只会下单一次。调用方也可显式传入，用于跨请求重试。该 id 不写入柜台，仅存于受控端台账，并在回执中回显。"
+            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
           }
         },
         "required": [
@@ -448,55 +432,47 @@ async def handle_call(
     # 更不会走到点提交那一步。台账不可用一律拒单（需求方拍板：禁静默降级）。
     reserved_coid: Optional[str] = None
     if method in IDEMPOTENT_METHODS:
-        coid = _resolve_client_order_id(method, params, frame_id)
-        if coid is None:
-            msg = "订单请求缺少有效 RPC id，无法安全分配幂等键，已拒绝执行"
-            reply["ok"] = False
-            reply["result"] = contract.fail(contract.CODE_INVALID_PARAMS,
-                                            contract.CLS_INVALID_PARAMS, msg,
-                                            data={"submitted": False})
-            reply["error"] = msg
-            return reply
-        # 将自动分配的键写入这一请求的本地副本，确保台账、后端与回执使用同一值。
-        params = {**params, "client_order_id": coid}
-        led = _ledger_or_none(backend)
-        if led is None:
-            msg = ("下单台账不可用，已拒绝下单——无台账即无法保证 client_order_id 幂等，"
-                   "重发会造成重复下单。请检查受控端数据目录后重试")
-            reply["ok"] = False
-            reply["result"] = contract.fail(contract.CODE_LEDGER_UNAVAILABLE,
-                                            contract.CLS_LEDGER_UNAVAILABLE, msg)
-            reply["error"] = msg
-            return reply
-        try:
-            verdict, record = await asyncio.to_thread(led.reserve, coid, method, params)
-        except LedgerUnavailable as e:
-            msg = f"下单台账不可用，已拒绝下单（禁降级为无幂等下单）：{e}"
-            reply["ok"] = False
-            reply["result"] = contract.fail(contract.CODE_LEDGER_UNAVAILABLE,
-                                            contract.CLS_LEDGER_UNAVAILABLE, msg)
-            reply["error"] = msg
-            return reply
-        if verdict == "conflict":
-            msg = (f"client_order_id={coid} 已用于参数不同的委托，拒绝执行。"
-                   "同 id 必须对应同一笔委托——请换新 id，或用 query_order 查原单")
-            reply["ok"] = False
-            reply["result"] = contract.fail(contract.CODE_INVALID_PARAMS,
-                                            contract.CLS_INVALID_PARAMS, msg,
-                                            data={"submitted": False,
-                                                  "first_record": _record_brief(record)})
-            reply["error"] = msg
-            return reply
-        if verdict == "duplicate":
-            result = _replay_receipt(coid, record)
-            reply["ok"] = contract.is_succeed(result)
-            reply["result"] = result
-            if not reply["ok"]:
-                reply["error"] = (result.get("error") or {}).get("message") or "重复提交"
-            logger.info("[RPC] 幂等命中 coid=%s state=%s，未产生第二次提交",
-                        coid, (record or {}).get("state"))
-            return reply
-        reserved_coid = coid
+        coid = params.get("client_order_id")
+        if coid is not None:
+            coid = str(coid)
+            led = _ledger_or_none(backend)
+            if led is None:
+                msg = ("下单台账不可用，已拒绝下单——无台账即无法保证 client_order_id 幂等，"
+                       "重发会造成重复下单。请检查受控端数据目录后重试")
+                reply["ok"] = False
+                reply["result"] = contract.fail(contract.CODE_LEDGER_UNAVAILABLE,
+                                                contract.CLS_LEDGER_UNAVAILABLE, msg)
+                reply["error"] = msg
+                return reply
+            try:
+                verdict, record = await asyncio.to_thread(led.reserve, coid, method, params)
+            except LedgerUnavailable as e:
+                msg = f"下单台账不可用，已拒绝下单（禁降级为无幂等下单）：{e}"
+                reply["ok"] = False
+                reply["result"] = contract.fail(contract.CODE_LEDGER_UNAVAILABLE,
+                                                contract.CLS_LEDGER_UNAVAILABLE, msg)
+                reply["error"] = msg
+                return reply
+            if verdict == "conflict":
+                msg = (f"client_order_id={coid} 已用于参数不同的委托，拒绝执行。"
+                       "同 id 必须对应同一笔委托——请换新 id，或用 query_order 查原单")
+                reply["ok"] = False
+                reply["result"] = contract.fail(contract.CODE_INVALID_PARAMS,
+                                                contract.CLS_INVALID_PARAMS, msg,
+                                                data={"submitted": False,
+                                                      "first_record": _record_brief(record)})
+                reply["error"] = msg
+                return reply
+            if verdict == "duplicate":
+                result = _replay_receipt(coid, record)
+                reply["ok"] = contract.is_succeed(result)
+                reply["result"] = result
+                if not reply["ok"]:
+                    reply["error"] = (result.get("error") or {}).get("message") or "重复提交"
+                logger.info("[RPC] 幂等命中 coid=%s state=%s，未产生第二次提交",
+                            coid, (record or {}).get("state"))
+                return reply
+            reserved_coid = coid
 
     # 串行化 THS 单窗口访问：order_watch 轮询与下单/查询共用 backend.win_lock。
     # 拿锁带超时：持锁方若被弹窗/慢操作拖住，排队方不能无限饿死——回 busy
