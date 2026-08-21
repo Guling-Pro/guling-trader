@@ -44,6 +44,7 @@ CODE_PLUGIN_DISABLED = "plugin_disabled"
 CODE_INVALID_PARAMS = "invalid_params"
 CODE_LEDGER_UNAVAILABLE = "ledger_unavailable"         # 台账不可用 → 拒单，禁降级
 CODE_NOT_FOUND = "not_found"                           # query_order 查无此单
+CODE_CONFIRMATION_REQUIRED = "confirmation_required"   # 未登记订单须显式二次确认
 CODE_UNSUPPORTED_METHOD = "unsupported_method"
 CODE_INTERNAL_ERROR = "internal_error"
 CODE_ABORTED = "aborted"                               # 本笔已被超时作废（代次机制）
@@ -60,6 +61,7 @@ CLS_TABLE_MISMATCH = "table_mismatch"
 CLS_INVALID_PARAMS = "invalid_params"
 CLS_LEDGER_UNAVAILABLE = "ledger_unavailable"
 CLS_NOT_FOUND = "not_found"
+CLS_CONFIRMATION_REQUIRED = "confirmation_required"
 CLS_INTERNAL_ERROR = "internal_error"
 CLS_ABORTED = "aborted"
 # 第二层：柜台原文尽力映射——认不出即 unknown，绝不猜。
@@ -87,6 +89,7 @@ _BROKER_PATTERNS: tuple[tuple[tuple[str, ...], str], ...] = (
 NON_RETRYABLE_CLASSES = frozenset({
     CLS_UNKNOWN, CLS_UNKNOWN_OUTCOME, CLS_INSUFFICIENT_FUNDS, CLS_NO_PERMISSION,
     CLS_INVALID_QUANTITY, CLS_INVALID_PARAMS, CLS_LEDGER_UNAVAILABLE,
+    CLS_CONFIRMATION_REQUIRED,
 })
 
 

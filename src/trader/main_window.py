@@ -64,6 +64,7 @@ class SharedState:
     ths_refreshing: bool = False  # 配对码过期·正在刷新中
     agent_token: Optional[str] = None  # 永久凭证（仅 CONNECTED 时有用）
     enable_ths_plugin: bool = True  # 同花顺交易插件启用状态
+    external_cancel_confirmation: str = "two_step"
     log_messages: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=500))
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -90,6 +91,7 @@ class SharedState:
                 "ths_refreshing": self.ths_refreshing,
                 "agent_token": self.agent_token,
                 "enable_ths_plugin": self.enable_ths_plugin,
+                "external_cancel_confirmation": self.external_cancel_confirmation,
                 "self_update_info": self.self_update_info,
                 "self_update_progress": self.self_update_progress,
                 "self_update_status": self.self_update_status,
@@ -192,6 +194,7 @@ class MainWindow:
         # 载入初始插件偏好
         snap = self.state.snapshot()
         self.enable_ths_plugin = snap.get("enable_ths_plugin", True)
+        self.external_cancel_confirmation = snap.get("external_cancel_confirmation", "two_step")
 
         self._build_ui()
         self._schedule_poll()
@@ -542,6 +545,26 @@ class MainWindow:
             highlightbackground="#d0d7de", highlightthickness=1,
         )
 
+        self.external_cancel_confirmation_var = tk.BooleanVar(
+            master=self.root,
+            value=self.external_cancel_confirmation != "direct",
+        )
+        self.external_cancel_confirmation_check = tk.Checkbutton(
+            self.ths_body,
+            text="未登记订单撤单需二次确认",
+            variable=self.external_cancel_confirmation_var,
+            command=self._toggle_external_cancel_confirmation,
+            bg="#ffffff",
+            fg="#57606a",
+            activebackground="#ffffff",
+            activeforeground="#24292f",
+            font=("Helvetica", 8),
+            anchor="w",
+            padx=0,
+            pady=2,
+        )
+        self.external_cancel_confirmation_check.pack(fill="x", pady=(8, 0))
+
         # 右分栏底部：退出程序排版
         right_footer = tk.Frame(right_frame, bg="#f6f8fa")
         right_footer.pack(fill="x", side="bottom", pady=(10, 0))
@@ -643,6 +666,27 @@ class MainWindow:
         else:
             self.ths_switch_btn.config(text="已禁用 ⚪", fg="#57606a", bg="#fafbfc")
             self.ths_body.pack_forget()
+
+    def _toggle_external_cancel_confirmation(self) -> None:
+        """持久化未登记订单撤单的本地确认偏好。"""
+        mode = "two_step" if self.external_cancel_confirmation_var.get() else "direct"
+        try:
+            from . import config as _config
+
+            cfg = _config.load()
+            cfg.external_cancel_confirmation = mode
+            _config.save(cfg)
+            self.external_cancel_confirmation = mode
+            self.state.update(external_cancel_confirmation=mode)
+            self.state.log(
+                "[配置] 未登记订单撤单二次确认已"
+                + ("开启" if mode == "two_step" else "关闭")
+            )
+        except Exception as e:
+            self.external_cancel_confirmation_var.set(
+                self.external_cancel_confirmation != "direct"
+            )
+            self.state.log(f"⚠ 保存配置失败: {e}")
 
     def _schedule_poll(self) -> None:
         """tk after-loop 周期同步 SharedState → UI"""

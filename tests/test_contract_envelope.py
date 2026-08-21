@@ -48,6 +48,11 @@ def test_failed_does_not_mean_not_submitted():
     assert contract.CLS_UNKNOWN_OUTCOME in contract.NON_RETRYABLE_CLASSES
 
 
+def test_confirmation_required_is_not_an_automatic_retry_signal():
+    """二次确认必须由用户显式授权，通用重试器不能自行跨过这一步。"""
+    assert contract.CLS_CONFIRMATION_REQUIRED in contract.NON_RETRYABLE_CLASSES
+
+
 # --- C2 两层错误分类 ---------------------------------------------------------
 
 @pytest.mark.parametrize("text,expected", [

@@ -58,7 +58,7 @@ def test_query_order_is_exposed():
     assert "query_order" in {t["name"] for t in SCHEMA["tools"]}
 
 
-@pytest.mark.parametrize("name", ["buy", "sell", "cancel"])
+@pytest.mark.parametrize("name", ["buy", "sell", "cancel", "confirm_external_cancel"])
 def test_order_tools_document_idempotency(name):
     tool = next(t for t in SCHEMA["tools"] if t["name"] == name)
     prop = tool["inputSchema"]["properties"]["client_order_id"]

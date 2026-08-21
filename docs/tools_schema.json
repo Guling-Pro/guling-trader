@@ -156,6 +156,29 @@
       }
     },
     {
+      "name": "confirm_external_cancel",
+      "description": "确认撤销未登记订单。仅接受此前 cancel 回执给出的短时一次性 confirmation_token；确认前会再次核验合同号及证券代码、方向、委托价、委托数量仍一致且订单仍可撤。必须使用新的 client_order_id，令牌过期、已使用或订单变化时绝不执行撤单。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "confirmation_token": {
+            "type": "string",
+            "description": "此前 cancel 对未登记订单返回的短时一次性确认令牌"
+          },
+          "client_order_id": {
+            "type": "string",
+            "pattern": "^gl-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "description": "本次确认动作的新客户端订单 ID，必填幂等键，格式必须为 gl-<小写 UUID v7>；网络重发同一确认时必须原样复用，不能复用原 cancel 的 ID。"
+          }
+        },
+        "required": [
+          "confirmation_token",
+          "client_order_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
       "name": "switch_account",
       "description": "切换同花顺客户端当前活跃的资金账户（向 xiadan 窗口发送 Alt+N，N=账户在客户端账户下拉列表中的槽位序号）。仅在 xiadan 登录了多个账户时有意义。**盲切**：本工具不核验切换是否成功，受控端对账户身份无感知；切换后所有工具(查询/下单)都作用于新的当前账户。调用方必须紧接着用 balance/position 做指纹核对、确认账户无误后再继续操作。",
       "inputSchema": {

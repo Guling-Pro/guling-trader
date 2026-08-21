@@ -6,6 +6,21 @@ from pathlib import Path
 from typing import Optional
 
 
+EXTERNAL_CANCEL_CONFIRMATION_TWO_STEP = "two_step"
+EXTERNAL_CANCEL_CONFIRMATION_DIRECT = "direct"
+_EXTERNAL_CANCEL_CONFIRMATION_VALUES = frozenset({
+    EXTERNAL_CANCEL_CONFIRMATION_TWO_STEP,
+    EXTERNAL_CANCEL_CONFIRMATION_DIRECT,
+})
+
+
+def normalize_external_cancel_confirmation(value: object) -> str:
+    """返回安全的未登记订单撤单确认模式。"""
+    if value in _EXTERNAL_CANCEL_CONFIRMATION_VALUES:
+        return str(value)
+    return EXTERNAL_CANCEL_CONFIRMATION_TWO_STEP
+
+
 @dataclass
 class TraderConfig:
     device_id: str
@@ -20,6 +35,7 @@ class TraderConfig:
     order_watch_active_secs: int = 60  # 有未完成委托时的提速周期（秒）：默认 1 分钟
     enable_watchlist_watch: bool = True  # 是否定时同步自选股并推变化事件（新版 xiadan）
     watchlist_sync_hours: str = "8,12,16,20"  # 自选股定时同步的整点（避开交易时段）
+    external_cancel_confirmation: str = EXTERNAL_CANCEL_CONFIRMATION_TWO_STEP
 
     def has_paired(self) -> bool:
         """检查是否已配对"""
@@ -82,6 +98,9 @@ def load() -> TraderConfig:
             order_watch_active_secs=data.get("order_watch_active_secs", 60),
             enable_watchlist_watch=data.get("enable_watchlist_watch", True),
             watchlist_sync_hours=data.get("watchlist_sync_hours", "8,12,16,20"),
+            external_cancel_confirmation=normalize_external_cancel_confirmation(
+                data.get("external_cancel_confirmation")
+            ),
         )
     except Exception:
         return TraderConfig(device_id="")
@@ -90,6 +109,9 @@ def load() -> TraderConfig:
 def save(config: TraderConfig) -> None:
     """保存配置到本地"""
     config_path = _get_config_path()
+    config.external_cancel_confirmation = normalize_external_cancel_confirmation(
+        config.external_cancel_confirmation
+    )
 
     data = {
         "device_id": config.device_id,
@@ -104,8 +126,8 @@ def save(config: TraderConfig) -> None:
         "order_watch_active_secs": config.order_watch_active_secs,
         "enable_watchlist_watch": config.enable_watchlist_watch,
         "watchlist_sync_hours": config.watchlist_sync_hours,
+        "external_cancel_confirmation": config.external_cancel_confirmation,
     }
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-

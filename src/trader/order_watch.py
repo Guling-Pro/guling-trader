@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
+from collections import deque
 from datetime import datetime, time as dtime
-from typing import Any, Optional
+from typing import Any, Deque, Optional
 
 from . import config, contract
 from .ths.rows import ST_CANCELED, ST_FILLED, ST_PARTIAL, ST_REJECTED, is_in_flight
@@ -19,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 IDLE_INTERVAL_DEFAULT = 300   # 空闲（无未完成委托）轮询周期：5 分钟。验证码顾虑→分钟级
 ACTIVE_INTERVAL_DEFAULT = 60  # 有未完成委托挂着时提速：1 分钟（为及时抓成交）
+SEND_RETRY_INTERVAL_DEFAULT = 5  # 主动事件发送失败后短间隔重试；不重新读取/操作交易窗口。
 FRAME_TYPE = "order_event"
 
 # 契约 v2 规范化后的键（不再是 THS 原始表头）。
@@ -136,8 +139,62 @@ def next_interval(snapshot: dict, idle_secs: int, active_secs: int) -> int:
     return active_secs if any(_is_open(o) for o in snapshot.values()) else idle_secs
 
 
-async def _poll_once(backend, client, prev: Optional[dict], seq: int) -> tuple[Optional[dict], int, bool]:
-    """单轮：取委托快照 → diff → 发帧。返回 (new_prev, new_seq, ok)。"""
+async def _send_frame(client, frame: dict) -> bool:
+    """生产客户端必须显式返回 ``True`` 才算已写入。"""
+    send_result = client.send_frame(frame)
+    if inspect.isawaitable(send_result):
+        send_result = await send_result
+    return send_result is True
+
+
+def _pending_events(client, pending: Optional[Deque[dict]]) -> Deque[dict]:
+    """取得看门狗的待发 FIFO；兼容直接调用内部薄壳的旧测试/调用方。"""
+    if pending is not None:
+        return pending
+    queue = getattr(client, "_order_watch_pending_events", None)
+    if queue is None:
+        queue = deque()
+        setattr(client, "_order_watch_pending_events", queue)
+    return queue
+
+
+async def _flush_pending_events(client, pending: Deque[dict]) -> bool:
+    """按 FIFO 重发未确认写入的帧；成功帧只出队一次。"""
+    try:
+        while pending:
+            frame = pending[0]
+            if not await _send_frame(client, frame):
+                logger.warning("order_watch 待发事件未写入（下轮重试）")
+                return False
+            pending.popleft()
+            logger.info("order_watch 发送成功 %s entrust=%s seq=%s",
+                        frame["event"], frame["entrust_no"], frame["seq"])
+    except Exception as e:
+        logger.warning("order_watch 待发事件发送异常（下轮重试）：%s", e)
+        return False
+    return True
+
+
+async def _poll_once(
+    backend,
+    client,
+    prev: Optional[dict],
+    seq: int,
+    pending: Optional[Deque[dict]] = None,
+) -> tuple[Optional[dict], int, bool]:
+    """单轮：先送待发帧，再取委托快照并排入新事件。
+
+    ``pending`` 是进程内 FIFO。每个事件分配序号后不再改变，只有成功写入当前
+    WebSocket 才出队；观察基线在事件入队时推进，以免失败后重新构造已成功帧。
+    断线期间不执行任何交易 RPC，只保留通知帧。
+    """
+    pending = _pending_events(client, pending)
+
+    # 先清空上轮失败留下的帧。失败时不要读取 THS 表或改变基线，避免同一事件
+    # 被重新构造、已成功帧被重复提交，或在失败窗口内丢失原始观察结果。
+    if pending and not await _flush_pending_events(client, pending):
+        return prev, seq, False
+
     async with backend.win_lock:
         # 全量表（含终态）：终态行正是 filled/canceled 事件的来源。
         active = await backend.orders_active_all()
@@ -151,17 +208,21 @@ async def _poll_once(backend, client, prev: Optional[dict], seq: int) -> tuple[O
     for eno in prev:
         if eno not in cur:
             logger.warning("order_watch 委托 %s 已从委托表消失，保守起见未发事件", eno)
+
+    # 快照只能在所有 diff 事件都已排入 FIFO 后推进。这样单批的首帧已成功、
+    # 后帧失败时，不会重新发送首帧；未发帧保留自己的 seq 和检测时间。
     try:
         for ev in events:
             seq += 1
             ev["seq"] = seq
             ev["ts"] = time.time()
-            await client.send_frame(ev)
-            logger.info("order_watch 推送 %s entrust=%s source=%s filled=%s",
-                        ev["event"], ev["entrust_no"], ev["source"], ev["filled_qty"])
+            pending.append(ev)
+
+        if not await _flush_pending_events(client, pending):
+            return cur, seq, False
     except Exception as e:
         logger.warning("order_watch 发送事件失败（下轮重试）：%s", e)
-        return prev, seq, False  # 不推进基线，保留未发的事件供下轮重试
+        return cur, seq, False
     return cur, seq, True
 
 
@@ -176,6 +237,7 @@ async def order_watch_task(state, client) -> None:
     active_secs = cfg.order_watch_active_secs or ACTIVE_INTERVAL_DEFAULT
     prev: Optional[dict] = None
     seq = 0
+    pending: Deque[dict] = deque()
     interval = idle_secs
     logger.info("order_watch_task 启动（空闲 %ds / 活跃 %ds）", idle_secs, active_secs)
     while True:
@@ -184,18 +246,26 @@ async def order_watch_task(state, client) -> None:
             snap = state.snapshot()
             if snap.get("connection_state") != "CONNECTED":
                 logger.debug("order_watch 跳过：连接状态 %s", snap.get("connection_state"))
-                interval = idle_secs
+                interval = min(active_secs, SEND_RETRY_INTERVAL_DEFAULT) if pending else idle_secs
                 continue
             if not snap.get("enable_ths_plugin", True):
                 logger.debug("order_watch 跳过：THS 插件已禁用")
-                interval = idle_secs
+                interval = min(active_secs, SEND_RETRY_INTERVAL_DEFAULT) if pending else idle_secs
+                continue
+            # 断线期间积压的事件不需要访问交易窗口，连接恢复后立即按原 seq
+            # 重发；这条路径只发送通知帧，绝不触发买卖或撤单 RPC。
+            if pending and not await _flush_pending_events(client, pending):
+                interval = min(active_secs, SEND_RETRY_INTERVAL_DEFAULT)
                 continue
             if not in_trading_session(datetime.now()):
                 logger.debug("order_watch 跳过：非交易时段")
                 interval = idle_secs
                 continue
-            prev, seq, ok = await _poll_once(backend, client, prev, seq)
-            interval = next_interval(prev, idle_secs, active_secs) if (ok and prev) else idle_secs
+            prev, seq, ok = await _poll_once(backend, client, prev, seq, pending)
+            if pending:
+                interval = min(active_secs, SEND_RETRY_INTERVAL_DEFAULT)
+            else:
+                interval = next_interval(prev, idle_secs, active_secs) if (ok and prev) else idle_secs
         except asyncio.CancelledError:
             break
         except Exception as e:

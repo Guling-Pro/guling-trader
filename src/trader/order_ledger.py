@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import sqlite3
 import threading
@@ -57,6 +58,14 @@ def fingerprint(method: str, params: dict[str, Any]) -> str:
     """请求指纹：同 id 不同参数要能认出来。"""
     keys = ("stock_no", "amount", "price", "entrust_no")
     payload = {k: params.get(k) for k in keys if params.get(k) is not None}
+    if method == "confirm_external_cancel":
+        # 确认令牌只应留在进程内；台账只保存摘要来区分同一 coid 被换令牌的
+        # 调用，不能把可执行令牌落盘。
+        token = params.get("confirmation_token")
+        if isinstance(token, str):
+            payload["confirmation_token_sha256"] = hashlib.sha256(
+                token.encode("utf-8")
+            ).hexdigest()
     return json.dumps({"method": method, **payload}, sort_keys=True, ensure_ascii=False)
 
 
@@ -179,6 +188,27 @@ class OrderLedger:
             logger.warning("台账 entrust_no 映射读取失败，本次不回显 client_order_id",
                            exc_info=True)
             return {}
+
+    def has_entrust_no(self, entrust_no: object) -> bool:
+        """是否存在本机登记的买卖订单合同号。
+
+        撤单记录本身只能说明曾请求撤某个编号，不能证明该原始订单由本机工具创建；
+        因此这里严格只查买卖记录，供未登记订单的撤单确认闸门使用。
+        """
+        value = str(entrust_no or "").strip()
+        if not value:
+            return False
+        try:
+            with self._lock, self._connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM orders"
+                    " WHERE method IN ('buy', 'sell') AND entrust_no=?"
+                    " LIMIT 1",
+                    (value,),
+                ).fetchone()
+                return row is not None
+        except sqlite3.Error as e:
+            raise LedgerUnavailable(f"台账合同号映射读取失败：{e}") from e
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:

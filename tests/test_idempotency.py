@@ -9,6 +9,7 @@ import asyncio
 import pytest
 
 from trader import contract, dispatcher
+from trader.config import EXTERNAL_CANCEL_CONFIRMATION_DIRECT, TraderConfig
 from trader.order_ledger import LedgerUnavailable, OrderLedger
 
 
@@ -18,11 +19,28 @@ def ledger(tmp_path):
 
 
 BUY_PARAMS = {"stock_no": "600000", "amount": 100, "price": 8.1}
+EXTERNAL_ORDER = {
+    "entrust_no": "777",
+    "证券代码": "600000",
+    "方向": "买入",
+    "委托价": 8.1,
+    "委托数量": 100,
+    "已成数量": 0,
+    "状态": "已报",
+}
 
 
 def coid(sequence: int) -> str:
     """符合新协议的测试 ID；仅 dispatcher 对外入口强制该格式。"""
     return f"gl-0198f6a1-{sequence:04x}-7000-8000-{sequence:012x}"
+
+
+def _register_agent_order(ledger, sequence=90, entrust_no="777"):
+    """登记原买卖单，模拟本系统此前成功下出的委托。"""
+    order_id = coid(sequence)
+    ledger.reserve(order_id, "buy", BUY_PARAMS)
+    ledger.complete(order_id, contract.ok({"entrust_no": entrust_no}), entrust_no)
+    return order_id
 
 
 # --- 台账本身 ---------------------------------------------------------------
@@ -118,6 +136,19 @@ def _cancel(backend, coid, entrust_no="777"):
     return asyncio.run(dispatcher.handle_call(frame, backend))
 
 
+def _confirm_external_cancel(backend, coid, confirmation_token):
+    frame = {
+        "type": "call",
+        "id": "confirm-cancel",
+        "method": "confirm_external_cancel",
+        "params": {
+            "confirmation_token": confirmation_token,
+            "client_order_id": coid,
+        },
+    }
+    return asyncio.run(dispatcher.handle_call(frame, backend))
+
+
 def test_resend_same_coid_never_submits_twice(ledger):
     backend = OrderBackend(ledger)
     first = _buy(backend, coid(1))
@@ -203,6 +234,8 @@ def test_order_requires_canonical_uuid_v7(ledger, method, params, value):
 ])
 def test_order_accepts_canonical_uuid_v7(ledger, method, params):
     backend = OrderBackend(ledger)
+    if method == "cancel":
+        _register_agent_order(ledger)
     frame = {"type": "call", "id": "x", "method": method,
              "params": {**params, "client_order_id": coid(10)}}
     reply = asyncio.run(dispatcher.handle_call(frame, backend))
@@ -216,9 +249,11 @@ def test_unconfirmed_cancel_auto_verifies_target_without_resubmitting(ledger):
         async def orders_active_all(self):
             self.all_order_queries += 1
             return contract.ok([{
-                "entrust_no": "777", "委托数量": 100, "已成数量": 0, "状态": "已撤",
+                **EXTERNAL_ORDER,
+                "状态": "已撤",
             }])
 
+    _register_agent_order(ledger)
     backend = B(ledger, contract.submitted_unconfirmed(
         "撤单已提交但尚未确认", data={"submitted": True}))
     first = _cancel(backend, coid(11))
@@ -231,6 +266,191 @@ def test_unconfirmed_cancel_auto_verifies_target_without_resubmitting(ledger):
     assert backend.active_queries == 0
     assert backend.filled_queries == 0
     assert backend.all_order_queries == 2
+
+
+def test_external_cancel_refreshes_prompt_without_persisting_or_reusing_token(ledger):
+    """提示重放只换令牌，既不点击 GUI，也不把授权令牌写进台账。"""
+    class B(OrderBackend):
+        async def orders_active_all(self):
+            self.all_order_queries += 1
+            return contract.ok([EXTERNAL_ORDER])
+
+    backend = B(ledger)
+    first = _cancel(backend, coid(18))
+    second = _cancel(backend, coid(18))
+
+    assert first["ok"] is False
+    assert first["result"]["code"] == "confirmation_required"
+    assert first["result"]["error"]["class"] == "confirmation_required"
+    assert first["result"]["data"]["submitted"] is False
+    assert first["result"]["data"]["order"] == EXTERNAL_ORDER
+    first_token = first["result"]["data"]["confirmation_token"]
+    second_token = second["result"]["data"]["confirmation_token"]
+    assert second_token != first_token
+    stored_receipt = ledger.get(coid(18))["receipt"]
+    assert "confirmation_token" not in stored_receipt["data"]
+
+    stale = _confirm_external_cancel(backend, coid(33), first_token)
+    assert stale["result"]["data"]["confirmation_state"] == "missing"
+    assert backend.calls == []
+
+    confirmed = _confirm_external_cancel(backend, coid(34), second_token)
+    assert confirmed["ok"] is True
+    assert backend.calls == ["cancel"]
+    assert backend.all_order_queries == 3
+
+
+def test_external_cancel_confirmation_rereads_and_records_target_for_query(ledger):
+    """确认必须二次读表后才撤，并把目标编号写入确认动作台账。"""
+    class B(OrderBackend):
+        def __init__(self, ledger):
+            super().__init__(ledger)
+            self.rows = [dict(EXTERNAL_ORDER)]
+
+        async def orders_active_all(self):
+            self.all_order_queries += 1
+            return contract.ok(self.rows)
+
+    backend = B(ledger)
+    prompt = _cancel(backend, coid(19))
+    token = prompt["result"]["data"]["confirmation_token"]
+    confirmed = _confirm_external_cancel(backend, coid(20), token)
+
+    assert confirmed["ok"] is True
+    assert backend.calls == ["cancel"]
+    assert backend.all_order_queries == 2
+    assert ledger.get(coid(20))["entrust_no"] == "777"
+
+    backend.rows = [{**EXTERNAL_ORDER, "状态": "已撤"}]
+    queried = asyncio.run(dispatcher.handle_call(
+        {"type": "call", "id": "query", "method": "query_order",
+         "params": {"client_order_id": coid(20)}}, backend,
+    ))
+    assert queried["result"]["data"]["resolution"] == "by_entrust_no"
+    assert queried["result"]["data"]["cancel_state"] == "已撤"
+
+
+def test_external_cancel_rejects_reused_token_without_second_click(ledger):
+    class B(OrderBackend):
+        async def orders_active_all(self):
+            self.all_order_queries += 1
+            return contract.ok([EXTERNAL_ORDER])
+
+    backend = B(ledger)
+    token = _cancel(backend, coid(21))["result"]["data"]["confirmation_token"]
+    assert _confirm_external_cancel(backend, coid(22), token)["ok"] is True
+    repeated = _confirm_external_cancel(backend, coid(23), token)
+
+    assert repeated["result"]["code"] == "confirmation_required"
+    assert repeated["result"]["data"]["confirmation_state"] == "used"
+    assert backend.calls == ["cancel"]
+
+
+def test_external_cancel_stops_when_order_changes_between_prompt_and_confirmation(ledger):
+    class B(OrderBackend):
+        def __init__(self, ledger):
+            super().__init__(ledger)
+            self.rows = [dict(EXTERNAL_ORDER)]
+
+        async def orders_active_all(self):
+            self.all_order_queries += 1
+            return contract.ok(self.rows)
+
+    backend = B(ledger)
+    token = _cancel(backend, coid(24))["result"]["data"]["confirmation_token"]
+    backend.rows = [{**EXTERNAL_ORDER, "已成数量": 10, "状态": "部成"}]
+    changed = _confirm_external_cancel(backend, coid(25), token)
+
+    assert changed["result"]["code"] == "confirmation_required"
+    assert changed["result"]["data"]["submitted"] is False
+    assert changed["result"]["data"]["current_order"]["已成数量"] == 10
+    assert backend.calls == []
+
+
+def test_external_cancel_rejects_expired_token_without_clicking(ledger, monkeypatch):
+    class B(OrderBackend):
+        async def orders_active_all(self):
+            self.all_order_queries += 1
+            return contract.ok([EXTERNAL_ORDER])
+
+    monkeypatch.setattr(dispatcher, "EXTERNAL_CANCEL_CONFIRMATION_TTL_SECS", -1.0)
+    backend = B(ledger)
+    token = _cancel(backend, coid(26))["result"]["data"]["confirmation_token"]
+    expired = _confirm_external_cancel(backend, coid(27), token)
+
+    assert expired["result"]["code"] == "confirmation_required"
+    assert expired["result"]["data"]["confirmation_state"] == "expired"
+    assert backend.calls == []
+
+
+def test_external_cancel_connection_reset_invalidates_pending_token(ledger):
+    class B(OrderBackend):
+        async def orders_active_all(self):
+            self.all_order_queries += 1
+            return contract.ok([EXTERNAL_ORDER])
+
+    backend = B(ledger)
+    token = _cancel(backend, coid(30))["result"]["data"]["confirmation_token"]
+    dispatcher.clear_external_cancel_confirmations()
+    invalidated = _confirm_external_cancel(backend, coid(31), token)
+
+    assert invalidated["result"]["code"] == "confirmation_required"
+    assert invalidated["result"]["data"]["confirmation_state"] == "missing"
+    assert backend.calls == []
+
+    refreshed = _cancel(backend, coid(30))
+    refreshed_token = refreshed["result"]["data"]["confirmation_token"]
+    assert refreshed_token != token
+    assert backend.calls == []
+    assert backend.all_order_queries == 2
+
+
+def test_external_cancel_read_timeout_is_never_reported_as_submitted(ledger, monkeypatch):
+    """确认前读表超时没有调用 backend.cancel，不能伪装为未知的真实撤单。"""
+    class B(OrderBackend):
+        async def orders_active_all(self):
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(dispatcher, "CALL_TIMEOUT_SECS", 0.01)
+    backend = B(ledger)
+    timed_out = _cancel(backend, coid(32))
+
+    assert timed_out["result"]["code"] == "call_timeout"
+    assert timed_out["result"]["data"]["submitted"] is False
+    assert backend.calls == []
+
+
+def test_registered_cancel_skips_confirmation_and_does_not_read_full_table(ledger):
+    class B(OrderBackend):
+        async def orders_active_all(self):
+            pytest.fail("已登记订单不应进入人工订单全量表确认路径")
+
+    _register_agent_order(ledger)
+    backend = B(ledger)
+    reply = _cancel(backend, coid(28))
+
+    assert reply["ok"] is True
+    assert backend.calls == ["cancel"]
+
+
+def test_external_cancel_direct_mode_skips_confirmation(ledger, monkeypatch):
+    class B(OrderBackend):
+        async def orders_active_all(self):
+            pytest.fail("direct 模式不应读取人工订单确认表")
+
+    monkeypatch.setattr(
+        dispatcher._config,
+        "load",
+        lambda: TraderConfig(
+            device_id="",
+            external_cancel_confirmation=EXTERNAL_CANCEL_CONFIRMATION_DIRECT,
+        ),
+    )
+    backend = B(ledger)
+    reply = _cancel(backend, coid(29))
+
+    assert reply["ok"] is True
+    assert backend.calls == ["cancel"]
 
 
 def test_auto_query_timeout_preserves_unknown_without_resubmitting(ledger, monkeypatch):

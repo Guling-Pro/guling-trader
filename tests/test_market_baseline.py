@@ -15,7 +15,7 @@ def _backend(monkeypatch, pre_result):
     monkeypatch.setattr(b, "switch_to_normal", lambda: None)
     monkeypatch.setattr(b, "get_filled_orders", lambda: pre_result)
     monkeypatch.setattr(b, "_select_tree_child",
-                        lambda parent, child: calls.append("navigate") or True)
+                        lambda parent, child, **kwargs: calls.append("navigate") or True)
     monkeypatch.setattr(w, "_activate_window", lambda hwnd: None)
     monkeypatch.setattr(w, "sleep_time", 0)
     return b, calls
@@ -42,3 +42,19 @@ def test_wrong_table_baseline_also_aborts(monkeypatch):
     r = b._submit_market_trade("卖出", "300458", 500)
     assert r["status"] == "failed"
     assert calls == []
+
+
+def test_empty_filled_table_is_a_valid_market_order_baseline(monkeypatch):
+    """成功读取到空成交表就是合法基线，不能误判为读取失败。"""
+    from trader import contract
+    b, calls = _backend(monkeypatch, contract.ok([]))
+    monkeypatch.setattr(
+        b, "_select_tree_child",
+        lambda parent, child, **kwargs: calls.append("navigate") or False,
+    )
+
+    r = b._submit_market_trade("买入", "300458", 500)
+
+    assert r["status"] == "failed"
+    assert "未能导航到市价委托面板" in r["error"]["message"]
+    assert calls == ["navigate"], "空成交表必须通过基线校验，继续进入下单面板"
