@@ -616,6 +616,7 @@ def run() -> None:
         account_name=result.config.account_name or "",
         agent_token=result.config.agent_token or None,
         enable_ths_plugin=result.config.enable_ths_plugin,
+        external_cancel_confirmation=result.config.external_cancel_confirmation,
     )
 
     def on_open_xiadan() -> None:

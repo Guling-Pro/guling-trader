@@ -40,6 +40,27 @@ def test_non_frozen_falls_back(monkeypatch, tmp_path):
     assert base.is_dir()
 
 
+def test_external_cancel_confirmation_defaults_safely_and_persists(monkeypatch, tmp_path):
+    """桌面端的直接撤单偏好必须落盘，未知旧值始终回退到二次确认。"""
+    config = _reload_config()
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(config, "_get_config_path", lambda: config_path)
+
+    assert config.load().external_cancel_confirmation == "two_step"
+
+    config.save(config.TraderConfig(
+        device_id="test-device",
+        external_cancel_confirmation="direct",
+    ))
+    assert config.load().external_cancel_confirmation == "direct"
+
+    config_path.write_text(json.dumps({
+        "device_id": "test-device",
+        "external_cancel_confirmation": "unexpected",
+    }), encoding="utf-8")
+    assert config.load().external_cancel_confirmation == "two_step"
+
+
 
 
 

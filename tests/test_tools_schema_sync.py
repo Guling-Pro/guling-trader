@@ -23,7 +23,7 @@ def test_buy_sell_desc_mentions_market_and_limit():
 
 def test_fallback_matches_tools_schema_json():
     disk = json.loads((ROOT / "docs/tools_schema.json").read_text("utf-8"))
-    for name in ("buy", "sell", "cancel"):
+    for name in ("buy", "sell", "cancel", "confirm_external_cancel"):
         code_schema = _tool(FALLBACK_TOOLS_SCHEMA["tools"], name)["inputSchema"]
         disk_schema = _tool(disk["tools"], name)["inputSchema"]
         assert code_schema == disk_schema

@@ -186,15 +186,35 @@ AI 助手部分（Claude、Cursor 等）在任何系统都能跑；只需确保�
 | `watchlist` | 读同花顺自选股代码（新版）| —（顶部第一屏，按同花顺习惯最新在顶部）|
 | `buy` | 买入（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(必填) |
 | `sell` | 卖出（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(必填) |
-| `cancel` | 撤销未成交单 | `entrust_no`, `client_order_id`(必填) |
+| `cancel` | 撤销未成交单；未登记订单可要求确认 | `entrust_no`, `client_order_id`(必填) |
+| `confirm_external_cancel` | 确认撤销未登记/人工订单 | `confirmation_token`, 新的 `client_order_id`(必填) |
 
-`buy`、`sell`、`cancel` 的 `client_order_id` 必须是 `gl-<小写 UUID v7>`，例如
-`gl-0198f6a1-0001-7000-8000-000000000001`。调用方创建请求时生成并持久保存：新订单或
-新撤单用新 ID；网络重发同一请求必须复用原 ID。交易端只验证和防重，不会生成或改写 ID。
+`buy`、`sell`、`cancel`、`confirm_external_cancel` 的 `client_order_id` 必须是
+`gl-<小写 UUID v7>`，例如 `gl-0198f6a1-0001-7000-8000-000000000001`。调用方创建请求时
+生成并持久保存：每个新订单、撤单或确认撤单动作使用新 ID；网络重发同一动作必须复用原 ID。
+`confirm_external_cancel` 必须使用不同于产生令牌的 `cancel` 的新 ID。交易端只验证和防重，
+不会生成或改写 ID。
+
+默认本地配置 `external_cancel_confirmation=two_step`（桌面端“未登记订单撤单需二次确认”
+开关开启）。本系统台账已经登记的订单按 `entrust_no` 匹配，`cancel` 会直接执行；未登记的
+人工、手机端或其他外部订单，`cancel` 只会返回 `confirmation_required` 和 60 秒一次性的
+`confirmation_token`，不会点击同花顺 GUI。调用 `confirm_external_cancel` 时，交易端会消费
+该令牌、重新读取含终态的全量委托表，并逐项核验合同号、证券代码、方向、委托价、委托数量、
+已成数量和可撤状态仍与令牌生成时一致，才会执行撤单。令牌过期、已使用、连接/进程重启，或
+订单发生变化时都不会撤单。令牌绝不写入本地台账；需要重新确认时，用原 `cancel` 的
+`client_order_id` 再次调用 `cancel`，交易端会重新读取订单并换发令牌，仍不会点击 GUI。
+
+关闭该本地开关即为 `external_cancel_confirmation=direct`：无论订单是否由本系统登记，
+`cancel` 都按普通撤单路径直接执行，不要求 `confirm_external_cancel`。这只改变是否需要
+人工确认，不会改变幂等或核验规则。
+
 买卖返回 `submitted_unconfirmed` 时会自动做一次只读 `query_order`，结果在
 `data.auto_query`；它绝不自动重发下单。撤单返回该状态时会按目标 `entrust_no` 自动读取
 一次含终态的全量委托表；只有 `data.auto_query.data.cancel_state` 为 `已撤` 或
-`部成后已撤` 才表示柜台已确认撤单，绝不自动重发撤单。
+`部成后已撤` 才表示柜台已确认撤单。`query_order` 对实际撤单动作（直接 `cancel` 或
+`confirm_external_cancel`）都按保存的目标 `entrust_no` 精确核验，不使用买卖单的启发式匹配。
+超时或结果未知时，交易端绝不自动重发真实撤单；只能由调用方使用同一动作的
+`client_order_id` 显式取得幂等回执或调用 `query_order` 核验。
 
 > 未配对时仅暴露 `pair_with_code` 一个工具；完整帧协议（握手、call、reply、reject、心跳）见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
 
@@ -209,8 +229,14 @@ AI 助手部分（Claude、Cursor 等）在任何系统都能跑；只需确保�
 # 安装依赖（包括 build 额外包）
 pip install -e .[build]
 
-# 编译成单文件 exe
-pyinstaller --onefile --windowed --name guling-trader -m trader
+# 编译成单文件 exe（与 .github/workflows/build.yml 一致）
+pyinstaller --onefile --windowed `
+    --name guling-trader `
+    --paths src `
+    --icon src/trader/assets/icon.ico `
+    --collect-submodules trader `
+    --collect-data certifi `
+    run_trader.py
 
 # 输出路径：dist\guling-trader.exe
 ```

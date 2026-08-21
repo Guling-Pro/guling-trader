@@ -10,16 +10,19 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
+from collections import deque
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Deque, Optional
 
 from . import config
 
 logger = logging.getLogger(__name__)
 
 FRAME_TYPE = "watchlist_event"
+SEND_RETRY_INTERVAL_DEFAULT = 5  # 发送失败后短间隔重试；不重复读取或操作 THS。
 
 
 def _parse_hours(spec: str) -> list[int]:
@@ -41,6 +44,31 @@ def next_fire(now: datetime, hours: list[int]) -> datetime:
         hour=hours[0], minute=0, second=0, microsecond=0)
 
 
+async def _send_frame(client, frame: dict) -> bool:
+    """生产客户端必须显式返回 ``True`` 才算已写入当前 WebSocket。"""
+    send_result = client.send_frame(frame)
+    if inspect.isawaitable(send_result):
+        send_result = await send_result
+    return send_result is True
+
+
+async def _flush_pending_events(client, pending: Deque[dict]) -> bool:
+    """按 FIFO 重发未确认写入的自选股事件，成功后才出队。"""
+    try:
+        while pending:
+            frame = pending[0]
+            if not await _send_frame(client, frame):
+                logger.warning("watchlist_watch 待发事件未写入（下次重试）")
+                return False
+            pending.popleft()
+            logger.info("watchlist_watch 推送变化：新增 %s（顶部 %d 只，seq=%s）",
+                        frame["added"], len(frame["codes"]), frame["seq"])
+    except Exception as e:
+        logger.warning("watchlist_watch 待发事件发送异常（下次重试）：%s", e)
+        return False
+    return True
+
+
 async def watchlist_watch_task(state, client) -> None:
     """定点同步自选股顶部 → 变化则推 watchlist_event。exception-safe。"""
     backend = client.backend
@@ -51,11 +79,16 @@ async def watchlist_watch_task(state, client) -> None:
     hours = _parse_hours(getattr(cfg, "watchlist_sync_hours", "8,12,16,20"))
     prev: Optional[list[str]] = None
     seq = 0
+    pending: Deque[dict] = deque()
     logger.info("watchlist_watch_task 启动，定点同步整点 %s", hours)
     first = True
     while True:
         try:
-            if first:
+            if pending:
+                # 已经读取到的变化必须先按原帧/原序号送达；不在失败窗口反复 OCR，
+                # 也不让下一次整点读数覆盖该变化。
+                await asyncio.sleep(SEND_RETRY_INTERVAL_DEFAULT)
+            elif first:
                 # 启动后先等 30s（等连接/登录稳定）建立基线，也便于验证读取正常
                 await asyncio.sleep(30)
                 first = False
@@ -72,6 +105,10 @@ async def watchlist_watch_task(state, client) -> None:
                 continue
             if not snap.get("enable_ths_plugin", True):
                 logger.debug("watchlist_watch 跳过：THS 插件已禁用")
+                continue
+            if pending:
+                # 这里只重放已排队的通知帧，不读取 THS、更不会执行交易 RPC。
+                await _flush_pending_events(client, pending)
                 continue
 
             async with backend.win_lock:
@@ -100,12 +137,11 @@ async def watchlist_watch_task(state, client) -> None:
                 "seq": seq,
                 "ts": time.time(),
             }
-            try:
-                await client.send_frame(frame)
-                logger.info("watchlist_watch 推送变化：新增 %s（顶部 %d 只）", added, len(cur))
-                prev = cur
-            except Exception as e:
-                logger.warning("watchlist_watch 发送失败（下次重试）：%s", e)  # 不推进基线
+            # 读取成功后立即推进观察基线并排队。写入失败时帧仍保留，后续变化
+            # 不会覆盖它；队列只承载通知事件，绝不触发真实交易动作。
+            prev = cur
+            pending.append(frame)
+            await _flush_pending_events(client, pending)
         except asyncio.CancelledError:
             break
         except Exception as e:

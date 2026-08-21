@@ -155,37 +155,103 @@ def setup(window_title_value: str, tesseract_cmd: str, work_dir_value: str = "")
     )
 
 
-def find_window_by_title_prefix(prefix: str) -> int:
-    """Find first visible top-level window whose title **starts with** `prefix`.
+def _matching_windows_by_title_prefix(prefix: str) -> list[tuple[int, str]]:
+    """Return every visible top-level window whose title starts with ``prefix``.
 
-    Hexin clients typically render `<base> - <broker> - <hint>` so exact-match
-    `FindWindow` fails. Prefix match handles the broker suffix while staying
-    safer than substring (avoids accidental matches in unrelated windows).
+    This deliberately has no ``FindWindow`` fast path. An exact title is also
+    a prefix match, so it must be considered together with broker-suffixed
+    windows rather than silently bypassing the ambiguity check.
     """
     if not prefix:
-        return 0
+        return []
     matches: list[tuple[int, str]] = []
 
     def cb(hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            text = win32gui.GetWindowText(hwnd) or ""
+            if text.startswith(prefix):
+                matches.append((hwnd, text))
+        except Exception:
+            # Enumeration is an identity check, not a best-effort lookup.
+            # Ignore an unreadable candidate; the caller still fails closed
+            # unless exactly one readable candidate remains.
             return
-        text = win32gui.GetWindowText(hwnd)
-        if text.startswith(prefix):
-            matches.append((hwnd, text))
 
-    win32gui.EnumWindows(cb, None)
-    if not matches:
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception:
+        logger.warning("unable to enumerate windows for title prefix %r", prefix, exc_info=True)
+        return []
+    return matches
+
+
+def find_window_by_title_prefix(prefix: str) -> int:
+    """Return the sole visible top-level prefix match, or ``0`` if ambiguous.
+
+    Hexin clients typically render ``<base> - <broker> - <hint>``. Prefix
+    matching handles that suffix, but choosing an arbitrary first match is
+    unsafe because subsequent F-keys and clicks are process-global.
+    """
+    matches = _matching_windows_by_title_prefix(prefix)
+    if len(matches) != 1:
+        if matches:
+            logger.error(
+                "refusing ambiguous window binding: %d windows match prefix %r: %r",
+                len(matches),
+                prefix,
+                [title for _, title in matches],
+            )
         return 0
-    if len(matches) > 1:
-        logger.warning(
-            "found %d windows matching prefix %r — picking first: %r",
-            len(matches),
-            prefix,
-            [t for _, t in matches],
-        )
     hwnd, full = matches[0]
-    logger.info("matched window prefix=%r → full_title=%r hwnd=%s", prefix, full, hwnd)
+    logger.info("matched unique window prefix=%r → full_title=%r hwnd=%s", prefix, full, hwnd)
     return hwnd
+
+
+def _normalize_executable_identity(path: Any) -> str:
+    """Normalize a process image path only for equality comparison."""
+    return os.path.normcase(os.path.normpath(str(path or "").strip()))
+
+
+def _window_process_identity(hwnd: int) -> tuple[int, str] | None:
+    """Return ``(pid, executable_path)`` for a window, or ``None`` on doubt.
+
+    ``GetWindowThreadProcessId`` alone is insufficient: Windows can recycle an
+    HWND after xiadan restarts. The image path gives the cached binding a second
+    stable identity signal. Every failure intentionally returns ``None`` so
+    callers stop rather than sending input to an unverified window.
+    """
+    try:
+        _thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
+        pid = int(pid)
+        if pid <= 0:
+            return None
+        access = (
+            getattr(win32con, "PROCESS_QUERY_LIMITED_INFORMATION", 0x1000)
+            | getattr(win32con, "PROCESS_QUERY_INFORMATION", 0x0400)
+            | getattr(win32con, "PROCESS_VM_READ", 0x0010)
+        )
+        handle = win32api.OpenProcess(access, False, pid)
+        try:
+            executable = win32process.GetModuleFileNameEx(handle, 0)
+        finally:
+            win32api.CloseHandle(handle)
+        executable = _normalize_executable_identity(executable)
+        if not executable:
+            return None
+        return pid, executable
+    except Exception:
+        logger.warning("unable to verify process identity for hwnd=%s", hwnd, exc_info=True)
+        return None
+
+
+def _foreground_window() -> int:
+    """Read the foreground HWND. Missing Win32 APIs are a failed check."""
+    try:
+        return int(win32gui.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
 
 
 def get_clipboard_data(open_retries: int = 10):
@@ -216,8 +282,15 @@ def get_clipboard_data(open_retries: int = 10):
     return None
 
 
-def hot_key(keys):
+def hot_key(keys, before_dispatch=None):
+    """Send a hotkey after the empirical delay.
+
+    State-changing callers can revalidate focus and their call generation
+    after this delay, immediately before the first physical key event.
+    """
     time.sleep(sleep_time)
+    if before_dispatch:
+        before_dispatch()
     for key in keys:
         win32api.keybd_event(VK_CODE[key], 0, 0, 0)
         time.sleep(short_sleep_time)
@@ -417,6 +490,10 @@ class StaleCallAborted(RuntimeError):
     """本线程所属的调用已被作废（dispatcher 超时后放锁），必须立刻停手。"""
 
 
+class WindowSafetyError(RuntimeError):
+    """A global UI action was stopped before it could target an unverified window."""
+
+
 def guarded(fn):
     """工作线程入口装饰器：登记调用代次，本笔被作废时在检查点中止。
 
@@ -433,12 +510,21 @@ def guarded(fn):
 class WinThsBackend:
     def __init__(self):
         self.hwnd_main = None
+        # HWND values can be recycled after xiadan exits. Keep the process
+        # identity captured at bind time and verify it before every global UI
+        # action; title text by itself is not a sufficient identity proof.
+        self._bound_pid: int | None = None
+        self._bound_executable: str | None = None
         # order_watch 与 RPC 共用：串行化对 THS 单窗口的访问，避免并发拷表。
         self.win_lock = asyncio.Lock()
         # agent 经 RPC 下单成功后登记的合同编号，供 order_watch 标记事件来源。
         self.agent_entrust_nos: set[str] = set()
         # 内存态：查询结果的 last-known 存储（剪贴板仅作毫秒级中转）。
         self.state = ThsState()
+        # Last raw columns observed by _grab_grid. Limit-order ownership needs
+        # stronger evidence than the generic query-table marker check, and an
+        # empty but valid table has no rows from which to recover this fact.
+        self._last_grid_columns: dict[str, tuple[str, ...]] = {}
         # dispatcher 侧调用超时后置位；下一次调用进入前先跑 dialog_cleanup 自愈。
         self.degraded = False
         # 调用代次：dispatcher 超时后 +1，作废所有在飞的工作线程（见 _abort_if_stale）。
@@ -481,6 +567,9 @@ class WinThsBackend:
         except StaleCallAborted as e:
             logger.warning("脱缰线程已在 %s 处停手（%s）", getattr(e, "where", "?"), e)
             return contract.fail(contract.CODE_ABORTED, CLS_ABORTED, f"调用已作废：{e}")
+        except WindowSafetyError as e:
+            logger.warning("窗口安全检查阻止了 UI 输入：%s", e)
+            return contract.fail(contract.CODE_NOT_BOUND, CLS_NOT_BOUND, str(e))
         finally:
             self._tls.gen = None
 
@@ -500,6 +589,9 @@ class WinThsBackend:
     def _pump_dialogs(self):
         """提交动作后的弹窗「发现-处置-存证」循环（见 ths/dialogs.py）。"""
         self._abort_if_stale("pump_dialogs")
+        if not self._bound_window_is_valid():
+            self._clear_bound_window("cannot pump dialogs for an invalid binding")
+            raise WindowSafetyError("弹窗处置前交易窗口绑定已失效，已停止处理弹窗")
         from .dialogs import DialogSentry
         return DialogSentry(self).pump()
 
@@ -507,35 +599,246 @@ class WinThsBackend:
         """degraded 自愈入口：清掉残留弹窗并留存证（dispatcher 在超时后的
         下一次调用前执行）。返回 PumpResult，内容进日志。"""
         self._abort_if_stale("dialog_cleanup")
+        if not self._bound_window_is_valid():
+            self._clear_bound_window("cannot clean dialogs for an invalid binding")
+            raise WindowSafetyError("弹窗清理前交易窗口绑定已失效，已停止处理弹窗")
         from .dialogs import DialogSentry
         result = DialogSentry(self).cleanup()
         if result.dialogs:
             logger.warning("dialog_cleanup 清掉残留弹窗：%s", result.dialogs)
         return result
 
+    def _clear_bound_window(self, reason: str) -> None:
+        if self.hwnd_main:
+            logger.warning("discarding bound xiadan window hwnd=%s: %s", self.hwnd_main, reason)
+        self.hwnd_main = None
+        self._bound_pid = None
+        self._bound_executable = None
+
+    def _bound_window_is_valid(self) -> bool:
+        """Check the cached HWND, title, PID, and executable identity.
+
+        Failure is intentionally indistinguishable from a missing binding to
+        callers. A successful title match alone is not enough because a new
+        process can inherit a recycled HWND and render the same title.
+        """
+        hwnd = self.hwnd_main
+        if not hwnd or hwnd <= 0 or not self._bound_pid or not self._bound_executable:
+            return False
+        try:
+            if not win32gui.IsWindow(hwnd):
+                return False
+            if not (win32gui.GetWindowText(hwnd) or "").startswith(window_title):
+                return False
+        except Exception:
+            return False
+        identity = _window_process_identity(hwnd)
+        return bool(
+            identity
+            and identity[0] == self._bound_pid
+            and identity[1] == self._bound_executable
+        )
+
+    def _activate_bound_window(self) -> bool:
+        """Activate the verified xiadan window and require it to become foreground."""
+        if not self._bound_window_is_valid():
+            self._clear_bound_window("cached HWND/title/process identity verification failed")
+            return False
+        _activate_window(self.hwnd_main)
+        if _foreground_window() != self.hwnd_main:
+            logger.warning(
+                "xiadan activation failed or focus was stolen: expected=%s actual=%s",
+                self.hwnd_main, _foreground_window(),
+            )
+            return False
+        return True
+
+    def _foreground_is_bound_process(self) -> bool:
+        """Whether the foreground top-level window belongs to the bound client.
+
+        A confirmation/captcha dialog can legitimately become foreground after
+        a submit. It is still accepted only when its process identity matches
+        the bound xiadan process; another application with a copied title is
+        never accepted.
+        """
+        if not self._bound_window_is_valid():
+            self._clear_bound_window("bound identity changed while checking foreground")
+            return False
+        identity = _window_process_identity(_foreground_window())
+        return bool(
+            identity
+            and identity[0] == self._bound_pid
+            and identity[1] == self._bound_executable
+        )
+
+    def _window_is_owned_by_bound_process(self, hwnd: int) -> bool:
+        """Whether ``hwnd`` still belongs to the exact client we bound.
+
+        Direct WM_CHAR/BM_CLICK delivery does not need foreground focus, but
+        it *does* need this check: child HWND values are recyclable too. A
+        control ID and a title are not sufficient evidence that a message is
+        going to the same xiadan process.
+        """
+        if not hwnd or not self._bound_window_is_valid():
+            self._clear_bound_window("bound identity changed while checking a target control")
+            return False
+        identity = _window_process_identity(hwnd)
+        return bool(
+            identity
+            and identity[0] == self._bound_pid
+            and identity[1] == self._bound_executable
+        )
+
+    def _require_owned_window_for_input(self, hwnd: int, where: str) -> None:
+        """Fail closed before directly messaging a state-changing control."""
+        self._abort_if_stale(where)
+        if not self._window_is_owned_by_bound_process(hwnd):
+            raise WindowSafetyError(
+                f"{where}: 目标控件不属于当前已绑定的 xiadan 进程，已停止发送输入"
+            )
+
+    def _activate_owned_window(self, hwnd: int) -> bool:
+        """Activate a bound-process popup and require that exact popup in front."""
+        if not hwnd or not self._bound_window_is_valid():
+            self._clear_bound_window("cannot activate popup from an invalid binding")
+            return False
+        identity = _window_process_identity(hwnd)
+        if not (
+            identity
+            and identity[0] == self._bound_pid
+            and identity[1] == self._bound_executable
+        ):
+            logger.warning("refusing to activate foreign popup hwnd=%s", hwnd)
+            return False
+        _activate_window(hwnd)
+        return _foreground_window() == hwnd
+
+    def _require_foreground_for_input(self, where: str,
+                                      allow_bound_process_popup: bool = False,
+                                      expected_popup: int | None = None) -> None:
+        """Fail closed before a process-global hotkey or physical mouse event."""
+        self._abort_if_stale(where)
+        if expected_popup:
+            if (
+                _foreground_window() == expected_popup
+                and self._window_is_owned_by_bound_process(expected_popup)
+            ):
+                return
+            if not self._activate_owned_window(expected_popup):
+                raise WindowSafetyError(
+                    f"{where}: 指定 xiadan 弹窗未能保持前台或绑定已失效，已停止发送全局输入"
+                )
+            return
+        if allow_bound_process_popup and self._foreground_is_bound_process():
+            return
+        if not self._activate_bound_window():
+            raise WindowSafetyError(
+                f"{where}: xiadan 窗口未能保持前台或绑定已失效，已停止发送全局输入"
+            )
+
+    def _send_hotkey(self, keys: list[str], where: str,
+                     allow_bound_process_popup: bool = False,
+                     expected_popup: int | None = None,
+                     before_dispatch=None) -> None:
+        self._require_foreground_for_input(
+            where, allow_bound_process_popup, expected_popup
+        )
+
+        def final_check() -> None:
+            # hot_key waits before pressing its first key. The dispatcher may
+            # time out or another app may take focus during that interval.
+            self._require_foreground_for_input(
+                where, allow_bound_process_popup, expected_popup
+            )
+            if before_dispatch:
+                before_dispatch()
+
+        hot_key(keys, before_dispatch=final_check)
+
+    def _click_screen(self, x: int, y: int, where: str) -> None:
+        """Perform one physical click only after foreground verification."""
+        self._require_foreground_for_input(where)
+        win32api.SetCursorPos((x, y))
+        # Moving the pointer may itself take long enough for another app to
+        # surface. Recheck at the last possible point before button-down.
+        if (
+            _foreground_window() != self.hwnd_main
+            or not self._window_is_owned_by_bound_process(self.hwnd_main)
+        ):
+            raise WindowSafetyError(
+                f"{where}: 鼠标点击前前台窗口或进程身份已变化，已停止发送点击"
+            )
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+    def _click_owned_popup(self, popup: int, x: int, y: int, where: str) -> None:
+        """Click an exact, bound-process popup rather than whichever window is frontmost."""
+        if not self._activate_owned_window(popup):
+            raise WindowSafetyError(
+                f"{where}: 弹窗不属于当前已绑定的 xiadan 进程或未能置前，已停止点击"
+            )
+        win32api.SetCursorPos((x, y))
+        if (
+            _foreground_window() != popup
+            or not self._window_is_owned_by_bound_process(popup)
+        ):
+            raise WindowSafetyError(
+                f"{where}: 鼠标点击前弹窗焦点或进程身份已变化，已停止点击"
+            )
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+    def _set_owned_text(self, hwnd: int, value: Any, where: str, is_price: bool = False) -> None:
+        """Fill a form control only after both foreground and ownership checks."""
+        self._require_foreground_for_input(where)
+        self._require_owned_window_for_input(hwnd, where)
+        set_text(hwnd, value, is_price)
+
+    def _post_owned_button_click(self, hwnd: int, where: str, before_dispatch=None) -> None:
+        """Deliver BM_CLICK only to a control in the bound xiadan process."""
+        self._require_owned_window_for_input(hwnd, where)
+        if before_dispatch:
+            before_dispatch()
+        win32api.PostMessage(hwnd, win32con.BM_CLICK, 0, 0)
+
+    def _switch_to_normal_safely(self) -> None:
+        """Use the existing navigation primitive with its input guard enabled.
+
+        Keeping the public ``switch_to_normal()`` default unchanged avoids
+        turning pure read navigation into an availability dependency on focus.
+        """
+        self._tls.require_window_safety = True
+        try:
+            self.switch_to_normal()
+        finally:
+            self._tls.require_window_safety = False
+
+    def _pre_submit_failure(self, message: str, code: str = contract.CODE_NOT_BOUND,
+                            error_class: str = CLS_NOT_BOUND) -> dict[str, Any]:
+        """Build a never-submitted receipt for a failure before the submit action."""
+        return contract.fail(code, error_class, message, data={"submitted": False})
+
+    def _activate_or_pre_submit_failure(self, where: str) -> dict[str, Any] | None:
+        try:
+            self._require_foreground_for_input(where)
+        except StaleCallAborted:
+            raise
+        except WindowSafetyError as e:
+            logger.warning("pre-submit foreground check failed at %s: %s", where, e)
+            return self._pre_submit_failure(str(e))
+        return None
+
     def _ensure_bound(self) -> dict[str, Any] | None:
         """检查是否已绑定；否则 lazy bind，返回错误 dict 或 None（成功）"""
-        # 关键：缓存句柄必须验活。xiadan 重启后旧 hwnd 数值仍 >0 但窗口已销毁，
-        # 不验活会拿死句柄去 SendMessage/FindWindowEx → Win32 报错 1400「无效的窗口句柄」。
-        # IsWindow 判断句柄是否仍指向存活窗口；标题前缀校验顺带防 HWND 数值被系统回收复用。
         if self.hwnd_main and self.hwnd_main > 0:
-            try:
-                alive = bool(win32gui.IsWindow(self.hwnd_main)) and win32gui.GetWindowText(
-                    self.hwnd_main
-                ).startswith(window_title)
-            except Exception:
-                alive = False
-            if alive:
-                return None  # 已绑定且句柄有效
-            logger.info(
-                "缓存的 xiadan 句柄 %s 已失效（疑似重启/重登），重新捕获…", self.hwnd_main
-            )
-            self.hwnd_main = None  # 丢弃失效句柄，强制重绑
+            if self._bound_window_is_valid():
+                return None
+            self._clear_bound_window("cached binding validation failed")
 
         # 尝试 bind
         logger.info("未检测到 xiadan 窗口，尝试 lazy bind...")
         self.bind_client()
-        if self.hwnd_main and self.hwnd_main > 0:
+        if self.hwnd_main and self.hwnd_main > 0 and self._bound_window_is_valid():
             logger.info("✓ 成功绑定到 xiadan 窗口: hwnd=%s", self.hwnd_main)
             return None
 
@@ -545,29 +848,33 @@ class WinThsBackend:
                              "未检测到 xiadan 窗口（请确保同花顺已打开并登录）")
 
     def bind_client(self):
-        # Try exact match first for backward compat, then prefix match.
-        hwnd = win32gui.FindWindow(None, window_title)
+        # Exact FindWindow is deliberately not used: an exact-title window and
+        # a broker-suffixed one both match the configured prefix, so accepting
+        # the exact one would bypass the ambiguity protection.
+        self._clear_bound_window("rebinding")
+        hwnd = find_window_by_title_prefix(window_title)
         if hwnd <= 0:
-            hwnd = find_window_by_title_prefix(window_title)
-        if hwnd > 0:
-            _activate_window(hwnd)
-            self.hwnd_main = hwnd
+            return
+        identity = _window_process_identity(hwnd)
+        if not identity:
+            logger.error("refusing to bind hwnd=%s: process identity unavailable", hwnd)
+            return
+        self.hwnd_main = hwnd
+        self._bound_pid, self._bound_executable = identity
+        if not self._activate_bound_window():
+            self._clear_bound_window("window did not become foreground after bind")
 
     def kill_client(self):
-        self.hwnd_main = None
-        retry = 5
-        while retry > 0:
-            hwnd = win32gui.FindWindow(None, window_title)
-            if hwnd <= 0:
-                hwnd = find_window_by_title_prefix(window_title)
-            if hwnd == 0:
-                time.sleep(1)
-                break
-            else:
-                _activate_window(hwnd)
-                time.sleep(sleep_time)
-                hot_key(["alt", "F4"])
-                retry -= 1
+        """Close only the uniquely bound client; never Alt+F4 a title lookup."""
+        if self._ensure_bound():
+            return False
+        try:
+            self._send_hotkey(["alt", "F4"], "kill_client")
+        except WindowSafetyError as e:
+            logger.warning("refusing to close client: %s", e)
+            return False
+        self._clear_bound_window("close requested")
+        return True
 
     def get_tree_hwnd(self):
         # 结构链保持不变，仅把带 MFC 版本号的类名(AfxMDIFrame140s/AfxWnd140s)换成
@@ -718,24 +1025,36 @@ class WinThsBackend:
                        f"{list(self._BULK_CANCEL_BUTTONS)}",
             }
         btn_id = self._BULK_CANCEL_BUTTONS[action]
-        self.switch_to_normal()
-        hot_key(["F3"])
-        self.refresh()
-        right = self.get_right_hwnd()
         try:
+            self._switch_to_normal_safely()
+            self._send_hotkey(["F3"], "bulk_cancel_panel")
+            self.refresh(require_window_safety=True)
+            right = self.get_right_hwnd()
             btn = self._find_ctrl_by_id(right, btn_id, cls="Button", visible=True) \
                 or self._find_ctrl_by_id(right, btn_id, cls="Button")
+        except WindowSafetyError as e:
+            return self._pre_submit_failure(str(e))
         except Exception as e:
             return {"code": 1, "status": "failed",
                     "msg": f"GetDlgItem 0x{btn_id:04X}: {e}"}
         if not btn:
             return {"code": 1, "status": "failed",
                     "msg": f"button 0x{btn_id:04X} not present in F3 panel"}
-        # BM_CLICK fires the button's WM_COMMAND. Cross-process safe.
-        win32api.PostMessage(btn, win32con.BM_CLICK, 0, 0)
+        try:
+            # BM_CLICK is focus-independent, but must still target a control
+            # owned by the client we verified at bind time.
+            self._post_owned_button_click(btn, f"bulk_cancel_{action}")
+        except WindowSafetyError as e:
+            return self._pre_submit_failure(str(e))
         time.sleep(sleep_time)
         # "您确定要撤销..." 确认框 / 验证码：结构化处置 + 存证（取代盲 Enter）。
-        pump = self._pump_dialogs()
+        try:
+            pump = self._pump_dialogs()
+        except (StaleCallAborted, WindowSafetyError) as e:
+            return contract.submitted_unconfirmed(
+                f"批量撤单动作已发出，但后续弹窗核验未完成：{e}",
+                data={"action": action, "submitted": True},
+            )
         return pump.attach_to({
             "code": 0,
             "status": "succeed",
@@ -815,6 +1134,7 @@ class WinThsBackend:
         2026-08-03 串线事故的正面修复：翻页快捷键是全局按键，没落到 xiadan 时
         grid 里还是上一次查询的表，Ctrl+C 原样抓走，过去非空即 code=0 出门。
         """
+        self._last_grid_columns.pop(kind, None)
         got_columns: list[str] = []
         reason = ""
         for attempt in range(1, self._GRID_ATTEMPTS + 1):
@@ -830,6 +1150,7 @@ class WinThsBackend:
                 parsed = parse_table(data)
                 if not reason:
                     rows = normalize(parsed) if normalize else parsed
+                    self._last_grid_columns[kind] = tuple(got_columns)
                     self.state.update(kind, rows)
                     return contract.ok(rows)
                 logger.warning("%s 抓到错表（第 %d/%d 次）：%s cols=%r",
@@ -1160,7 +1481,8 @@ class WinThsBackend:
                 k32.VirtualFreeEx(int(h_proc), remote_item, 0, MEM_RELEASE)
             win32api.CloseHandle(h_proc)
 
-    def _select_tree_child(self, parent_text: str, child_text: str) -> bool:
+    def _select_tree_child(self, parent_text: str, child_text: str,
+                           require_window_safety: bool = False) -> bool:
         """先按 parent_text 定位父节点，再在其【直接子节点】里整串精确匹配 child_text 选中。
 
         用于市价委托 └ 买入/卖出——子节点文字'买入'与顶层'买入[F1]'前缀相同，深度优先的
@@ -1173,6 +1495,8 @@ class WinThsBackend:
         if not tree:
             logger.warning("market: tree hwnd not found")
             return False
+        if require_window_safety:
+            self._require_owned_window_for_input(tree, "market_tree_navigation")
         _, pid = win32process.GetWindowThreadProcessId(tree)
         is32 = _proc_is_wow64(pid)
         TVITEM = _TVITEM32 if is32 else _TVITEMW
@@ -1276,9 +1600,12 @@ class WinThsBackend:
             try:
                 pt = wintypes.POINT(cx, cy)
                 u32.ClientToScreen(tree, ctypes.byref(pt))
-                win32api.SetCursorPos((pt.x, pt.y))
-                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                if require_window_safety:
+                    self._click_screen(pt.x, pt.y, "market_tree_navigation")
+                else:
+                    win32api.SetCursorPos((pt.x, pt.y))
+                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
             finally:
                 if old_ctx is not None:
                     try:
@@ -1428,113 +1755,277 @@ class WinThsBackend:
             return contract.fail(contract.CODE_INTERNAL_ERROR,
                                  contract.CLS_INTERNAL_ERROR, f"交割单读取异常: {e}")
 
-    def _lookup_entrust_no(self, stock_no, op_keyword, amount, price, timeout=8.0):
-        """After buy/sell submission, find the freshly-placed order in
-        orders/active by matching (code, op, qty, price). Returns entrust_no
-        string or None if not found within timeout.
+    @staticmethod
+    def _columns_include_any(columns: tuple[str, ...] | list[str], aliases: tuple[str, ...]) -> bool:
+        return any(alias in str(column) for column in columns for alias in aliases)
 
-        Replaces the upstream `ocr_rect` approach which read entrust_no by
-        OCR-ing a screen region (right-300:right, bottom-21:bottom). That
-        region is fragile to xiadan version / DPI / occlusion / dialog
-        timing — it reliably failed in our 100-share test even though the
-        order was actually placed. orders/active reads the broker's view via
-        clipboard which is the source of truth.
+    @classmethod
+    def _active_order_columns_reliable(cls, columns: tuple[str, ...] | list[str]) -> bool:
+        """Whether an active-order table can prove a limit-order identity.
+
+        The generic table guard only proves that this is broadly an order table.
+        Ownership needs every component of the fingerprint and a stable order
+        ID; accepting a partial broker skin here would turn a later heuristic
+        into a false contract-number claim.
         """
-        target_price = f"{float(price):.3f}" if price is not None else None
-        target_amount = str(int(amount))
+        columns = tuple(str(column) for column in columns if str(column).strip())
+        required = (
+            ("合同编号", "委托编号"),
+            ("证券代码",),
+            ("操作", "买卖标志"),
+            ("委托数量",),
+            ("委托价格", "委托价"),
+            ("成交数量",),
+            ("备注", "委托状态", "状态"),
+        )
+        return bool(columns) and all(cls._columns_include_any(columns, aliases) for aliases in required)
+
+    @staticmethod
+    def _entrust_no(value: Any) -> str:
+        return str(value or "").strip()
+
+    @classmethod
+    def _matching_limit_entrust_nos(cls, rows: list[dict], stock_no: Any,
+                                    op_keyword: str, amount: Any, price: Any) -> list[str]:
+        """Return IDs whose complete normalized fingerprint exactly matches.
+
+        This helper does not infer any ordering from contract numbers. It is
+        deliberately pure so the ambiguity rule can be unit-tested without
+        Windows APIs.
+        """
+        try:
+            target_amount = int(amount)
+            target_price = round(float(price), 3)
+        except (TypeError, ValueError):
+            return []
+        matched: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            entrust_no = cls._entrust_no(row.get("entrust_no"))
+            if not entrust_no:
+                continue
+            if row.get("证券代码") != str(stock_no):
+                continue
+            if row.get("方向") != op_keyword:
+                continue
+            if row.get("委托数量") != target_amount:
+                continue
+            row_price = row.get("委托价")
+            if isinstance(row_price, bool) or not isinstance(row_price, (int, float)):
+                continue
+            if round(float(row_price), 3) != target_price:
+                continue
+            matched.append(entrust_no)
+        return matched
+
+    @classmethod
+    def _unique_new_limit_entrust_no(cls, rows: list[dict], baseline_entrust_nos: set[str],
+                                     stock_no: Any, op_keyword: str, amount: Any,
+                                     price: Any) -> tuple[str | None, int]:
+        """Claim an ID only when exactly one full-fingerprint candidate is new."""
+        candidates = [
+            entrust_no
+            for entrust_no in cls._matching_limit_entrust_nos(
+                rows, stock_no, op_keyword, amount, price)
+            if entrust_no not in baseline_entrust_nos
+        ]
+        return (candidates[0], 1) if len(candidates) == 1 else (None, len(candidates))
+
+    def _read_limit_order_baseline(self) -> tuple[set[str] | None, dict[str, Any] | None]:
+        """Read a strict, pre-submit full order-table baseline for limit orders."""
+        result = self.get_active_orders_all()
+        if not contract.is_succeed(result):
+            detail = ((result.get("error") or {}).get("message")) or "委托表读取失败"
+            return None, contract.fail(
+                result.get("code") or contract.CODE_READ_FAILED,
+                ((result.get("error") or {}).get("class")) or CLS_READ_FAILED,
+                f"限价委托提交前无法建立可靠委托表基线（{detail}），已中止未提交",
+                data={"submitted": False},
+            )
+        columns = self._last_grid_columns.get("active_orders", ())
+        if not self._active_order_columns_reliable(columns):
+            return None, contract.fail(
+                contract.CODE_TABLE_MISMATCH, CLS_TABLE_MISMATCH,
+                "限价委托提交前的委托表缺少合同号、代码、方向、数量、价格或状态列，"
+                "无法可靠归属新订单，已中止未提交",
+                data={"submitted": False, "got_columns": list(columns)},
+            )
+        rows = result.get("data")
+        if not isinstance(rows, list):
+            return None, contract.fail(
+                contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                "限价委托提交前的委托表结果不是行列表，无法建立可靠基线，已中止未提交",
+                data={"submitted": False},
+            )
+        ids = [self._entrust_no(row.get("entrust_no")) for row in rows if isinstance(row, dict)]
+        if len(ids) != len(rows) or any(not entrust_no for entrust_no in ids) or len(set(ids)) != len(ids):
+            return None, contract.fail(
+                contract.CODE_TABLE_MISMATCH, CLS_TABLE_MISMATCH,
+                "限价委托提交前的委托表存在缺失或重复合同号，无法证明新旧订单边界，已中止未提交",
+                data={"submitted": False, "got_columns": list(columns)},
+            )
+        return set(ids), None
+
+    def _lookup_entrust_no(self, stock_no, op_keyword, amount, price,
+                           baseline_entrust_nos: set[str] | None, timeout=8.0):
+        """Find one uniquely new full-fingerprint order after a limit submit.
+
+        The previous implementation sorted same-parameter candidates by the
+        largest contract number. That assumption is not evidence of ownership:
+        an old/manual/external order can have a larger number. Only a contract
+        absent from the pre-submit baseline is eligible, and multiple new rows
+        are explicitly unresolved.
+        """
+        if baseline_entrust_nos is None:
+            logger.warning("lookup_entrust_no refused without a pre-submit baseline")
+            return None
         deadline = time.time() + timeout
         last_seen_rows = 0
         while time.time() < deadline:
-            result = self.get_active_orders()
+            result = self.get_active_orders_all()
             if contract.is_succeed(result):
-                # 契约 v2：行已规范化（数值为 number、方向/状态为枚举、id 键为 entrust_no）。
+                columns = self._last_grid_columns.get("active_orders", ())
+                if not self._active_order_columns_reliable(columns):
+                    logger.warning("lookup_entrust_no refused unreliable columns=%r", columns)
+                    return None
                 rows = result.get("data") or []
+                if not isinstance(rows, list):
+                    logger.warning("lookup_entrust_no got non-list order rows")
+                    return None
                 last_seen_rows = len(rows)
-                candidates = []
-                for r in rows:
-                    if (r.get("证券代码") or "") != str(stock_no):
-                        continue
-                    if op_keyword not in (r.get("方向") or ""):
-                        continue
-                    if r.get("委托数量") != int(target_amount):
-                        continue
-                    if target_price is not None and r.get("委托价") != float(target_price):
-                        continue
-                    candidates.append(r)
-                if candidates:
-                    candidates.sort(
-                        key=lambda r: int(r.get("entrust_no") or 0),
-                        reverse=True,
+                entrust_no, candidate_count = self._unique_new_limit_entrust_no(
+                    rows, baseline_entrust_nos, stock_no, op_keyword, amount, price)
+                if entrust_no:
+                    logger.info(
+                        "lookup_entrust_no uniquely matched new order stock=%s op=%s qty=%s price=%s -> %s",
+                        stock_no, op_keyword, amount, price, entrust_no,
                     )
-                    eno = (candidates[0].get("entrust_no") or "").strip()
-                    if eno:
-                        logger.info(
-                            "lookup_entrust_no matched stock=%s op=%s qty=%s price=%s -> %s",
-                            stock_no, op_keyword, target_amount, target_price, eno,
-                        )
-                        return eno
+                    return entrust_no
+                if candidate_count > 1:
+                    logger.warning(
+                        "lookup_entrust_no ambiguous: %d newly appeared full matches "
+                        "stock=%s op=%s qty=%s price=%s",
+                        candidate_count, stock_no, op_keyword, amount, price,
+                    )
+                    return None
             time.sleep(0.3)
         logger.warning(
             "lookup_entrust_no timeout stock=%s op=%s qty=%s price=%s rows_last=%d",
-            stock_no, op_keyword, target_amount, target_price, last_seen_rows,
+            stock_no, op_keyword, amount, price, last_seen_rows,
         )
         return None
 
     def _submit_trade(self, panel_key, op_keyword, stock_no, amount, price):
-        """Shared form-fill + submit + lookup pipeline for buy/sell.
+        """Shared conservative limit-order form-fill, submit, and ownership path."""
+        submitted = False
 
-        panel_key: 'F1' (buy) or 'F2' (sell).
-        op_keyword: '买入' or '卖出' — substring matched against orders/active 操作 column.
-        """
-        self.switch_to_normal()
-        _activate_window(self.hwnd_main)
-        hot_key([panel_key])
-        time.sleep(sleep_time)
-        hwnd = self.get_right_hwnd()
-        ctrl = self._find_input(hwnd, 0x408)
-        set_text(ctrl, stock_no)
-        time.sleep(sleep_time)
-        price_str = None
-        if price is not None:
-            price_str = "%.3f" % price
-            ctrl = self._find_input(hwnd, 0x409)
-            set_text(ctrl, price_str, True)
-            time.sleep(short_sleep_time)
-        ctrl = self._find_input(hwnd, 0x40A)
-        set_text(ctrl, str(amount))
-        time.sleep(sleep_time)
-        # Submit form（Enter 提交表单本身）→ 之后可能出现的确认框/验证码/结果框
-        # 交给 DialogSentry 结构化处置（发现弹窗→点肯定按钮→存证；含 Edit 的
-        # 验证码框走 input_ocr）。取代旧的三连盲 Enter：不再依赖焦点与时序，
-        # 弹窗标题/全文/所点按钮全部带回回执，绝不静默。
-        # 提交前最后一次对代次：填单到这里已过去约 1s，若本笔已被超时作废，
-        # 绝不能在下一笔正在操作同一窗口时又敲一次提交。
-        self._abort_if_stale("submit_trade")
-        hot_key(["enter"])   # submit form → 可能弹「委托确认」
-        pump = self._pump_dialogs()
-        time.sleep(sleep_time)
-        entrust_no = pump.entrust_no or self._lookup_entrust_no(
-            stock_no, op_keyword, amount, price)
-        if entrust_no:
-            return contract.ok(pump.attach_to({
-                "entrust_no": entrust_no,
-                "stock_no": str(stock_no),
-                "方向": op_keyword,
-                "委托数量": int(amount),
-                "委托价": float(price) if price is not None else None,
-                "submitted": True,
-            }))
-        if pump.texts:
-            # 回查无此单 + 有弹窗文本 ⇒ 大概率被拒/废单：原文原样带回 broker_msg，
-            # class 由关键词表尽力映射（认不出即 unknown = 不可自动重试）。
-            return contract.broker_rejected(
-                "；".join(pump.texts),
-                message="委托未进入委托列表，客户端有提示",
-                data=pump.attach_to({"stock_no": str(stock_no), "submitted": True}))
-        return contract.submitted_unconfirmed(
-            "已提交但未能在委托表中匹配到对应订单，真相不可知。"
-            "安全动作=用同一 client_order_id 原样重发（幂等），或调 query_order 核实",
-            data=pump.attach_to({"stock_no": str(stock_no), "submitted": True}))
+        def mark_submitted() -> None:
+            nonlocal submitted
+            submitted = True
+
+        try:
+            baseline_entrust_nos, baseline_error = self._read_limit_order_baseline()
+            if baseline_error:
+                return baseline_error
+            if baseline_entrust_nos is None:
+                return self._pre_submit_failure("限价委托提交前未能建立委托表基线")
+
+            self._switch_to_normal_safely()
+            self._send_hotkey([panel_key], "limit_order_panel")
+            time.sleep(sleep_time)
+            hwnd = self.get_right_hwnd()
+            if not hwnd:
+                return self._pre_submit_failure(
+                    "限价委托提交前未找到右侧下单面板",
+                    contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                )
+            code_ctrl = self._find_input(hwnd, 0x408)
+            amount_ctrl = self._find_input(hwnd, 0x40A)
+            if not code_ctrl or not amount_ctrl:
+                return self._pre_submit_failure(
+                    "限价委托提交前未找到证券代码或数量输入框",
+                    contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                )
+            self._set_owned_text(code_ctrl, stock_no, "limit_order_code")
+            time.sleep(sleep_time)
+            if price is not None:
+                price_ctrl = self._find_input(hwnd, 0x409)
+                if not price_ctrl:
+                    return self._pre_submit_failure(
+                        "限价委托提交前未找到价格输入框",
+                        contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                    )
+                self._set_owned_text(price_ctrl, "%.3f" % price, "limit_order_price", True)
+                time.sleep(short_sleep_time)
+            self._set_owned_text(amount_ctrl, str(amount), "limit_order_amount")
+            time.sleep(sleep_time)
+
+            # The last foreground check occurs immediately before Enter. Mark
+            # the outcome unknown before invoking the global submit key: an
+            # exception during the key event cannot prove that no submit began.
+            self._send_hotkey(
+                ["enter"], "limit_submit", before_dispatch=mark_submitted
+            )
+        except StaleCallAborted:
+            raise
+        except WindowSafetyError as e:
+            if not submitted:
+                return self._pre_submit_failure(str(e))
+            return contract.submitted_unconfirmed(
+                f"限价委托已进入提交动作，但前台窗口校验随后失败：{e}",
+                data={"stock_no": str(stock_no), "submitted": True},
+            )
+        except Exception as e:
+            logger.exception("limit order failed before/while submit stock=%s", stock_no)
+            if not submitted:
+                return self._pre_submit_failure(
+                    f"限价委托提交前发生异常：{e}",
+                    contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                )
+            return contract.submitted_unconfirmed(
+                f"限价委托已进入提交动作，但客户端未能确认结果：{e}",
+                data={"stock_no": str(stock_no), "submitted": True},
+            )
+
+        try:
+            pump = self._pump_dialogs()
+            time.sleep(sleep_time)
+            entrust_no = self._entrust_no(getattr(pump, "entrust_no", None))
+            if not entrust_no:
+                entrust_no = self._lookup_entrust_no(
+                    stock_no, op_keyword, amount, price, baseline_entrust_nos)
+            if entrust_no:
+                return contract.ok(pump.attach_to({
+                    "entrust_no": entrust_no,
+                    "stock_no": str(stock_no),
+                    "方向": op_keyword,
+                    "委托数量": int(amount),
+                    "委托价": float(price) if price is not None else None,
+                    "submitted": True,
+                }))
+            if pump.texts:
+                return contract.broker_rejected(
+                    "；".join(pump.texts),
+                    message="委托已进入提交动作但未能在委托表唯一确认，客户端有提示",
+                    data=pump.attach_to({"stock_no": str(stock_no), "submitted": True}),
+                )
+            return contract.submitted_unconfirmed(
+                "限价委托已提交，但委托表中没有唯一新增的完整匹配订单；未认领合同号。"
+                "请用同一 client_order_id 查询或人工核对，勿改单重下",
+                data=pump.attach_to({"stock_no": str(stock_no), "submitted": True}),
+            )
+        except StaleCallAborted as e:
+            return contract.submitted_unconfirmed(
+                f"限价委托已提交，但后续核验被作废：{e}",
+                data={"stock_no": str(stock_no), "submitted": True},
+            )
+        except Exception as e:
+            logger.exception("limit order post-submit verification failed stock=%s", stock_no)
+            return contract.submitted_unconfirmed(
+                f"限价委托已提交，但后续核验失败：{e}",
+                data={"stock_no": str(stock_no), "submitted": True},
+            )
 
     @guarded
     def _do_sell(self, stock_no, amount, price):
@@ -1556,6 +2047,8 @@ class WinThsBackend:
         键盘法（真机验证优先）：标准 ComboBox 收到数字字符 → 增量匹配"以该数字开头"的项
         （买入'1'→'1-...'、卖出'4'→'4-五档即成剩撤'），且能触发同花顺的策略变更处理。
         跨进程发键需 AttachThreadInput + SetFocus，否则 WM_CHAR 落不到目标控件。"""
+        self._require_foreground_for_input("market_strategy")
+        self._require_owned_window_for_input(combo, "market_strategy")
         CB_GETCURSEL, CB_SETCURSEL = 0x0147, 0x014E
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
@@ -1592,59 +2085,92 @@ class WinThsBackend:
             return contract.fail(contract.CODE_INVALID_PARAMS, contract.CLS_INVALID_PARAMS,
                                  f"未知方向 {op_keyword!r}")
 
-        self.switch_to_normal()
-        _activate_window(self.hwnd_main)
-        # 下单前快照成交表作 before 基线（差分辨"本次新增成交" vs 历史成交；~1-2s，
-        # 换回执真实性，值得——市价单可能部分成交，必须拿准实际成交量/均价）。
-        pre = self.get_filled_orders()
-        if pre.get("code") != 0:
-            # 基线拿不到就**不下单**。空基线会把当日同股同向的历史成交算成本次成交
-            # （回执差分认「after 里 before 没有的行」），直接污染真钱 sizing 的输入；
-            # 而市价单发出去就没法回收。宁可不下单让调用方重试，也不带着空基线提交。
-            reason = ((pre.get("error") or {}).get("message")) or ""
-            return contract.fail(
-                contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
-                f"下单前无法读取成交表作回执基线（{reason}），已中止未提交——"
-                "空基线会把历史成交误算成本次成交。请稍后重试",
-                data={"submitted": False})
-        before = pre.get("data") or []
+        submitted = False
 
-        if not self._select_tree_child(MARKET_TREE_PARENT, op_keyword):
-            return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
-                                 "未能导航到市价委托面板", data={"submitted": False})
-        time.sleep(sleep_time)
-        hwnd = self.get_right_hwnd()
+        def mark_submitted() -> None:
+            nonlocal submitted
+            submitted = True
 
-        # 填 证券代码 + 数量（市价面板无价格框）
-        set_text(self._find_input(hwnd, MARKET_CODE_ID), stock_no)
-        time.sleep(sleep_time)
-        set_text(self._find_input(hwnd, MARKET_AMOUNT_ID), str(amount))
-        time.sleep(short_sleep_time)
+        try:
+            self._switch_to_normal_safely()
+            # 下单前快照成交表作 before 基线（差分辨"本次新增成交" vs 历史成交；~1-2s，
+            # 换回执真实性，值得——市价单可能部分成交，必须拿准实际成交量/均价）。
+            pre = self.get_filled_orders()
+            if pre.get("code") != 0:
+                reason = ((pre.get("error") or {}).get("message")) or ""
+                return contract.fail(
+                    contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                    f"下单前无法读取成交表作回执基线（{reason}），已中止未提交——"
+                    "空基线会把历史成交误算成本次成交。请稍后重试",
+                    data={"submitted": False})
+            before = pre.get("data") or []
 
-        # 委托策略 = 五档即成剩撤（卖出默认是即成剩撤=深市专有、沪市会拒 → 必须显式设）
-        combo = self._find_ctrl_by_id(hwnd, MARKET_STRATEGY_COMBO_ID, cls="ComboBox", visible=True) \
-            or self._find_ctrl_by_id(hwnd, MARKET_STRATEGY_COMBO_ID)
-        if not combo:
-            return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
-                                 "未找到委托策略下拉框", data={"submitted": False})
-        if not self._set_market_strategy(combo, strat["key"], strat["index"]):
-            logger.warning("market strategy not set to 五档即成剩撤 op=%s, abort", op_keyword)
-            return contract.fail(contract.CODE_INVALID_PARAMS, contract.CLS_INVALID_PARAMS,
-                                 "委托策略未能设为五档即成剩撤，已中止（避免下错单）",
-                                 data={"submitted": False})
+            if not self._select_tree_child(
+                    MARKET_TREE_PARENT, op_keyword, require_window_safety=True):
+                return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                                     "未能导航到市价委托面板", data={"submitted": False})
+            time.sleep(sleep_time)
+            hwnd = self.get_right_hwnd()
+            code_ctrl = self._find_input(hwnd, MARKET_CODE_ID)
+            amount_ctrl = self._find_input(hwnd, MARKET_AMOUNT_ID)
+            if not code_ctrl or not amount_ctrl:
+                return self._pre_submit_failure(
+                    "市价委托提交前未找到证券代码或数量输入框",
+                    contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                )
 
-        # 提交：点提交按钮（焦点无关，避开 combo 焦点吞 Enter）。
-        # 必须 PostMessage：SendMessage 是同步跨进程调用，按钮 handler 弹出模态
-        # 「委托确认」框时不返回 → 线程死锁（2026-07-13 事故根因），后续弹窗
-        # 处理代码永远执行不到。
-        self._abort_if_stale("submit_market_trade")
-        submit_btn = self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID, cls="Button", visible=True) \
-            or self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID)
-        if submit_btn:
-            win32api.PostMessage(submit_btn, win32con.BM_CLICK, 0, 0)
-        else:
-            hot_key(["enter"])
-        pump = self._pump_dialogs()   # 确认框/验证码/结果框：结构化处置 + 存证
+            # 填证券代码 + 数量（市价面板无价格框）。
+            self._set_owned_text(code_ctrl, stock_no, "market_order_code")
+            time.sleep(sleep_time)
+            self._set_owned_text(amount_ctrl, str(amount), "market_order_amount")
+            time.sleep(short_sleep_time)
+
+            # 委托策略 = 五档即成剩撤（卖出默认是即成剩撤=深市专有、沪市会拒 → 必须显式设）
+            combo = self._find_ctrl_by_id(hwnd, MARKET_STRATEGY_COMBO_ID, cls="ComboBox", visible=True) \
+                or self._find_ctrl_by_id(hwnd, MARKET_STRATEGY_COMBO_ID)
+            if not combo:
+                return self._pre_submit_failure(
+                    "未找到委托策略下拉框", contract.CODE_READ_FAILED, CLS_READ_FAILED)
+            if not self._set_market_strategy(combo, strat["key"], strat["index"]):
+                logger.warning("market strategy not set to 五档即成剩撤 op=%s, abort", op_keyword)
+                return contract.fail(contract.CODE_INVALID_PARAMS, contract.CLS_INVALID_PARAMS,
+                                     "委托策略未能设为五档即成剩撤，已中止（避免下错单）",
+                                     data={"submitted": False})
+
+            # 提交：优先定向投递 BM_CLICK；没有按钮才使用受前台校验的 Enter。
+            submit_btn = self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID, cls="Button", visible=True) \
+                or self._find_ctrl_by_id(hwnd, MARKET_SUBMIT_BTN_ID)
+            if submit_btn:
+                self._post_owned_button_click(
+                    submit_btn, "market_submit", before_dispatch=mark_submitted
+                )
+            else:
+                self._send_hotkey(["enter"], "market_submit", before_dispatch=mark_submitted)
+        except StaleCallAborted:
+            raise
+        except WindowSafetyError as e:
+            if not submitted:
+                return self._pre_submit_failure(str(e))
+            return contract.submitted_unconfirmed(
+                f"市价委托已进入提交动作，但窗口安全校验随后失败：{e}",
+                data={"stock_no": str(stock_no), "submitted": True},
+            )
+        except Exception as e:
+            logger.exception("market order failed before/while submit stock=%s", stock_no)
+            if not submitted:
+                return self._pre_submit_failure(
+                    f"市价委托提交前发生异常：{e}", contract.CODE_READ_FAILED, CLS_READ_FAILED)
+            return contract.submitted_unconfirmed(
+                f"市价委托已进入提交动作，但客户端未能确认结果：{e}",
+                data={"stock_no": str(stock_no), "submitted": True},
+            )
+        try:
+            pump = self._pump_dialogs()   # 确认框/验证码/结果框：结构化处置 + 存证
+        except (StaleCallAborted, WindowSafetyError) as e:
+            return contract.submitted_unconfirmed(
+                f"市价委托已进入提交动作，但后续弹窗核验未完成：{e}",
+                data={"stock_no": str(stock_no), "submitted": True},
+            )
         time.sleep(sleep_time)
 
         # 回执：轮询成交表拿本次新增成交（五档即成剩撤成交极快，给足 8s）
@@ -1678,15 +2204,20 @@ class WinThsBackend:
     def _do_cancel(self, entrust_no):
         try:
             return self._cancel_inner(entrust_no)
+        except StaleCallAborted:
+            raise
+        except WindowSafetyError as e:
+            logger.warning("cancel(%s) stopped by window safety: %s", entrust_no, e)
+            return self._pre_submit_failure(str(e))
         except Exception as e:
             logger.exception("cancel(%s) unhandled exception", entrust_no)
             return contract.fail(contract.CODE_INTERNAL_ERROR, contract.CLS_INTERNAL_ERROR,
                                  f"cancel error: {e}")
 
     def _cancel_inner(self, entrust_no):
-        self.switch_to_normal()
-        hot_key(["F3"])
-        self.refresh()
+        self._switch_to_normal_safely()
+        self._send_hotkey(["F3"], "cancel_panel")
+        self.refresh(require_window_safety=True)
         hwnd = self.get_right_hwnd()
         if not hwnd:
             return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
@@ -1724,22 +2255,25 @@ class WinThsBackend:
         if find is None:
             return contract.fail(contract.CODE_NOT_FOUND, contract.CLS_NOT_FOUND,
                                  f"撤单：委托表中没找到指定订单 {entrust_no}（可能已成/已撤）")
-        # 撤单是按行号算坐标的盲点击：本笔若已被作废，页面早被下一笔切走，
-        # 这两下点击会落到未知控件上 —— 提交类动作前必须对代次。
-        self._abort_if_stale("cancel_click")
+        # 撤单是按行号算坐标的盲点击。两次点击分别校验前台，避免第二下在
+        # 已失焦、HWND 被复用或调用作废后落到其他应用/其他控件。
+        self._require_owned_window_for_input(ctrl, "cancel_click")
         left, top, right, bottom = win32gui.GetWindowRect(ctrl)
         x = 50 + left
         y = 30 + 16 * find + top
-        win32api.SetCursorPos((x, y))
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        self._click_screen(x, y, "cancel_select_row")
         time.sleep(sleep_time)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        self._click_screen(x, y, "cancel_confirm_row")
         time.sleep(sleep_time)
         # 双击委托行后可能弹「撤单确认」——结构化处置（取代两次盲 Enter），
         # 弹窗内容带回回执。
-        pump = self._pump_dialogs()
+        try:
+            pump = self._pump_dialogs()
+        except (StaleCallAborted, WindowSafetyError) as e:
+            return contract.submitted_unconfirmed(
+                f"撤单双击已发出，但后续弹窗核验未完成：{e}",
+                data={"entrust_no": str(entrust_no), "submitted": True},
+            )
         return contract.ok(pump.attach_to({"entrust_no": str(entrust_no), "submitted": True}))
 
     def get_result(self, cid=0x3EC):
@@ -1781,9 +2315,12 @@ class WinThsBackend:
             else:
                 return {"code": 1, "status": "failed", "msg": text}
 
-    def refresh(self):
+    def refresh(self, require_window_safety: bool = False):
         self._abort_if_stale("refresh")
-        hot_key(["F5"])
+        if require_window_safety:
+            self._send_hotkey(["F5"], "refresh")
+        else:
+            hot_key(["F5"])
         time.sleep(refresh_sleep_time)
 
     def active_mian_window(self):
@@ -1791,17 +2328,25 @@ class WinThsBackend:
             ctypes.windll.user32.SwitchToThisWindow(self.hwnd_main, True)
             time.sleep(sleep_time)
 
-    def switch_to_normal(self):
+    def switch_to_normal(self, require_window_safety: bool = False):
         # 翻页/抓表链路的第一个动作 —— 代次检查放这里，脱缰线程在发出任何
         # 全局按键之前就退出。
+        require_window_safety = require_window_safety or bool(
+            getattr(self._tls, "require_window_safety", False)
+        )
         self._abort_if_stale("switch_to_normal")
         tabs = self.get_left_bottom_tabs()
+        if require_window_safety:
+            self._require_owned_window_for_input(tabs, "switch_to_normal")
         left, top, right, bottom = win32gui.GetWindowRect(tabs)
         x = left + 10
         y = top + 5
-        win32api.SetCursorPos((x, y))
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        if require_window_safety:
+            self._click_screen(x, y, "switch_to_normal")
+        else:
+            win32api.SetCursorPos((x, y))
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         time.sleep(sleep_time)
         _activate_window(self.hwnd_main)
 
@@ -1874,16 +2419,15 @@ class WinThsBackend:
         pil = Image.fromarray(binary)
         return pil.filter(ImageFilter.SHARPEN)
 
-    def _refresh_captcha(self, captcha_static):
+    def _refresh_captcha(self, captcha_static, dialog):
         """Click the captcha image to trigger image regeneration. xiadan does
         NOT auto-refresh on wrong submission — without this each retry OCRs
         the same image and gets the same wrong answer."""
         rect = win32gui.GetWindowRect(captcha_static)
         cx = (rect[0] + rect[2]) // 2
         cy = (rect[1] + rect[3]) // 2
-        win32api.SetCursorPos((cx, cy))
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        self._require_owned_window_for_input(captcha_static, "captcha_refresh")
+        self._click_owned_popup(dialog, cx, cy, "captcha_refresh")
         time.sleep(short_sleep_time)
 
     def input_ocr(self):
@@ -1931,6 +2475,10 @@ class WinThsBackend:
                 logger.warning("ocr attempt=%d cannot resolve dialog from %s",
                                attempt, hex(captcha_static))
                 return
+            if not self._window_is_owned_by_bound_process(dialog):
+                raise WindowSafetyError(
+                    "captcha_dialog: 验证码弹窗不属于当前已绑定的 xiadan 进程，已停止输入"
+                )
             edit_hwnd = 0
             ok_btn = 0
 
@@ -1948,11 +2496,14 @@ class WinThsBackend:
                 logger.warning("ocr attempt=%d no Edit in dialog %s",
                                attempt, hex(dialog))
                 return
+            self._require_owned_window_for_input(edit_hwnd, "captcha_edit")
+            if ok_btn:
+                self._require_owned_window_for_input(ok_btn, "captcha_confirm")
             # On retries (attempt > 1), force a fresh captcha image first —
             # xiadan doesn't auto-rotate on wrong submission, so without this
             # every retry OCRs the same image and gets the same wrong answer.
             if attempt > 1:
-                self._refresh_captcha(captcha_static)
+                self._refresh_captcha(captcha_static, dialog)
             ocr_png = os.path.join(work_dir, "ocr.png")
             ocr_proc_png = os.path.join(work_dir, "ocr_proc.png")
             self.capture_window(captcha_static, ocr_png)
@@ -1982,15 +2533,12 @@ class WinThsBackend:
             # silently dropped). So: bring popup to foreground, click the Edit
             # center to grant focus, attach thread input, type via WM_CHAR.
             user32 = ctypes.windll.user32
-            _activate_window(dialog)
-            time.sleep(short_sleep_time)
             er = win32gui.GetWindowRect(edit_hwnd)
             cx = (er[0] + er[2]) // 2
             cy = (er[1] + er[3]) // 2
-            win32api.SetCursorPos((cx, cy))
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            self._click_owned_popup(dialog, cx, cy, "captcha_focus_edit")
             time.sleep(short_sleep_time)
+            self._require_owned_window_for_input(edit_hwnd, "captcha_type")
             my_tid = ctypes.windll.kernel32.GetCurrentThreadId()
             target_tid, _ = win32process.GetWindowThreadProcessId(edit_hwnd)
             attached = False
@@ -2005,6 +2553,7 @@ class WinThsBackend:
                 # WM_CHAR per char — real-typing semantics, bypasses IME and
                 # the SetText anti-bot subclass.
                 for ch in code:
+                    self._require_owned_window_for_input(edit_hwnd, "captcha_type")
                     user32.SendMessageW(edit_hwnd, win32con.WM_CHAR, ord(ch), 0)
                     time.sleep(0.02)
             finally:
@@ -2025,9 +2574,11 @@ class WinThsBackend:
             if ok_btn:
                 # PostMessage：确定按钮的 handler 若再弹模态框（如"验证码错误"），
                 # SendMessage 会同步卡死本线程（同 2026-07-13 事故根因）。
-                win32api.PostMessage(ok_btn, win32con.BM_CLICK, 0, 0)
+                self._post_owned_button_click(ok_btn, "captcha_confirm")
             else:
-                hot_key(["enter"])
+                self._send_hotkey(
+                    ["enter"], "captcha_confirm", expected_popup=dialog
+                )
             time.sleep(sleep_time)
             if not self.get_ocr_hwnd():
                 logger.info("ocr accepted attempt=%d code=%r", attempt, code)
@@ -2190,8 +2741,7 @@ class WinThsBackend:
         加速键（与下拉列表顺序一致）。这里只负责把窗口拉到前台并发按键，
         不核验切换结果——受控端对账户身份保持无感知，切换后由调用方用
         balance/position 做指纹核对再继续操作。"""
-        _activate_window(self.hwnd_main)
-        hot_key(["alt", str(slot)])
+        self._send_hotkey(["alt", str(slot)], "switch_account")
         # 切换会触发资金/持仓面板重载，稍等再放行后续操作。
         time.sleep(sleep_time * 2)
         return contract.ok({
