@@ -162,16 +162,18 @@ class OrderLedger:
             raise LedgerUnavailable(f"台账读取失败：{e}") from e
 
     def coid_by_entrust(self) -> dict[str, str]:
-        """entrust_no → client_order_id，供 orders_active/orders_filled 回显 join。
+        """买卖 entrust_no → client_order_id，供 orders_active/orders_filled 回显 join。
 
         读失败返回空表：**回显是尽力而为的增强字段**（对账主键是 entrust_no），
-        不能因为 join 不上就让查询整体失败。
+        不能因为 join 不上就让查询整体失败。撤单动作也会引用目标 entrust_no，但不能
+        覆盖原买卖单的关联；撤单 ID 的核验走其自身台账记录。
         """
         try:
             with self._connect() as conn:
                 rows = conn.execute(
                     "SELECT entrust_no, client_order_id FROM orders"
-                    " WHERE entrust_no IS NOT NULL AND entrust_no != ''").fetchall()
+                    " WHERE method IN ('buy', 'sell')"
+                    " AND entrust_no IS NOT NULL AND entrust_no != ''").fetchall()
                 return {str(r["entrust_no"]): str(r["client_order_id"]) for r in rows}
         except sqlite3.Error:
             logger.warning("台账 entrust_no 映射读取失败，本次不回显 client_order_id",

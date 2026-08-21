@@ -14,6 +14,20 @@ import asyncio
 from trader import contract, dispatcher
 
 
+COID = "gl-0198f6a1-0001-7000-8000-000000000001"
+
+
+class FakeLedger:
+    def reserve(self, client_order_id, method, params):
+        return "new", None
+
+    def complete(self, client_order_id, receipt, entrust_no=None):
+        pass
+
+    def release(self, client_order_id):
+        pass
+
+
 class FakeBackend:
     """按方法名返回预置 result dict 的假后端。"""
 
@@ -22,6 +36,7 @@ class FakeBackend:
         self.calls = []
         self.win_lock = asyncio.Lock()
         self.agent_entrust_nos: set[str] = set()
+        self.ledger = FakeLedger()
 
     async def _run(self, name, *args):
         self.calls.append((name, args))
@@ -82,7 +97,8 @@ def test_success_is_single_layer_with_id_echoed():
 def test_submitted_unconfirmed_is_not_unknown_error():
     """已提交未确认必须给出明确文案 + 透传信封，绝不能塌成'未知错误'。"""
     frame = {"type": "call", "id": "id2", "method": "sell",
-             "params": {"stock_no": "300459", "amount": 100}}
+             "params": {"stock_no": "300459", "amount": 100,
+                        "client_order_id": COID}}
     result = contract.submitted_unconfirmed("已提交但未能在委托表中匹配到对应订单",
                                             data={"submitted": True})
     reply, _ = _call(frame, result)
@@ -121,7 +137,8 @@ def test_non_contract_shape_is_rejected_loudly():
 def test_broker_rejection_carries_class_and_raw_text():
     """柜台拒单：class 可机器分流，broker_msg 保留原文（C2 两层分类）。"""
     frame = {"type": "call", "id": "id5", "method": "buy",
-             "params": {"stock_no": "600000", "amount": 100}}
+             "params": {"stock_no": "600000", "amount": 100,
+                        "client_order_id": COID}}
     reply, _ = _call(frame, contract.broker_rejected("可用资金不足，无法委托"))
     assert reply["ok"] is False
     assert reply["result"]["error"]["class"] == "insufficient_funds"
@@ -138,7 +155,8 @@ def test_method_not_whitelisted():
 
 def test_backend_exception_is_caught():
     frame = {"type": "call", "id": "id7", "method": "sell",
-             "params": {"stock_no": "300459", "amount": 100}}
+             "params": {"stock_no": "300459", "amount": 100,
+                        "client_order_id": COID}}
     reply, _ = _call(frame, RuntimeError("窗口未找到"))
     assert reply["ok"] is False
     assert "窗口未找到" in reply["error"]
@@ -166,7 +184,8 @@ def test_settlement_default_date_range():
 def test_buy_params_forwarded_to_backend():
     """确认 price 透传——市价单(price 缺省→None)不会被 dispatcher 篡改。"""
     frame = {"type": "call", "id": "id8", "method": "sell",
-             "params": {"stock_no": "300459", "amount": 100}}
+             "params": {"stock_no": "300459", "amount": 100,
+                        "client_order_id": COID}}
     _, backend = _call(frame, {"code": 0})
     name, args = backend.calls[-1]
     assert name == "sell"

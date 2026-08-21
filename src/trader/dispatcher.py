@@ -6,11 +6,13 @@
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Optional
 
 from . import contract
 from .order_ledger import LedgerUnavailable
+from .ths.rows import ST_CANCELED, ST_FILLED, ST_PARTIAL, ST_PENDING, ST_PLACED, ST_REJECTED
 from .ths.win import WinThsBackend
 
 logger = logging.getLogger(__name__)
@@ -18,14 +20,25 @@ logger = logging.getLogger(__name__)
 # 受控端单笔调用总预算：必须低于网关侧 30s 超时，保证网关永远等得到带
 # unknown 语义的 reply，而不是自造裸错误（-32003）。
 CALL_TIMEOUT_SECS = 25.0
+# ``submitted_unconfirmed`` 后的自动核验必须留在网关 30s 总预算内。买卖只读
+# orders_active/orders_filled；撤单只读内部全量委托表。超时后保留原始未知结果，绝不重发。
+AUTO_QUERY_TIMEOUT_SECS = 3.0
 # win_lock 排队上限：持锁方被拖住时，排队方回 busy 而非无限饿死。
 LOCK_TIMEOUT_SECS = 5.0
 # 会真实改变账户状态的方法：超时/busy 回执必须带「可能已提交，先核单」语义。
 ORDER_METHODS = {"buy", "sell", "cancel"}
 # 走 client_order_id 幂等台账的方法（C5a）。
 IDEMPOTENT_METHODS = {"buy", "sell", "cancel"}
+# 买卖按成交/在飞表核单；撤单按目标 entrust_no 的全量委托表核验终态。
+AUTO_QUERY_METHODS = {"buy", "sell", "cancel"}
 # busy 是背压信号：告诉调用方等多久再来，别让它自己猜（G3）。
 BUSY_BACKOFF_HINT_SECS = 3
+# UUID v7 带毫秒时间成分与随机位，便于按时间审计且碰撞概率可忽略。格式校验只
+# 约束协议，不在受控端自行生成或重写 ID——同一业务订单必须由上游复用原 ID。
+CLIENT_ORDER_ID_PATTERN = (
+    r"^gl-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_CLIENT_ORDER_ID_RE = re.compile(CLIENT_ORDER_ID_PATTERN)
 
 # Fallback tools schema in case the external JSON file cannot be found (e.g., in a packaged PyInstaller environment)
 FALLBACK_TOOLS_SCHEMA = {
@@ -118,12 +131,14 @@ FALLBACK_TOOLS_SCHEMA = {
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+            "pattern": "^gl-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "description": "客户端订单 ID，**必填幂等键**。格式必须为 gl-<小写 UUID v7>，如 gl-0198f6a1-0001-7000-8000-000000000001；UUID v7 含毫秒时间戳和随机位。调用方必须在创建买卖请求时生成并持久保存该 ID：新买卖用新 ID；网络重发或 query_order 查询同一买卖单必须原样复用。交易端只验证，不生成或改写。同一 ID 重复提交只会执行一次。buy/sell 返回 submitted_unconfirmed 时，交易端会自动执行一次只读 query_order，结果位于 data.auto_query，绝不自动重发。"
           }
         },
         "required": [
           "stock_no",
-          "amount"
+          "amount",
+          "client_order_id"
         ],
         "additionalProperties": False
       }
@@ -148,12 +163,14 @@ FALLBACK_TOOLS_SCHEMA = {
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+            "pattern": "^gl-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "description": "客户端订单 ID，**必填幂等键**。格式必须为 gl-<小写 UUID v7>，如 gl-0198f6a1-0001-7000-8000-000000000001；UUID v7 含毫秒时间戳和随机位。调用方必须在创建买卖请求时生成并持久保存该 ID：新买卖用新 ID；网络重发或 query_order 查询同一买卖单必须原样复用。交易端只验证，不生成或改写。同一 ID 重复提交只会执行一次。buy/sell 返回 submitted_unconfirmed 时，交易端会自动执行一次只读 query_order，结果位于 data.auto_query，绝不自动重发。"
           }
         },
         "required": [
           "stock_no",
-          "amount"
+          "amount",
+          "client_order_id"
         ],
         "additionalProperties": False
       }
@@ -170,11 +187,13 @@ FALLBACK_TOOLS_SCHEMA = {
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+            "pattern": "^gl-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "description": "撤单请求 ID，**必填幂等键**。格式必须为 gl-<小写 UUID v7>，如 gl-0198f6a1-0001-7000-8000-000000000001；UUID v7 含毫秒时间戳和随机位。调用方必须在创建撤单请求时生成并持久保存该 ID：每个新撤单动作使用新 ID；网络重发同一撤单请求必须原样复用。交易端只验证，不生成或改写。同一 ID 重复提交只会执行一次。cancel 返回 submitted_unconfirmed 时，交易端会按目标 entrust_no 自动读取一次含终态的全量委托表，结果位于 data.auto_query；其中 cancel_state 为已撤/部成后已撤/已成/仍在飞/废单/未知。仅一次只读核验，绝不自动重发。"
           }
         },
         "required": [
-          "entrust_no"
+          "entrust_no",
+          "client_order_id"
         ],
         "additionalProperties": False
       }
@@ -200,13 +219,13 @@ FALLBACK_TOOLS_SCHEMA = {
     },
     {
       "name": "query_order",
-      "description": "按 client_order_id 查单（契约 v2 C5b）。返回 state（未报/已报/部成/已成/已撤/废单/未知）＋首次回执快照＋分辨率 resolution：by_entrust_no=按合同编号精确命中；heuristic=台账无合同编号时按代码/数量匹配，存在同参重复单歧义；unresolved=实表中无法唯一定位，state=未知需人工。与 buy/sell/cancel 的幂等（同 id 重发不重复下单）配对使用。",
+      "description": "按 client_order_id 查单（契约 v2 C5b）。买卖单返回 state（未报/已报/部成/已成/已撤/废单/未知）＋首次回执快照＋分辨率 resolution：by_entrust_no=按合同编号精确命中；heuristic=台账无合同编号时按代码、方向、数量匹配，限价活单还须委托价一致，仍可能有同参重复单歧义；unresolved=实表中无法唯一定位，state=未知需人工。对 cancel 请求 ID，按其目标 entrust_no 精确读取含终态的全量委托表，并额外返回 cancel_state（已撤/部成后已撤/已成/仍在飞/废单/未知）。与 buy/sell/cancel 的幂等（同 id 重发不重复下单）配对使用。",
       "inputSchema": {
         "type": "object",
         "properties": {
           "client_order_id": {
             "type": "string",
-            "description": "下单时传入的 client_order_id"
+            "description": "买卖或撤单时传入的 client_order_id"
           }
         },
         "required": [
@@ -301,18 +320,126 @@ def _replay_receipt(coid: str, record: Optional[dict]) -> dict:
               "first_record": _record_brief(record)})
 
 
+def _ledger_fingerprint(record: dict) -> dict:
+    """读取台账请求指纹；损坏的历史值按空指纹处理。"""
+    try:
+        value = json.loads(record.get("fingerprint") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _cancel_target_entrust_no(record: dict) -> Optional[str]:
+    """撤单要核验的原委托编号，以首次请求参数为准。"""
+    fingerprint = _ledger_fingerprint(record)
+    value = fingerprint.get("entrust_no") or record.get("entrust_no")
+    if value is None:
+        return None
+    entrust_no = str(value).strip()
+    return entrust_no or None
+
+
+def _as_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cancel_state_from_order_row(row: dict) -> str:
+    """把原委托全量行转换为撤单动作的可审计结论。"""
+    state = row.get("状态") or "未知"
+    order_qty = _as_int(row.get("委托数量"))
+    filled_qty = _as_int(row.get("已成数量"))
+
+    if order_qty is not None and order_qty > 0 and filled_qty is not None and filled_qty >= order_qty:
+        return "已成"
+    if state == ST_CANCELED:
+        if filled_qty is not None and filled_qty > 0:
+            return "部成后已撤"
+        return "已撤"
+    if state == ST_FILLED:
+        return "已成"
+    if state in (ST_PENDING, ST_PLACED, ST_PARTIAL):
+        return "仍在飞"
+    if state == ST_REJECTED:
+        return "废单"
+    return "未知"
+
+
+async def _query_cancel(backend, client_order_id: str, record: dict) -> dict:
+    """撤单动作的查单：按目标合同编号读内部全量委托表，绝不二次撤单。"""
+    entrust_no = _cancel_target_entrust_no(record)
+    if not entrust_no:
+        logger.warning("[CANCEL_VERIFY] coid=%s lacks target entrust_no", client_order_id)
+        return contract.ok({
+            "client_order_id": client_order_id,
+            "state": "未知",
+            "cancel_state": "未知",
+            "resolution": "unresolved",
+            "entrust_no": None,
+            "ledger_state": record.get("state"),
+            "first_receipt": record.get("receipt"),
+            "matched_rows": [],
+            "tables_readable": False,
+            "note": "撤单请求未保存目标 entrust_no，无法核验是否已撤；需人工核实。",
+        })
+
+    read_all = getattr(backend, "orders_active_all", None)
+    if not callable(read_all):
+        return contract.fail(
+            contract.CODE_INTERNAL_ERROR, contract.CLS_INTERNAL_ERROR,
+            "受控端不支持撤单全量委托核验，无法确认是否已撤")
+
+    all_orders = await read_all()
+    tables_readable = contract.is_succeed(all_orders)
+    rows = (all_orders.get("data") or []) if tables_readable else []
+    matched = [row for row in rows if str(row.get("entrust_no") or "") == entrust_no]
+    resolution, state, cancel_state = "unresolved", "未知", "未知"
+    if len(matched) == 1:
+        resolution = "by_entrust_no"
+        state = matched[0].get("状态") or "未知"
+        cancel_state = _cancel_state_from_order_row(matched[0])
+
+    logger.info(
+        "[CANCEL_VERIFY] coid=%s entrust_no=%s readable=%s resolution=%s state=%s "
+        "cancel_state=%s matches=%d",
+        client_order_id, entrust_no, tables_readable, resolution, state, cancel_state, len(matched),
+    )
+    return contract.ok({
+        "client_order_id": client_order_id,
+        "state": state,
+        "cancel_state": cancel_state,
+        "resolution": resolution,
+        "entrust_no": entrust_no,
+        "ledger_state": record.get("state"),
+        "first_receipt": record.get("receipt"),
+        "matched_rows": matched,
+        "tables_readable": tables_readable,
+        "note": (
+            "cancel_state=已撤 或 部成后已撤 才表示柜台已确认撤单；"
+            "已成/仍在飞/废单/未知均不表示撤单成功。"
+        ),
+    })
+
+
 async def _query_order(backend, client_order_id: Any) -> dict:
     """C5b 按 client_order_id 查单：台账定位 + 实时委托/成交表核实。
 
     分辨率分三档，回执里明说是哪一档——消费侧据此决定信不信：
     ``by_entrust_no``（台账有 entrust_no，实表精确命中）、
-    ``heuristic``（entrust_no 未知，按代码/方向/数量/价格唯一匹配）、
+    ``heuristic``（entrust_no 未知，按代码/方向/数量匹配；限价活单再比委托价）、
     ``unresolved``（零命中或多命中 → 未知，需人工）。
+
+    对撤单请求，`client_order_id` 标识撤单动作而非原买卖单；改按其请求中保存的
+    `entrust_no` 精确读取含终态的全量委托表，才能确认已撤或部成后已撤。
+    `query_order` 保留读取历史台账中旧格式 ID 的能力；UUID v7 格式仅对新建的
+    buy/sell/cancel 生效，避免升级后历史未知订单反而无法核查。
     """
-    if not client_order_id:
+    if not isinstance(client_order_id, str) or not client_order_id.strip():
         return contract.fail(contract.CODE_INVALID_PARAMS, contract.CLS_INVALID_PARAMS,
                              "query_order 缺少 client_order_id")
-    coid = str(client_order_id)
+    coid = client_order_id.strip()
     led = _ledger_or_none(backend)
     if led is None:
         return contract.fail(contract.CODE_LEDGER_UNAVAILABLE, contract.CLS_LEDGER_UNAVAILABLE,
@@ -327,6 +454,9 @@ async def _query_order(backend, client_order_id: Any) -> dict:
             contract.CODE_NOT_FOUND, contract.CLS_NOT_FOUND,
             f"台账中没有 client_order_id={coid}："
             "本受控端未提交过该 id，或已超出台账保留窗口")
+
+    if record.get("method") == "cancel":
+        return await _query_cancel(backend, coid, record)
 
     active = await backend.orders_active()
     filled = await backend.orders_filled()
@@ -346,18 +476,28 @@ async def _query_order(backend, client_order_id: Any) -> dict:
                 resolution, state = "by_entrust_no", "已成"
     else:
         # entrust_no 未知（提交超时那批）：按首次请求指纹启发式匹配。
-        try:
-            fp = json.loads(record.get("fingerprint") or "{}")
-        except (TypeError, ValueError):
-            fp = {}
+        fp = _ledger_fingerprint(record)
         stock_no, amount = str(fp.get("stock_no") or ""), fp.get("amount")
+        direction = {"buy": "买入", "sell": "卖出"}.get(
+            record.get("method") or fp.get("method"))
+        requested_price = fp.get("price")
 
-        def _hit(rows, qty_key):
+        def _price_matches(value: Any) -> bool:
+            if requested_price is None:
+                return True
+            try:
+                return float(value) == float(requested_price)
+            except (TypeError, ValueError):
+                return False
+
+        def _hit(rows, qty_key, *, price_key: Optional[str] = None):
             return [r for r in rows
                     if (r.get("证券代码") or "") == stock_no
-                    and (amount is None or r.get(qty_key) == amount)]
+                    and (direction is None or r.get("方向") == direction)
+                    and (amount is None or r.get(qty_key) == amount)
+                    and (price_key is None or _price_matches(r.get(price_key)))]
 
-        cand = _hit(active_rows, "委托数量")
+        cand = _hit(active_rows, "委托数量", price_key="委托价")
         if len(cand) == 1:
             resolution, state, matched = "heuristic", cand[0].get("状态") or "未知", cand
         elif not cand:
@@ -375,8 +515,89 @@ async def _query_order(backend, client_order_id: Any) -> dict:
         "matched_rows": matched,
         "tables_readable": tables_ok,         # False ⇒ state 的可信度仅限台账
         "note": ("state=未知 表示实表中无法唯一定位该单，需人工核实；"
-                 "resolution=heuristic 表示按代码/数量匹配而非 id 关联，存在同参重复单歧义"),
+                 "resolution=heuristic 表示按代码/方向/数量（限价活单另含委托价）匹配而非 id 关联，"
+                 "存在同参重复单歧义"),
     })
+
+
+def _attach_auto_query(result: dict, query_result: dict) -> None:
+    """把只读自动核单结果嵌入原未知回执，绝不改变原回执的未知语义。"""
+    data = result.get("data")
+    if not isinstance(data, dict):
+        data = {}
+        result["data"] = data
+    data["auto_query"] = query_result
+
+
+async def _auto_query_after_unconfirmed(
+    backend,
+    method: str,
+    client_order_id: str,
+    result: dict,
+    *,
+    lock_held: bool,
+) -> None:
+    """对买卖/撤单未知结果做一次受限的只读核验，不重发、不改变顶层结果。
+
+    首次下单路径已持有 ``win_lock``；同 ID 再次调用命中台账时尚未持锁，需在这里
+    按正常窗口访问规则排队。无论锁忙、核单超时还是内部异常，均只附带核单失败信息，
+    绝不让它覆盖 ``submitted_unconfirmed`` 或触发第二次下单/撤单。
+    """
+    if method not in AUTO_QUERY_METHODS or result.get("code") != contract.CODE_SUBMITTED_UNCONFIRMED:
+        return
+
+    logger.info("[ORDER] submitted_unconfirmed 后开始一次只读核验 coid=%s method=%s",
+                client_order_id, method)
+    acquired_here = False
+    lock = getattr(backend, "win_lock", None)
+    if not lock_held:
+        if lock is None:
+            query_result = contract.fail(
+                contract.CODE_INTERNAL_ERROR, contract.CLS_INTERNAL_ERROR,
+                "自动核单未执行：受控端缺少窗口锁")
+            _attach_auto_query(result, query_result)
+            return
+        try:
+            await asyncio.wait_for(lock.acquire(), LOCK_TIMEOUT_SECS)
+            acquired_here = True
+        except asyncio.TimeoutError:
+            query_result = contract.busy(
+                "自动核验未执行：受控端正忙；原交易动作未重发，请稍后用同一 client_order_id 查单")
+            query_result["data"] = {"submitted": True,
+                                    "retry_after_secs": BUSY_BACKOFF_HINT_SECS}
+            _attach_auto_query(result, query_result)
+            logger.warning("[ORDER] 自动核单排队超时 coid=%s method=%s", client_order_id, method)
+            return
+
+    try:
+        try:
+            query_result = await asyncio.wait_for(
+                _query_order(backend, client_order_id), AUTO_QUERY_TIMEOUT_SECS)
+        except asyncio.TimeoutError:
+            # 与主调用超时同理：查询线程可能仍在操作窗口，作废代次后再放锁。
+            backend.degraded = True
+            invalidate = getattr(backend, "invalidate_inflight", None)
+            if invalidate:
+                invalidate(f"自动核单超过 {AUTO_QUERY_TIMEOUT_SECS}s 未完成")
+            query_result = contract.fail(
+                contract.CODE_CALL_TIMEOUT, contract.CLS_CALL_TIMEOUT,
+                "自动核验超时，原交易动作结果仍未知；未自动重发，请稍后用同一 client_order_id 查单")
+            logger.warning("[ORDER] 自动核单超时 coid=%s method=%s", client_order_id, method)
+        except Exception:
+            logger.exception("[ORDER] 自动核单异常 coid=%s method=%s", client_order_id, method)
+            query_result = contract.fail(
+                contract.CODE_INTERNAL_ERROR, contract.CLS_INTERNAL_ERROR,
+                "自动核验异常，原交易动作结果仍未知；未自动重发，请稍后用同一 client_order_id 查单")
+    finally:
+        if acquired_here:
+            lock.release()
+
+    _attach_auto_query(result, query_result)
+    query_data = query_result.get("data") if isinstance(query_result, dict) else None
+    logger.info("[ORDER] 自动核验 coid=%s method=%s result=%s/%s state=%s resolution=%s",
+                client_order_id, method, query_result.get("status"), query_result.get("code"),
+                query_data.get("state") if isinstance(query_data, dict) else None,
+                query_data.get("resolution") if isinstance(query_data, dict) else None)
 
 
 async def handle_call(
@@ -428,51 +649,62 @@ async def handle_call(
         reply["error"] = msg
         return reply
 
-    # --- C5a 幂等：在**拿锁之前**查台账。重发直接返回首次回执，连排队都不用排，
-    # 更不会走到点提交那一步。台账不可用一律拒单（需求方拍板：禁静默降级）。
+    # --- C5a 幂等：下单/撤单必须带业务级 ID，在**拿锁之前**查台账。重发直接
+    # 返回首次回执，连排队都不用排，更不会走到点提交那一步。
     reserved_coid: Optional[str] = None
     if method in IDEMPOTENT_METHODS:
         coid = params.get("client_order_id")
-        if coid is not None:
-            coid = str(coid)
-            led = _ledger_or_none(backend)
-            if led is None:
-                msg = ("下单台账不可用，已拒绝下单——无台账即无法保证 client_order_id 幂等，"
-                       "重发会造成重复下单。请检查受控端数据目录后重试")
-                reply["ok"] = False
-                reply["result"] = contract.fail(contract.CODE_LEDGER_UNAVAILABLE,
-                                                contract.CLS_LEDGER_UNAVAILABLE, msg)
-                reply["error"] = msg
-                return reply
-            try:
-                verdict, record = await asyncio.to_thread(led.reserve, coid, method, params)
-            except LedgerUnavailable as e:
-                msg = f"下单台账不可用，已拒绝下单（禁降级为无幂等下单）：{e}"
-                reply["ok"] = False
-                reply["result"] = contract.fail(contract.CODE_LEDGER_UNAVAILABLE,
-                                                contract.CLS_LEDGER_UNAVAILABLE, msg)
-                reply["error"] = msg
-                return reply
-            if verdict == "conflict":
-                msg = (f"client_order_id={coid} 已用于参数不同的委托，拒绝执行。"
-                       "同 id 必须对应同一笔委托——请换新 id，或用 query_order 查原单")
-                reply["ok"] = False
-                reply["result"] = contract.fail(contract.CODE_INVALID_PARAMS,
-                                                contract.CLS_INVALID_PARAMS, msg,
-                                                data={"submitted": False,
-                                                      "first_record": _record_brief(record)})
-                reply["error"] = msg
-                return reply
-            if verdict == "duplicate":
-                result = _replay_receipt(coid, record)
-                reply["ok"] = contract.is_succeed(result)
-                reply["result"] = result
-                if not reply["ok"]:
-                    reply["error"] = (result.get("error") or {}).get("message") or "重复提交"
-                logger.info("[RPC] 幂等命中 coid=%s state=%s，未产生第二次提交",
-                            coid, (record or {}).get("state"))
-                return reply
-            reserved_coid = coid
+        if not isinstance(coid, str) or _CLIENT_ORDER_ID_RE.fullmatch(coid) is None:
+            logger.warning("[ORDER] 拒绝无效 client_order_id method=%s frame_id=%s coid=%r",
+                           method, frame_id, coid)
+            msg = (f"{method} 的 client_order_id 格式无效，必须为 "
+                   "gl-<小写 UUID v7>（如 gl-0198f6a1-0001-7000-8000-000000000001）；"
+                   "已拒绝执行")
+            reply["ok"] = False
+            reply["result"] = contract.fail(contract.CODE_INVALID_PARAMS,
+                                            contract.CLS_INVALID_PARAMS, msg,
+                                            data={"submitted": False})
+            reply["error"] = msg
+            return reply
+        led = _ledger_or_none(backend)
+        if led is None:
+            msg = ("下单台账不可用，已拒绝下单——无台账即无法保证 client_order_id 幂等，"
+                   "重发会造成重复下单。请检查受控端数据目录后重试")
+            reply["ok"] = False
+            reply["result"] = contract.fail(contract.CODE_LEDGER_UNAVAILABLE,
+                                            contract.CLS_LEDGER_UNAVAILABLE, msg)
+            reply["error"] = msg
+            return reply
+        try:
+            verdict, record = await asyncio.to_thread(led.reserve, coid, method, params)
+        except LedgerUnavailable as e:
+            msg = f"下单台账不可用，已拒绝下单（禁降级为无幂等下单）：{e}"
+            reply["ok"] = False
+            reply["result"] = contract.fail(contract.CODE_LEDGER_UNAVAILABLE,
+                                            contract.CLS_LEDGER_UNAVAILABLE, msg)
+            reply["error"] = msg
+            return reply
+        if verdict == "conflict":
+            msg = (f"client_order_id={coid} 已用于参数不同的委托，拒绝执行。"
+                   "同 id 必须对应同一笔委托——请换新 id，或用 query_order 查原单")
+            reply["ok"] = False
+            reply["result"] = contract.fail(contract.CODE_INVALID_PARAMS,
+                                            contract.CLS_INVALID_PARAMS, msg,
+                                            data={"submitted": False,
+                                                  "first_record": _record_brief(record)})
+            reply["error"] = msg
+            return reply
+        if verdict == "duplicate":
+            result = _replay_receipt(coid, record)
+            await _auto_query_after_unconfirmed(backend, method, coid, result, lock_held=False)
+            reply["ok"] = contract.is_succeed(result)
+            reply["result"] = result
+            if not reply["ok"]:
+                reply["error"] = (result.get("error") or {}).get("message") or "重复提交"
+            logger.info("[RPC] 幂等命中 coid=%s state=%s，未产生第二次提交",
+                        coid, (record or {}).get("state"))
+            return reply
+        reserved_coid = coid
 
     # 串行化 THS 单窗口访问：order_watch 轮询与下单/查询共用 backend.win_lock。
     # 拿锁带超时：持锁方若被弹窗/慢操作拖住，排队方不能无限饿死——回 busy
@@ -558,10 +790,18 @@ async def handle_call(
             logger.error("[RPC] %s 超过 %ss 未完成，标记 degraded，回 unknown",
                          method, CALL_TIMEOUT_SECS)
             if method in ORDER_METHODS:
+                if method == "cancel":
+                    message = (
+                        "受控端处理超时（疑似弹窗或客户端无响应），撤单动作可能已提交。"
+                        "安全动作=用同一 client_order_id 原样重发（幂等，不会第二次撤单），"
+                        "或查看本次 data.auto_query / 调 query_order 核验目标委托；勿换新 id 重撤")
+                else:
+                    message = (
+                        "受控端处理超时（疑似弹窗或客户端无响应），委托可能已提交。"
+                        "安全动作=用同一 client_order_id 原样重发（幂等，不会重复下单），"
+                        "或调 query_order/orders_active 核实；勿改单重下")
                 result = contract.submitted_unconfirmed(
-                    "受控端处理超时（疑似弹窗或客户端无响应），委托可能已提交。"
-                    "安全动作=用同一 client_order_id 原样重发（幂等，不会重复下单），"
-                    "或调 query_order/orders_active 核实；勿改单重下",
+                    message,
                     data={"submitted": True})
             else:
                 result = contract.fail(
@@ -575,15 +815,23 @@ async def handle_call(
 
         # 下单类：回填 client_order_id 并把首次回执落台账（幂等重发就靠它）。
         if reserved_coid:
+            settled_coid = reserved_coid
             if isinstance(result.get("data"), dict):
-                result["data"]["client_order_id"] = reserved_coid
+                result["data"]["client_order_id"] = settled_coid
             elif result.get("data") is None:
-                result["data"] = {"client_order_id": reserved_coid}
+                result["data"] = {"client_order_id": settled_coid}
             entrust_no = (result.get("data") or {}).get("entrust_no")
+            if method == "cancel":
+                # 请求指纹已持久保存目标编号；仅回显到回执，不能把撤单动作 ID 写成原
+                # 买卖单的 entrust_no 关联，否则会覆盖 orders_active 的原订单 ID 回显。
+                target_entrust_no = str(params.get("entrust_no") or "").strip()
+                if target_entrust_no and isinstance(result.get("data"), dict):
+                    result["data"].setdefault("entrust_no", target_entrust_no)
+                entrust_no = None
             try:
                 led = _ledger_or_none(backend)
                 if led is not None:
-                    await asyncio.to_thread(led.complete, reserved_coid, result,
+                    await asyncio.to_thread(led.complete, settled_coid, result,
                                             str(entrust_no) if entrust_no else None)
                 reserved_coid = None   # 已落定，finally 不再回滚
             except LedgerUnavailable:
@@ -593,8 +841,12 @@ async def handle_call(
                 result = contract.submitted_unconfirmed(
                     "委托已提交，但台账回写失败——本次结果无法保证可幂等重放，"
                     "请立即用 orders_active/orders_filled 人工核单",
-                    data={"submitted": True, "client_order_id": reserved_coid})
+                    data={"submitted": True, "client_order_id": settled_coid})
                 reserved_coid = None
+
+            # 未知时只做一次本地只读核验；不调用 buy/sell/cancel，因此不会自动重发。
+            await _auto_query_after_unconfirmed(backend, method, settled_coid, result,
+                                                lock_held=True)
 
         reply["result"] = result
         reply["ok"] = contract.is_succeed(result)

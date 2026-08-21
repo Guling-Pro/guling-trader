@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from trader import contract
-from trader.dispatcher import FALLBACK_TOOLS_SCHEMA, METHOD_WHITELIST
+from trader.dispatcher import CLIENT_ORDER_ID_PATTERN, FALLBACK_TOOLS_SCHEMA, METHOD_WHITELIST
 from trader.ths import rows
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,8 +61,18 @@ def test_query_order_is_exposed():
 @pytest.mark.parametrize("name", ["buy", "sell", "cancel"])
 def test_order_tools_document_idempotency(name):
     tool = next(t for t in SCHEMA["tools"] if t["name"] == name)
-    desc = tool["inputSchema"]["properties"]["client_order_id"]["description"]
+    prop = tool["inputSchema"]["properties"]["client_order_id"]
+    desc = prop["description"]
     assert "幂等" in desc and "重发" in desc
+    assert "client_order_id" in tool["inputSchema"]["required"]
+    assert prop["pattern"] == CLIENT_ORDER_ID_PATTERN
+    assert "UUID v7" in desc
+
+
+def test_protocol_pins_canonical_ids_and_one_shot_auto_query():
+    assert "gl-<小写 UUID v7>" in PROTOCOL
+    assert "data.auto_query" in PROTOCOL
+    assert "绝不自动重发下单" in PROTOCOL
 
 
 def test_protocol_states_failed_is_not_not_submitted():

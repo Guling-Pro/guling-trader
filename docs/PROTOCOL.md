@@ -155,7 +155,7 @@ reply 帧本身仍是单层 `{type,id,ok,result|error}`；**`result` 一律是�
 
 #### ⚠️ `status: failed` **不等于**「未提交」
 
-`code == submitted_unconfirmed` 时委托**可能已经在柜台**。判定必须看 `code`，不能看
+`code == submitted_unconfirmed` 时交易动作**可能已经在柜台**。判定必须看 `code`，不能看
 `status`。此时调用方唯一安全动作是**用同一 `client_order_id` 原样重发**（幂等，见
 3.2.3），或调 `query_order` 核实；**禁止改单重下**。
 
@@ -199,22 +199,45 @@ reply 帧本身仍是单层 `{type,id,ok,result|error}`；**`result` 一律是�
 
 * coid **不写入柜台**（同花顺委托无自定义字段），仅存于受控端本地台账（SQLite，
   保留 ≥5 交易日）。
-* **幂等**：`buy`/`sell`/`cancel` 传 coid 后，同 id 重复提交**绝不产生第二次提交**，
-  返回首次记录的回执；首次结果尚未落定时返回 `submitted_unconfirmed`——
-  这是合法态，不是 bug（最危险那一刻台账自己也不知道结果）。
+* **必填、格式与责任边界**：`buy`/`sell`/`cancel` 的 coid 必须为
+  `gl-<小写 UUID v7>`，例如 `gl-0198f6a1-0001-7000-8000-000000000001`。UUID v7
+  含毫秒时间戳和随机位；调用方必须在创建业务请求时生成并持久保存它，网络重发、
+  `query_order` 查询同一交易动作时原样复用。交易端只验证格式和台账幂等，不生成、
+  不改写，也不能替调用方判断两个未持久化的请求是否属于同一笔业务订单。
+* **幂等**：同 id 重复提交**绝不产生第二次提交**，返回首次记录的回执；首次结果
+  尚未落定时返回 `submitted_unconfirmed`——这是合法态，不是 bug（最危险那一刻台账
+  自己也不知道结果）。同 id 不同参数仍会被拒绝。
 * 同 id **不同参数** → `invalid_params` 拒绝执行（调用方 id 复用 bug，不静默）。
 * **台账不可用一律拒单**（`ledger_unavailable`），禁静默降级为无幂等下单。
-* **回显是尽力而为**：`orders_active` / `orders_filled` 按 entrust_no join 回显 coid；
-  回查不到合同编号的单（超时那批）与外部/人工单为 `null`。**对账主键是 entrust_no，
-  coid 是增强关联**。
-* 建议 coid 全局唯一且含账户维度——受控端 `switch_account` 是盲切，对账户身份无感知。
+* **回显是尽力而为**：`orders_active` / `orders_filled` 仅按原买卖单的 entrust_no join
+  回显 coid；撤单动作引用同一编号但不会覆盖原买卖单的回显。回查不到合同编号的单
+  （超时那批）与外部/人工单为 `null`。**对账主键是 entrust_no，coid 是增强关联**。
+* coid 应全局唯一；调用方的持久记录必须把它与目标账户绑定。固定 UUID v7 格式不
+  携带账户文本，而受控端 `switch_account` 又是盲切、对账户身份无感知。
+* `buy`/`sell` 首次或幂等重放返回 `submitted_unconfirmed` 时，受控端会自动执行**一次**
+  只读 `query_order`，把结果放入 `data.auto_query`；顶层仍保持
+  `submitted_unconfirmed`，不会把启发式命中伪装成精确确认，**绝不自动重发下单**。
+* `cancel` 的 coid 标识的是撤单动作，而非原买卖单。其首次或幂等重放返回
+  `submitted_unconfirmed` 时，受控端会用该撤单请求保存的目标 `entrust_no`，自动读取**一次**
+  含终态的内部全量委托表，结果同样放入 `data.auto_query`；它不会调用买卖单的启发式
+  查询，也**绝不自动重发撤单**。只在全量表精确命中且 `cancel_state` 为 `已撤` 或
+  `部成后已撤` 时，才可判定柜台已确认撤单；`已成`、`仍在飞`、`废单`、`未知`都不是撤单成功。
+  表读取失败、零命中或多命中时保守返回 `未知`，不把“查不到”当作“已撤”。
 
 #### 3.2.4 查单（C5b）
 
-`query_order(client_order_id)` → `state` ∈ 未报/已报/部成/已成/已撤/废单/**未知**，
-并给出 `resolution`：`by_entrust_no`（精确命中）/ `heuristic`（台账无合同编号，按
-代码+数量匹配，**同参重复单存在歧义**）/ `unresolved`（零命中或多命中 → `state=未知`，
-需人工）。`unknown` 态被收窄到「回查确认前」，但**不可能被消灭**。
+买卖 `query_order(client_order_id)` → `state` ∈ 未报/已报/部成/已成/已撤/废单/**未知**，
+并给出 `resolution`：`by_entrust_no`（精确命中）/ `heuristic`（台账无合同编号时，
+活跃委托须代码、方向、数量一致；限价单还须委托价一致；成交表须代码、方向、数量一致；
+**同参重复单仍有歧义**）/ `unresolved`（零命中或多命中 → `state=未知`，需人工）。
+
+对 `cancel` 的 `client_order_id`，`query_order` 按撤单请求中保存的原始 `entrust_no`
+精确读取含终态的全量委托表，返回原委托的 `state` 与专用 `cancel_state`：`已撤`、
+`部成后已撤`、`已成`、`仍在飞`、`废单` 或 `未知`。`resolution=by_entrust_no` 才表示
+精确关联；全量表读取失败或找不到唯一目标则 `resolution=unresolved`、`cancel_state=未知`。
+`unknown` 态被收窄到「回查确认前」，但**不可能被消灭**。
+为兼容升级前已写入的台账，`query_order` 可读取历史的非 UUID v7 ID；新建的
+`buy`/`sell`/`cancel` 仍只接受规范 UUID v7。
 
 #### 3.2.5 数值与单位（C6）
 

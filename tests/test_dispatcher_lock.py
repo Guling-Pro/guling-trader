@@ -4,12 +4,27 @@ import asyncio
 from trader import contract, dispatcher
 
 
+COID = "gl-0198f6a1-0002-7000-8000-000000000002"
+
+
+class FakeLedger:
+    def reserve(self, client_order_id, method, params):
+        return "new", None
+
+    def complete(self, client_order_id, receipt, entrust_no=None):
+        pass
+
+    def release(self, client_order_id):
+        pass
+
+
 class LockFakeBackend:
     def __init__(self):
         self.win_lock = asyncio.Lock()
         self.agent_entrust_nos: set[str] = set()
         self.concurrent = 0
         self.max_concurrent = 0
+        self.ledger = FakeLedger()
 
     async def _hold(self, result):
         # 记录临界区并发度，验证锁真的串行化。
@@ -43,7 +58,8 @@ def test_window_methods_serialized_by_lock():
 def test_buy_registers_entrust_no():
     backend = LockFakeBackend()
     frame = {"type": "call", "id": "b", "method": "buy",
-             "params": {"stock_no": "600519", "amount": 100, "price": 1700.0}}
+             "params": {"stock_no": "600519", "amount": 100, "price": 1700.0,
+                        "client_order_id": COID}}
     reply = asyncio.run(dispatcher.handle_call(frame, backend))
     assert reply["ok"] is True
     assert "777" in backend.agent_entrust_nos

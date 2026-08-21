@@ -13,7 +13,7 @@
 
 **让 Agent 交易像移动支付一样，成为每个普通投资者触手可及的基础能力。**
 
-guling-trader 是一个跑在 Windows 上的开源交易执行客户端。它把你登录的同花顺独立委托客户端（xiadan.exe）接入任意 AI 助手（Claude / Cursor / openclaw 等），通过 MCP（Model Context Protocol）协议暴露 9 个交易工具——市价/限价买卖、查持仓、查资金、查委托/成交、查交割单、读自选股等——让 AI 可以直接帮你研究、盯盘、下单，而整个过程中你的账号密码始终不离开同花顺官方软件。
+guling-trader 是一个跑在 Windows 上的开源交易执行客户端。它把你登录的同花顺独立委托客户端（xiadan.exe）接入任意 AI 助手（Claude / Cursor / openclaw 等），通过 MCP（Model Context Protocol）协议暴露交易工具——市价/限价买卖、查持仓、查资金、查委托/成交、查交割单、读自选股等——让 AI 可以直接帮你研究、盯盘、下单，而整个过程中你的账号密码始终不离开同花顺官方软件。
 
 接入后，你可以对 AI 说：
 > "帮我对手价买入 100 股贵州茅台。"  
@@ -174,7 +174,7 @@ AI 助手部分（Claude、Cursor 等）在任何系统都能跑；只需确保�
 
 ## MCP 工具接口速查表
 
-配对成功后解锁全部 9 个交易工具。完整 Schema 见 [`docs/tools_schema.json`](docs/tools_schema.json)。
+配对成功后解锁全部交易工具。完整 Schema 见 [`docs/tools_schema.json`](docs/tools_schema.json)。
 
 | 工具 | 用途 | 关键参数 |
 |------|------|---------|
@@ -184,9 +184,17 @@ AI 助手部分（Claude、Cursor 等）在任何系统都能跑；只需确保�
 | `orders_filled` | 当日已成交记录 | — |
 | `settlement` | 交割单查询 | `date_range`：近一周/近一月/近三月/近一年 |
 | `watchlist` | 读同花顺自选股代码（新版）| —（顶部第一屏，按同花顺习惯最新在顶部）|
-| `buy` | 买入（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(可选) |
-| `sell` | 卖出（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(可选) |
-| `cancel` | 撤销未成交单 | `entrust_no` |
+| `buy` | 买入（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(必填) |
+| `sell` | 卖出（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(必填) |
+| `cancel` | 撤销未成交单 | `entrust_no`, `client_order_id`(必填) |
+
+`buy`、`sell`、`cancel` 的 `client_order_id` 必须是 `gl-<小写 UUID v7>`，例如
+`gl-0198f6a1-0001-7000-8000-000000000001`。调用方创建请求时生成并持久保存：新订单或
+新撤单用新 ID；网络重发同一请求必须复用原 ID。交易端只验证和防重，不会生成或改写 ID。
+买卖返回 `submitted_unconfirmed` 时会自动做一次只读 `query_order`，结果在
+`data.auto_query`；它绝不自动重发下单。撤单返回该状态时会按目标 `entrust_no` 自动读取
+一次含终态的全量委托表；只有 `data.auto_query.data.cancel_state` 为 `已撤` 或
+`部成后已撤` 才表示柜台已确认撤单，绝不自动重发撤单。
 
 > 未配对时仅暴露 `pair_with_code` 一个工具；完整帧协议（握手、call、reply、reject、心跳）见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)。
 
@@ -229,7 +237,7 @@ guling-trader/
 │   ├── bootstrap.py         # 启动引导
 │   ├── brand.py             # 品牌/版本管理
 │   ├── config.py            # 配置加载
-│   ├── dispatcher.py        # 9 个交易工具定义（FALLBACK_TOOLS_SCHEMA）
+│   ├── dispatcher.py        # 交易工具定义（FALLBACK_TOOLS_SCHEMA）
 │   ├── handshake.py         # WebSocket 握手逻辑
 │   ├── ws_client.py         # WebSocket 客户端
 │   ├── ui_dialogs.py        # UI 对话框
