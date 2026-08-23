@@ -1,0 +1,39 @@
+2026-08-04 00:38:09,225 [INFO] trader.main: === guling-trader 启动 ===
+2026-08-04 00:38:09,225 [INFO] trader.main: log file: /Users/sunyang/Documents/Projects/guling-trader/guling-trader-data/trader.log
+2026-08-04 00:38:09,234 [INFO] trader.main: platform: macOS-26.5.1-arm64-arm-64bit, python: 3.11.15 (main, Apr  7 2026, 20:41:15) [Clang 22.1.1 ]
+2026-08-04 00:38:09,241 [INFO] trader.installer.download: 解析重定向：https://download.10jqka.com.cn/index/download/id/7/
+2026-08-04 00:38:09,241 [INFO] trader.installer.download: 重定向到：https://sp.thsi.cn/THS_v9.50.90_build.exe
+2026-08-04 00:38:09,242 [INFO] trader.installer.download: 解析重定向：https://example.com/file.exe
+2026-08-04 00:38:09,242 [INFO] trader.installer.download: 无重定向（status=200），返回原 URL
+2026-08-04 00:38:09,243 [INFO] trader.installer.download: 下载(第1/4次) url=https://example.com/file.exe resume=0 total=100
+2026-08-04 00:38:09,243 [INFO] trader.installer.download: 下载完成：/tmp/test-download.exe（100 bytes）
+2026-08-04 00:38:09,244 [INFO] trader.installer.download: 验证 SHA256：/tmp/test.exe
+2026-08-04 00:38:09,245 [INFO] trader.installer.download: ✓ SHA256 验证通过
+2026-08-04 00:38:09,246 [INFO] trader.installer.download: 验证 SHA256：/tmp/test.exe
+2026-08-04 00:38:09,246 [WARNING] trader.installer.download: ✗ SHA256 不匹配：expected=wrong_hash actual=abc123
+2026-08-04 00:38:09,249 [WARNING] trader.installer.download: 下载第 1/4 次失败：boom（保留已下 0 字节，重试将续传）
+2026-08-04 00:38:09,249 [INFO] trader.installer.download: 下载(第2/4次) url=https://example.com/f.exe resume=0 total=4
+2026-08-04 00:38:09,249 [INFO] trader.installer.download: 下载完成：/private/var/folders/6x/wx6gnhjd0kb_64qjswlv_jmm0000gn/T/pytest-of-sunyang/pytest-53/test_download_retries_then_suc0/f.exe（4 bytes）
+2026-08-04 00:38:09,250 [INFO] trader.installer.download: 下载(第1/4次) url=https://example.com/f.exe resume=2 total=4
+2026-08-04 00:38:09,250 [INFO] trader.installer.download: 下载完成：/private/var/folders/6x/wx6gnhjd0kb_64qjswlv_jmm0000gn/T/pytest-of-sunyang/pytest-53/test_download_resumes_with_ran0/f.exe（4 bytes）
+2026-08-04 00:38:09,258 [WARNING] trader.selfupdate.check: Release v0.6.0 缺少 guling-trader.exe 或 guling-trader.exe.sha256 资产，跳过
+2026-08-04 00:38:09,259 [WARNING] trader.selfupdate.check: GitHub Release API 返回非 200：403
+2026-08-04 00:38:09,260 [WARNING] trader.selfupdate.check: 检查 guling-trader 更新失败：network down
+2026-08-04 00:38:09,264 [INFO] trader.ths.win: thsauto setup: window_title='网上股票交易系统5.0' tesseract_cmd='<from PATH>' work_dir='/private/var/folders/6x/wx6gnhjd0kb_64qjswlv_jmm0000gn/T/pytest-of-sunyang/pytest-53/test_setup_routes_ocr_temp_to_0/tmp'
+2026-08-04 00:38:09,356 [INFO] trader.dispatcher: [RPC] method=balance, frame_id=abc-123
+2026-08-04 00:38:09,356 [INFO] trader.dispatcher: [RPC] balance → code=0
+2026-08-04 00:38:09,359 [ERROR] trader.dispatcher: 处理 RPC 'sell' 出错：窗口未找到
+2026-08-04 00:38:09,361 [INFO] trader.dispatcher: [RPC] method=tools/list, frame_id=t1
+2026-08-04 00:38:09,542 [ERROR] trader.dispatcher: [RPC] sell 超过 0.05s 未完成，标记 degraded，回 unknown
+2026-08-04 00:38:09,594 [ERROR] trader.dispatcher: [RPC] orders_active 超过 0.05s 未完成，标记 degraded，回 unknown
+2026-08-04 00:38:09,657 [INFO] trader.order_watch: order_watch 基线建立：1 笔委托
+2026-08-04 00:38:09,658 [INFO] trader.order_watch: order_watch 基线建立：1 笔委托
+2026-08-04 00:38:09,658 [INFO] trader.order_watch: order_watch 推送 filled entrust=1 source=external filled=100
+2026-08-04 00:38:09,659 [INFO] trader.order_watch: order_watch 基线建立：1 笔委托
+2026-08-04 00:38:09,659 [WARNING] trader.order_watch: order_watch 发送事件失败（下轮重试）：simulated send_frame failure
+2026-08-04 00:38:09,659 [INFO] trader.order_watch: order_watch 推送 filled entrust=1 source=external filled=100
+2026-08-04 00:38:09,666 [INFO] trader.installer.tesseract: winget 退出码=0
+Successfully installed
+2026-08-04 00:38:09,666 [INFO] trader.installer.tesseract: winget 退出码=1
+failed
+2026-08-04 00:38:17,175 [INFO] trader.ws_client: 收到 RPC call：id=slow, method=orders_active
