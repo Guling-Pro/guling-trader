@@ -37,6 +37,7 @@ class FakeBackend:
         self.win_lock = asyncio.Lock()
         self.agent_entrust_nos: set[str] = set()
         self.ledger = FakeLedger()
+        self.account_trading_blocked = False
 
     async def _run(self, name, *args):
         self.calls.append((name, args))
@@ -234,6 +235,29 @@ def test_switch_account_forwards_slot_and_single_layer_reply():
     assert reply["id"] == "sw-1"
     assert reply["result"]["data"]["slot"] == 2
     assert backend.calls == [("switch_account", (2,))]
+
+
+def test_buy_sell_blocked_after_account_verification_failure():
+    """账户切换核验失败后，dispatcher 不得把买卖请求送入后端。"""
+    backend = FakeBackend(contract.ok({"submitted": True}))
+    backend.account_trading_blocked = True
+    frame = {
+        "type": "call", "id": "blocked-1", "method": "buy",
+        "params": {
+            "stock_no": "600000", "amount": 100,
+            "order_type": "LIMIT", "price": 8.1,
+            "client_order_id": COID,
+        },
+    }
+
+    reply = asyncio.run(dispatcher.handle_call(frame, backend))
+
+    assert reply["ok"] is False
+    assert reply["result"]["code"] == "read_failed"
+    assert reply["result"]["data"] == {
+        "account_verified": False, "submitted": False,
+    }
+    assert backend.calls == []
 
 
 def test_fallback_schema_matches_file_schema():

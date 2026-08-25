@@ -125,6 +125,16 @@ short_sleep_time = 0.05
 refresh_sleep_time = 0.5
 retry_time = 1
 
+# 账户列表项：每次按当前绑定主窗口重新枚举，不保存其 HWND；同花顺重启后
+# HWND 可能变化。0x0912 来自当前 Windows 控件快照：ComboBox、可见、可用，
+# rect=[546, 201, 678, 227]；运行时仍按 ID/class/可见性/进程归属重新核验。
+ACCOUNT_SELECTOR_ID = 0x094C
+ACCOUNT_SELECTOR_CLASS = "Button"
+ACCOUNT_VERIFY_TIMEOUT_SECS = 3.0
+ACCOUNT_TEXT_PLACEHOLDERS = frozenset({"", "NUL", "ＸＸ证券"})
+ACCOUNT_DROPDOWN_ID = 0x0912
+ACCOUNT_DROPDOWN_SETTLE_SECS = 0.5
+
 # Set by `setup()` from Config. Module-level so the existing call sites
 # (`win32gui.FindWindow(None, window_title)`) keep working without threading
 # config through every method.
@@ -347,6 +357,82 @@ def get_text(hwnd):
     return buf.value
 
 
+def _ocr_text_lines(image) -> list[dict[str, Any]]:
+    """将 OCR data 按行合并，保留位置和置信度供账户列表解析。"""
+    from pytesseract import Output
+
+    data = pytesseract.image_to_data(
+        image, lang="chi_sim+eng", config="--psm 11", output_type=Output.DICT
+    )
+    groups: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+    for i, raw in enumerate(data.get("text", [])):
+        text = (raw or "").strip()
+        if not text:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (KeyError, TypeError, ValueError):
+            conf = -1.0
+        key = (
+            int(data.get("block_num", [0])[i]),
+            int(data.get("par_num", [0])[i]),
+            int(data.get("line_num", [0])[i]),
+        )
+        groups.setdefault(key, []).append({
+            "text": text,
+            "left": int(data["left"][i]),
+            "top": int(data["top"][i]),
+            "width": int(data["width"][i]),
+            "height": int(data["height"][i]),
+            "conf": conf,
+        })
+
+    lines = []
+    for words in groups.values():
+        words.sort(key=lambda item: item["left"])
+        left = min(item["left"] for item in words)
+        top = min(item["top"] for item in words)
+        right = max(item["left"] + item["width"] for item in words)
+        bottom = max(item["top"] + item["height"] for item in words)
+        lines.append({
+            "text": " ".join(item["text"] for item in words).strip(),
+            "left": left,
+            "top": top,
+            "right": right,
+            "bottom": bottom,
+            "conf": round(sum(item["conf"] for item in words) / len(words), 1),
+        })
+    return sorted(lines, key=lambda item: (item["top"], item["left"]))
+
+
+def _account_candidates_from_ocr(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从下拉框 OCR 行中提取带 ``Alt+N`` 的账户候选。
+
+    截图证据显示每个可切换账户行都带快捷键（如 ``Alt+1``），而“编辑账户”
+    没有快捷键。因此只接受带槽位快捷键的行，避免把资金数字或菜单项当账户。
+    """
+    out: list[dict[str, Any]] = []
+    seen_slots: set[int] = set()
+    for line in lines:
+        text = " ".join(str(line.get("text") or "").split()).strip()
+        if not text:
+            continue
+        shortcut = re.search(r"Alt\s*[+＋]\s*([1-9])", text, re.IGNORECASE)
+        if not shortcut:
+            continue
+        slot = int(shortcut.group(1))
+        if slot in seen_slots:
+            continue
+        account_text = text[:shortcut.start()].strip(" -—:：")
+        if not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", account_text) or len(account_text) < 3:
+            continue
+        seen_slots.add(slot)
+        out.append({"slot": slot, "text": account_text,
+                    "shortcut": f"Alt+{slot}", "confidence": line["conf"],
+                    "rect": [line["left"], line["top"], line["right"], line["bottom"]]})
+    return sorted(out, key=lambda item: item["slot"])
+
+
 _PHANTOM_VALUES = frozenset({"", "0", "0.0", "0.00", "0.000", "-", "--"})
 
 
@@ -515,6 +601,9 @@ class WinThsBackend:
         # action; title text by itself is not a sufficient identity proof.
         self._bound_pid: int | None = None
         self._bound_executable: str | None = None
+        # 仅在一次切换核验失败后阻断买卖；初次启动不改变既有使用流程。
+        self._account_trading_blocked = False
+        self._last_account_text: str | None = None
         # order_watch 与 RPC 共用：串行化对 THS 单窗口的访问，避免并发拷表。
         self.win_lock = asyncio.Lock()
         # agent 经 RPC 下单成功后登记的合同编号，供 order_watch 标记事件来源。
@@ -934,6 +1023,28 @@ class WinThsBackend:
             pass
         return hit[0] if hit else 0
 
+    def _read_account_selector_text(self) -> Optional[str]:
+        """按控件 ID/class 重新定位当前账户项并读取其文本。
+
+        不缓存账户控件 HWND：同花顺重启或切换页面后 HWND 会变化。控件可能处于
+        隐藏模板层，所以这里不能要求 visible=True；但目标必须仍属于已绑定的
+        xiadan 进程，且占位文本不算账户身份。
+        """
+        ctrl = self._find_ctrl_by_id(
+            self.hwnd_main, ACCOUNT_SELECTOR_ID, cls=ACCOUNT_SELECTOR_CLASS
+        )
+        if not ctrl or not self._window_is_owned_by_bound_process(ctrl):
+            return None
+        text = (get_text(ctrl) or "").strip()
+        if text in ACCOUNT_TEXT_PLACEHOLDERS:
+            return None
+        return text
+
+    @property
+    def account_trading_blocked(self) -> bool:
+        """Whether a failed account switch verification currently blocks buy/sell."""
+        return self._account_trading_blocked
+
     def _find_grid(self, root: int) -> int:
         """找面板里的表格控件(0x417)。优先【可见的】CVirtualGridCtrl —— 右区同时挂着
         多个面板的 grid，只有当前激活面板的可见，不按可见性过滤会误读到隐藏的持仓表
@@ -1288,6 +1399,73 @@ class WinThsBackend:
                     user32.SetThreadDpiAwarenessContext(old)
                 except Exception:
                     pass
+
+    def _open_account_dropdown(self) -> bool:
+        """点击当前快照确认的账户 ComboBox，不用 OCR 猜测下拉按钮位置。"""
+        combo = self._find_ctrl_by_id(
+            self.hwnd_main, ACCOUNT_DROPDOWN_ID, cls="ComboBox", visible=True
+        )
+        if (combo
+                and win32gui.IsWindowEnabled(combo)
+                and self._window_is_owned_by_bound_process(combo)):
+            left, top, right, bottom = win32gui.GetWindowRect(combo)
+            self._click_screen((left + right) // 2, (top + bottom) // 2,
+                               "account_dropdown")
+            return True
+        raise RuntimeError(
+            f"未找到可见且属于当前同花顺进程的账户 ComboBox（ID=0x{ACCOUNT_DROPDOWN_ID:04X}）；"
+            "未点击、未读取账户、未切换账户"
+        )
+
+    @guarded
+    def get_account_list(self):
+        """展开账户下拉框并用截图 OCR 列出候选账户；不选择、不切换账户。"""
+        self._switch_to_normal_safely()
+        current = self._read_account_selector_text()
+        opened = False
+        try:
+            opened = self._open_account_dropdown()
+            time.sleep(ACCOUNT_DROPDOWN_SETTLE_SECS)
+            image = self._capture_window_png(self.hwnd_main)
+            candidates = _account_candidates_from_ocr(_ocr_text_lines(image))
+            if not candidates:
+                return contract.fail(
+                    contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                    "账户下拉框已打开，但 OCR 未识别到账户列表；未切换账户",
+                    data={"accounts": [], "current_account_text": current,
+                          "partial": True, "submitted": False},
+                )
+
+            accounts = [
+                {
+                    "slot": item["slot"],
+                    "shortcut": item["shortcut"],
+                    "text": item["text"],
+                    "ocr_confidence": item["confidence"],
+                }
+                for item in candidates
+            ]
+            return contract.ok({
+                "accounts": accounts,
+                "current_account_text": current,
+                "partial": False,
+                "source": "screenshot_ocr",
+                "msg": "已读取带 Alt 快捷键的账户列表，未选择或切换任何账户",
+            })
+        except Exception as e:
+            logger.warning("account list screenshot/OCR failed: %s", e, exc_info=True)
+            return contract.fail(
+                contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                f"读取账户下拉列表失败：{e}；未切换账户",
+                data={"accounts": [], "current_account_text": current,
+                      "partial": True, "submitted": False},
+            )
+        finally:
+            if opened:
+                try:
+                    self._send_hotkey(["esc"], "close_account_dropdown")
+                except Exception:
+                    logger.warning("账户下拉框关闭失败，请人工确认当前界面", exc_info=True)
 
     def _ocr_leftmost_codes(self, img) -> list[str]:
         """OCR 图中 6 位数字，只取【最左一簇】(x 最小)=代码列，排除右侧数字列(主力净额/
@@ -2657,6 +2835,12 @@ class WinThsBackend:
             return bound_err
         return await asyncio.to_thread(self.get_balance)
 
+    async def list_accounts(self) -> dict[str, Any]:
+        bound_err = self._ensure_bound()
+        if bound_err:
+            return bound_err
+        return await asyncio.to_thread(self.get_account_list)
+
     async def position(self) -> dict[str, Any]:
         bound_err = self._ensure_bound()
         if bound_err:
@@ -2747,17 +2931,67 @@ class WinThsBackend:
         """向 xiadan 发送 Alt+N，切换多账户登录下的当前活跃资金账户。
 
         盲切：新版 xiadan 的账户下拉框给每个已登录账户注册了 Alt+1..Alt+9
-        加速键（与下拉列表顺序一致）。这里只负责把窗口拉到前台并发按键，
-        不核验切换结果——受控端对账户身份保持无感知，切换后由调用方用
-        balance/position 做指纹核对再继续操作。"""
+        加速键（与下拉列表顺序一致）。发送按键后按账户列表项 0x094C 的
+        文本变化核验，并同步读取一次资金面板；核验失败时保留买卖闸门。"""
+        previous = self._read_account_selector_text()
+        self._account_trading_blocked = True
+        if not previous:
+            return contract.fail(
+                contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                "切换前无法读取当前账户（控件 ID 0x094C），未发送切换按键，已禁止买卖",
+                data={"slot": slot, "account_verified": False, "submitted": False},
+            )
+        self._last_account_text = previous
+
         self._send_hotkey(["alt", str(slot)], "switch_account")
-        # 切换会触发资金/持仓面板重载，稍等再放行后续操作。
-        time.sleep(sleep_time * 2)
+
+        # 切换会触发账户列表和资金/持仓面板重载。账户控件可能先保留旧文本，
+        # 因此轮询至变化或超时；不使用固定 HWND，确保同花顺重启后仍可定位。
+        current = None
+        deadline = time.monotonic() + ACCOUNT_VERIFY_TIMEOUT_SECS
+        while time.monotonic() < deadline:
+            self._abort_if_stale("switch_account_verify")
+            current = self._read_account_selector_text()
+            if current and current != previous:
+                break
+            time.sleep(sleep_time)
+
+        if not current or current == previous:
+            return contract.fail(
+                contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                "Alt+%s 已发送，但账户控件文本未发生可验证变化，已禁止买卖；"
+                "请确认目标账户后重试" % slot,
+                data={
+                    "slot": slot,
+                    "account_verified": False,
+                    "previous_account_text": previous,
+                    "account_text": current,
+                    "submitted": False,
+                },
+            )
+
+        balance = self.get_balance()
+        if not contract.is_succeed(balance):
+            return contract.fail(
+                contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                "已检测到账户切换为 %s，但资金信息读取失败，已禁止买卖；请稍后重试"
+                % current,
+                data={
+                    "slot": slot,
+                    "account_verified": False,
+                    "account_text": current,
+                    "balance": None,
+                    "balance_error": balance.get("error") if isinstance(balance, dict) else None,
+                    "submitted": False,
+                },
+            )
+
+        self._last_account_text = current
+        self._account_trading_blocked = False
         return contract.ok({
             "slot": slot,
-            "msg": (
-                f"已向同花顺窗口发送 Alt+{slot}（盲切，未核验结果）。"
-                "后续所有查询/下单都作用于切换后的当前账户，"
-                "请先用 balance/position 核对账户身份再继续。"
-            ),
+            "account_verified": True,
+            "account_text": current,
+            "balance": balance.get("data"),
+            "msg": f"已切换到：{current}",
         })

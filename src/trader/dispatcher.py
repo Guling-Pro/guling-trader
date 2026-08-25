@@ -272,6 +272,15 @@ FALLBACK_TOOLS_SCHEMA = {
       }
     },
     {
+      "name": "list_accounts",
+      "description": "只读列出同花顺账户下拉框中的可切换账户。仅点击当前控件快照确认的账户 ComboBox（ID 0x0912）打开下拉框，等待 0.5 秒后截取同花顺主窗口并 OCR 读取带 Alt+N 快捷键的账户行；不发送 Alt+N、不选择账户，账户名称保留 OCR 原文（包括 *）；返回 slot、shortcut、text 和 OCR 置信度。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False
+      }
+    },
+    {
       "name": "buy",
       "description": "下买入委托单。**会真实下单**，慎重调用。必须显式指定 order_type：LIMIT 为限价挂单，FIVE_LEVEL_IOC 为五档即成剩撤（立即成交、剩余自动撤销、无残留挂单）。LIMIT 必须传正数 price；FIVE_LEVEL_IOC 禁止传 price。",
       "inputSchema": {
@@ -401,7 +410,7 @@ FALLBACK_TOOLS_SCHEMA = {
     },
     {
       "name": "switch_account",
-      "description": "切换同花顺客户端当前活跃的资金账户（向 xiadan 窗口发送 Alt+N，N=账户在客户端账户下拉列表中的槽位序号）。仅在 xiadan 登录了多个账户时有意义。**盲切**：本工具不核验切换是否成功，受控端对账户身份无感知；切换后所有工具(查询/下单)都作用于新的当前账户。调用方必须紧接着用 balance/position 做指纹核对、确认账户无误后再继续操作。",
+      "description": "切换同花顺客户端当前活跃的资金账户（向 xiadan 窗口发送 Alt+N，N=账户在客户端账户下拉列表中的槽位序号）。仅在 xiadan 登录了多个账户时有意义。切换后按账户控件 ID 0x094C 的 text 核验账户变化，并立即读取一次资金信息；成功时返回 account_text 和 balance，失败时禁止后续买卖。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -461,7 +470,7 @@ def load_tools_schema() -> dict[str, Any]:
     if not cfg.enable_ths_plugin:
         trading_names = {
             "balance", "position", "orders_active", "orders_filled", "settlement",
-            "watchlist", "buy", "sell", "cancel", "confirm_external_cancel",
+            "watchlist", "list_accounts", "buy", "sell", "cancel", "confirm_external_cancel",
             "switch_account", "query_order",
         }
         schema["tools"] = [t for t in schema["tools"] if t.get("name") not in trading_names]
@@ -476,6 +485,7 @@ METHOD_WHITELIST = {
     "orders_filled",
     "settlement",
     "watchlist",
+    "list_accounts",
     "buy",
     "sell",
     "cancel",
@@ -1036,6 +1046,7 @@ async def handle_call(
         "orders_filled",
         "settlement",
         "watchlist",
+        "list_accounts",
         "buy",
         "sell",
         "cancel",
@@ -1080,6 +1091,20 @@ async def handle_call(
             )
             reply["error"] = validation_error
             return reply
+
+    # switch_account 在账户文本或资金查询核验失败后保持买卖闸门；查询和重试切换
+    # 仍可继续，避免在身份不明时把真实订单送入错误账户。
+    if method in ("buy", "sell") and getattr(backend, "account_trading_blocked", False):
+        msg = "当前账户身份尚未核验，已禁止买卖；请先成功调用 switch_account"
+        reply["ok"] = False
+        reply["result"] = contract.fail(
+            contract.CODE_READ_FAILED,
+            contract.CLS_READ_FAILED,
+            msg,
+            data={"account_verified": False, "submitted": False},
+        )
+        reply["error"] = msg
+        return reply
 
     # --- C5a 幂等：下单/撤单必须带业务级 ID，在**拿锁之前**查台账。重发直接
     # 返回首次回执，连排队都不用排，更不会走到点提交那一步。
@@ -1315,6 +1340,8 @@ async def handle_call(
                 return r
             if method == "switch_account":
                 return await backend.switch_account(params.get("slot"))
+            if method == "list_accounts":
+                return await backend.list_accounts()
             if method == "query_order":
                 return await _query_order(backend, params.get("client_order_id"))
             return contract.fail(contract.CODE_INTERNAL_ERROR,
