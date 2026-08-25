@@ -55,8 +55,12 @@ class LedgerUnavailable(RuntimeError):
 
 
 def fingerprint(method: str, params: dict[str, Any]) -> str:
-    """请求指纹：同 id 不同参数要能认出来。"""
-    keys = ("stock_no", "amount", "price", "entrust_no")
+    """请求指纹：同 id 不同参数要能认出来。
+
+    ``order_type`` 是买卖的业务语义，而不仅是 price 的表现形式；必须写入
+    指纹，避免同一个 client_order_id 在限价和五档即成剩撤之间切换。
+    """
+    keys = ("stock_no", "amount", "price", "order_type", "entrust_no")
     payload = {k: params.get(k) for k in keys if params.get(k) is not None}
     if method == "confirm_external_cancel":
         # 确认令牌只应留在进程内；台账只保存摘要来区分同一 coid 被换令牌的

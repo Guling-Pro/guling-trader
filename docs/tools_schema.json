@@ -70,7 +70,7 @@
     },
     {
       "name": "buy",
-      "description": "下买入委托单。**会真实下单**，慎重调用。不传 price=五档即成剩撤市价单(立即成交、剩余自动撤销、无残留挂单)，回执 status/filled_amount/avg_price 为实际成交；传 price=限价挂单，返回 entrust_no，未成交需自行用 orders_active+cancel 管理。",
+      "description": "下买入委托单。**会真实下单**，慎重调用。必须显式指定 order_type：LIMIT 为限价挂单，FIVE_LEVEL_IOC 为五档即成剩撤（立即成交、剩余自动撤销、无残留挂单）。LIMIT 必须传正数 price；FIVE_LEVEL_IOC 禁止传 price。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -82,9 +82,17 @@
             "type": "integer",
             "description": "买入股数（必须为 100 股的整数倍）"
           },
+          "order_type": {
+            "type": "string",
+            "enum": [
+              "LIMIT",
+              "FIVE_LEVEL_IOC"
+            ],
+            "description": "订单类型。LIMIT=限价挂单（必须传正数 price）；FIVE_LEVEL_IOC=五档即成剩撤（禁止传 price）。"
+          },
           "price": {
             "type": "number",
-            "description": "限价买入价格。不传则走同花顺市价委托(五档即成剩撤)立即成交、剩余自动撤销、无残留挂单；传则限价挂单，需自行 orders_active/cancel 管理。"
+            "description": "LIMIT 必填的正数限价。order_type=FIVE_LEVEL_IOC 时禁止传入。"
           },
           "client_order_id": {
             "type": "string",
@@ -92,17 +100,18 @@
             "description": "客户端订单 ID，**必填幂等键**。格式必须为 gl-<小写 UUID v7>，如 gl-0198f6a1-0001-7000-8000-000000000001；UUID v7 含毫秒时间戳和随机位。调用方必须在创建买卖请求时生成并持久保存该 ID：新买卖用新 ID；网络重发或 query_order 查询同一买卖单必须原样复用。交易端只验证，不生成或改写。同一 ID 重复提交只会执行一次。buy/sell 返回 submitted_unconfirmed 时，交易端会自动执行一次只读 query_order，结果位于 data.auto_query，绝不自动重发。"
           }
         },
-      "required": [
-        "stock_no",
-        "amount",
-        "client_order_id"
+        "required": [
+          "stock_no",
+          "amount",
+          "order_type",
+          "client_order_id"
         ],
         "additionalProperties": false
       }
     },
     {
       "name": "sell",
-      "description": "下卖出委托单。**会真实下单**，慎重调用。不传 price=五档即成剩撤市价单(立即成交、剩余自动撤销、无残留挂单)，回执 status/filled_amount/avg_price 为实际成交；传 price=限价挂单，返回 entrust_no，未成交需自行用 orders_active+cancel 管理。",
+      "description": "下卖出委托单。**会真实下单**，慎重调用。必须显式指定 order_type：LIMIT 为限价挂单，FIVE_LEVEL_IOC 为五档即成剩撤（立即成交、剩余自动撤销、无残留挂单）。LIMIT 必须传正数 price；FIVE_LEVEL_IOC 禁止传 price。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -114,9 +123,17 @@
             "type": "integer",
             "description": "卖出股数"
           },
+          "order_type": {
+            "type": "string",
+            "enum": [
+              "LIMIT",
+              "FIVE_LEVEL_IOC"
+            ],
+            "description": "订单类型。LIMIT=限价挂单（必须传正数 price）；FIVE_LEVEL_IOC=五档即成剩撤（禁止传 price）。"
+          },
           "price": {
             "type": "number",
-            "description": "限价卖出价格。不传则走同花顺市价委托(五档即成剩撤)立即成交、剩余自动撤销、无残留挂单；传则限价挂单，需自行 orders_active/cancel 管理。"
+            "description": "LIMIT 必填的正数限价。order_type=FIVE_LEVEL_IOC 时禁止传入。"
           },
           "client_order_id": {
             "type": "string",
@@ -124,10 +141,11 @@
             "description": "客户端订单 ID，**必填幂等键**。格式必须为 gl-<小写 UUID v7>，如 gl-0198f6a1-0001-7000-8000-000000000001；UUID v7 含毫秒时间戳和随机位。调用方必须在创建买卖请求时生成并持久保存该 ID：新买卖用新 ID；网络重发或 query_order 查询同一买卖单必须原样复用。交易端只验证，不生成或改写。同一 ID 重复提交只会执行一次。buy/sell 返回 submitted_unconfirmed 时，交易端会自动执行一次只读 query_order，结果位于 data.auto_query，绝不自动重发。"
           }
         },
-      "required": [
-        "stock_no",
-        "amount",
-        "client_order_id"
+        "required": [
+          "stock_no",
+          "amount",
+          "order_type",
+          "client_order_id"
         ],
         "additionalProperties": false
       }

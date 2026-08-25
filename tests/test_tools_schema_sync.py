@@ -11,13 +11,18 @@ def _tool(tools, name):
     return next(t for t in tools if t["name"] == name)
 
 
-def test_buy_sell_desc_mentions_market_and_limit():
+def test_buy_sell_schema_requires_explicit_order_type():
     for name in ("buy", "sell"):
         t = _tool(FALLBACK_TOOLS_SCHEMA["tools"], name)
-        price_desc = t["inputSchema"]["properties"]["price"]["description"]
-        assert "五档即成剩撤" in price_desc
-        assert "限价" in price_desc
-        # 旧文案不得残留
+        schema = t["inputSchema"]
+        assert schema["properties"]["order_type"]["enum"] == [
+            "LIMIT", "FIVE_LEVEL_IOC"
+        ]
+        assert "order_type" in schema["required"]
+        assert "order_type" in t["description"]
+        price_desc = schema["properties"]["price"]["description"]
+        assert "LIMIT" in price_desc
+        assert "禁止传入" in price_desc
         assert "对手价市价单" not in price_desc
 
 

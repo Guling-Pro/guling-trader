@@ -184,8 +184,8 @@ AI 助手部分（Claude、Cursor 等）在任何系统都能跑；只需确保�
 | `orders_filled` | 当日已成交记录 | — |
 | `settlement` | 交割单查询 | `date_range`：近一周/近一月/近三月/近一年 |
 | `watchlist` | 读同花顺自选股代码（新版）| —（顶部第一屏，按同花顺习惯最新在顶部）|
-| `buy` | 买入（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(必填) |
-| `sell` | 卖出（实盘） | `stock_no`, `amount`, `price`(不传=五档即成剩撤市价单/传=限价挂单), `client_order_id`(必填) |
+| `buy` | 买入（实盘） | `stock_no`, `amount`, `order_type`(`LIMIT`/`FIVE_LEVEL_IOC`), `price`(仅 LIMIT 传正数), `client_order_id`(必填) |
+| `sell` | 卖出（实盘） | `stock_no`, `amount`, `order_type`(`LIMIT`/`FIVE_LEVEL_IOC`), `price`(仅 LIMIT 传正数), `client_order_id`(必填) |
 | `cancel` | 撤销未成交单；未登记订单可要求确认 | `entrust_no`, `client_order_id`(必填) |
 | `confirm_external_cancel` | 确认撤销未登记/人工订单 | `confirmation_token`, 新的 `client_order_id`(必填) |
 
@@ -194,6 +194,10 @@ AI 助手部分（Claude、Cursor 等）在任何系统都能跑；只需确保�
 生成并持久保存：每个新订单、撤单或确认撤单动作使用新 ID；网络重发同一动作必须复用原 ID。
 `confirm_external_cancel` 必须使用不同于产生令牌的 `cancel` 的新 ID。交易端只验证和防重，
 不会生成或改写 ID。
+
+买卖必须显式指定 `order_type`：`LIMIT` 表示限价挂单，必须传入有限且大于 0 的 `price`；
+`FIVE_LEVEL_IOC` 表示五档即成剩撤，禁止传入 `price`。同一个
+`client_order_id` 不能在这两种订单语义之间切换；网络重试必须连同原参数原样复用 ID。
 
 默认本地配置 `external_cancel_confirmation=two_step`（桌面端“未登记订单撤单需二次确认”
 开关开启）。本系统台账已经登记的订单按 `entrust_no` 匹配，`cancel` 会直接执行；未登记的

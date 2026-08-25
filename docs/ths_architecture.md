@@ -125,13 +125,14 @@ xiadan 是 32 位，`TVITEMW` 的 `hItem/pszText/lParam` 是 4 字节；64 位 P
 → 与上次 diff → 有变化经 WS 推 `watchlist_event`（含 `added`/`codes`/`partial`）。仿 `order_watch`。
 配置：`enable_watchlist_watch` / `watchlist_sync_hours`。
 
-## 7.6 市价委托路径（`buy`/`sell` 不传 price）
+## 7.6 市价委托路径（`buy`/`sell` 显式 `order_type`）
 
-`buy`/`sell` 有两条路径，在 `_do_buy`/`_do_sell` 内按 `price` 分派：
+对外工具必须显式传 `order_type`，dispatcher 校验后才进入后端；不会再按
+`price` 是否缺失猜测订单意图。后端仍以归一化后的 `price` 分派两条路径：
 
-- **传 `price`** → `_submit_trade("F1"/"F2", …)`：**限价挂单**（原逻辑），未成交留 `orders_active`，
-  由 agent 用 `cancel` 管理。
-- **不传 `price`（`None`）** → `_submit_market_trade(op, code, amount)`：走左树 **市价委托 └ 买入/卖出**
+- **`order_type=LIMIT` + 正数 `price`** → `_submit_trade("F1"/"F2", …)`：**限价挂单**（原逻辑），
+  未成交留 `orders_active`，由 agent 用 `cancel` 管理。
+- **`order_type=FIVE_LEVEL_IOC`，且不传 `price`** → `_submit_market_trade(op, code, amount)`：走左树 **市价委托 └ 买入/卖出**
   面板，**委托策略固定「五档即成剩撤」**——扫对手方最优五档立即成交、剩余自动撤销、**无残留挂单**。
 
 **为什么是五档即成剩撤**：市价 5 个策略里唯一同时满足"立即成交 + 剩余自动撤 + 沪深北全市场通用"。

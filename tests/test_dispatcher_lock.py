@@ -59,6 +59,7 @@ def test_buy_registers_entrust_no():
     backend = LockFakeBackend()
     frame = {"type": "call", "id": "b", "method": "buy",
              "params": {"stock_no": "600519", "amount": 100, "price": 1700.0,
+                        "order_type": "LIMIT",
                         "client_order_id": COID}}
     reply = asyncio.run(dispatcher.handle_call(frame, backend))
     assert reply["ok"] is True

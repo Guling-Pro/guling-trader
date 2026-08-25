@@ -6,6 +6,7 @@
 import asyncio
 import json
 import logging
+import math
 import re
 import secrets
 import threading
@@ -37,6 +38,9 @@ IDEMPOTENT_METHODS = {"buy", "sell", *CANCEL_METHODS}
 AUTO_QUERY_METHODS = {"buy", "sell", *CANCEL_METHODS}
 # busy 是背压信号：告诉调用方等多久再来，别让它自己猜（G3）。
 BUSY_BACKOFF_HINT_SECS = 3
+# 买卖的显式业务语义。入口不再根据 price 是否存在猜测订单类型。
+ORDER_TYPES = ("LIMIT", "FIVE_LEVEL_IOC")
+_ORDER_TYPE_SET = frozenset(ORDER_TYPES)
 # UUID v7 带毫秒时间成分与随机位，便于按时间审计且碰撞概率可忽略。格式校验只
 # 约束协议，不在受控端自行生成或重写 ID——同一业务订单必须由上游复用原 ID。
 CLIENT_ORDER_ID_PATTERN = (
@@ -269,7 +273,7 @@ FALLBACK_TOOLS_SCHEMA = {
     },
     {
       "name": "buy",
-      "description": "下买入委托单。**会真实下单**，慎重调用。不传 price=五档即成剩撤市价单(立即成交、剩余自动撤销、无残留挂单)，回执 status/filled_amount/avg_price 为实际成交；传 price=限价挂单，返回 entrust_no，未成交需自行用 orders_active+cancel 管理。",
+      "description": "下买入委托单。**会真实下单**，慎重调用。必须显式指定 order_type：LIMIT 为限价挂单，FIVE_LEVEL_IOC 为五档即成剩撤（立即成交、剩余自动撤销、无残留挂单）。LIMIT 必须传正数 price；FIVE_LEVEL_IOC 禁止传 price。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -281,9 +285,17 @@ FALLBACK_TOOLS_SCHEMA = {
             "type": "integer",
             "description": "买入股数（必须为 100 股的整数倍）"
           },
+          "order_type": {
+            "type": "string",
+            "enum": [
+              "LIMIT",
+              "FIVE_LEVEL_IOC"
+            ],
+            "description": "订单类型。LIMIT=限价挂单（必须传正数 price）；FIVE_LEVEL_IOC=五档即成剩撤（禁止传 price）。"
+          },
           "price": {
             "type": "number",
-            "description": "限价买入价格。不传则走同花顺市价委托(五档即成剩撤)立即成交、剩余自动撤销、无残留挂单；传则限价挂单，需自行 orders_active/cancel 管理。"
+            "description": "LIMIT 必填的正数限价。order_type=FIVE_LEVEL_IOC 时禁止传入。"
           },
           "client_order_id": {
             "type": "string",
@@ -294,6 +306,7 @@ FALLBACK_TOOLS_SCHEMA = {
         "required": [
           "stock_no",
           "amount",
+          "order_type",
           "client_order_id"
         ],
         "additionalProperties": False
@@ -301,7 +314,7 @@ FALLBACK_TOOLS_SCHEMA = {
     },
     {
       "name": "sell",
-      "description": "下卖出委托单。**会真实下单**，慎重调用。不传 price=五档即成剩撤市价单(立即成交、剩余自动撤销、无残留挂单)，回执 status/filled_amount/avg_price 为实际成交；传 price=限价挂单，返回 entrust_no，未成交需自行用 orders_active+cancel 管理。",
+      "description": "下卖出委托单。**会真实下单**，慎重调用。必须显式指定 order_type：LIMIT 为限价挂单，FIVE_LEVEL_IOC 为五档即成剩撤（立即成交、剩余自动撤销、无残留挂单）。LIMIT 必须传正数 price；FIVE_LEVEL_IOC 禁止传 price。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -313,9 +326,17 @@ FALLBACK_TOOLS_SCHEMA = {
             "type": "integer",
             "description": "卖出股数"
           },
+          "order_type": {
+            "type": "string",
+            "enum": [
+              "LIMIT",
+              "FIVE_LEVEL_IOC"
+            ],
+            "description": "订单类型。LIMIT=限价挂单（必须传正数 price）；FIVE_LEVEL_IOC=五档即成剩撤（禁止传 price）。"
+          },
           "price": {
             "type": "number",
-            "description": "限价卖出价格。不传则走同花顺市价委托(五档即成剩撤)立即成交、剩余自动撤销、无残留挂单；传则限价挂单，需自行 orders_active/cancel 管理。"
+            "description": "LIMIT 必填的正数限价。order_type=FIVE_LEVEL_IOC 时禁止传入。"
           },
           "client_order_id": {
             "type": "string",
@@ -326,6 +347,7 @@ FALLBACK_TOOLS_SCHEMA = {
         "required": [
           "stock_no",
           "amount",
+          "order_type",
           "client_order_id"
         ],
         "additionalProperties": False
@@ -528,6 +550,32 @@ def _as_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _validate_buy_sell_params(method: str, params: dict[str, Any]) -> Optional[str]:
+    """校验买卖的显式订单语义，返回错误原因或 ``None``。
+
+    该函数只检查请求参数，不访问 backend 或台账；调用方必须在幂等预留和
+    ``win_lock`` 之前调用它。这样漏字段、错类型和非法价格都不会留下台账
+    记录，也不会有机会触碰交易窗口。
+    """
+    order_type = params.get("order_type")
+    if order_type not in _ORDER_TYPE_SET:
+        return (
+            f"{method} 必须明确指定 order_type，取值只能是 LIMIT 或 FIVE_LEVEL_IOC；"
+            "已拒绝执行"
+        )
+
+    has_price = "price" in params
+    price = params.get("price")
+    if order_type == "LIMIT":
+        if not has_price or isinstance(price, bool) or not isinstance(price, (int, float)):
+            return "order_type=LIMIT 必须传入正数 price，已拒绝执行"
+        if not math.isfinite(float(price)) or float(price) <= 0:
+            return "order_type=LIMIT 的 price 必须是有限且大于 0 的数值，已拒绝执行"
+    elif has_price:
+        return "order_type=FIVE_LEVEL_IOC 禁止传入 price，已拒绝执行"
+    return None
 
 
 def _cancel_state_from_order_row(row: dict) -> str:
@@ -1017,6 +1065,21 @@ async def handle_call(
         )
         reply["error"] = msg
         return reply
+
+    # 买卖契约校验必须早于台账 reserve、win_lock 和 backend 调用；尤其不能
+    # 让缺失 order_type 的请求沿用旧的 price 推断路径。
+    if method in ("buy", "sell"):
+        validation_error = _validate_buy_sell_params(method, params)
+        if validation_error is not None:
+            reply["ok"] = False
+            reply["result"] = contract.fail(
+                contract.CODE_INVALID_PARAMS,
+                contract.CLS_INVALID_PARAMS,
+                validation_error,
+                data={"submitted": False},
+            )
+            reply["error"] = validation_error
+            return reply
 
     # --- C5a 幂等：下单/撤单必须带业务级 ID，在**拿锁之前**查台账。重发直接
     # 返回首次回执，连排队都不用排，更不会走到点提交那一步。

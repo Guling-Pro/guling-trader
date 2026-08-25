@@ -56,6 +56,7 @@ def test_order_timeout_returns_unknown_not_bare_error(monkeypatch):
     monkeypatch.setattr(dispatcher, "CALL_TIMEOUT_SECS", 0.05)
     backend = HangingBackend()
     reply = _call(backend, "sell", {"stock_no": "300458", "amount": 500,
+                                      "order_type": "FIVE_LEVEL_IOC",
                                       "client_order_id": COID})
     assert reply["ok"] is False
     assert reply["result"]["code"] == "submitted_unconfirmed"
@@ -86,6 +87,7 @@ def test_lock_busy_instead_of_starvation(monkeypatch):
         await backend.win_lock.acquire()  # 模拟持锁方被拖住
         frame = {"type": "call", "id": "t2", "method": "buy",
                  "params": {"stock_no": "600000", "amount": 100,
+                            "order_type": "FIVE_LEVEL_IOC",
                             "client_order_id": COID}}
         return await dispatcher.handle_call(frame, backend)
 

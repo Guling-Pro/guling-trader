@@ -18,7 +18,12 @@ def ledger(tmp_path):
     return OrderLedger(tmp_path / "orders.db")
 
 
-BUY_PARAMS = {"stock_no": "600000", "amount": 100, "price": 8.1}
+BUY_PARAMS = {
+    "stock_no": "600000",
+    "amount": 100,
+    "order_type": "LIMIT",
+    "price": 8.1,
+}
 EXTERNAL_ORDER = {
     "entrust_no": "777",
     "证券代码": "600000",
@@ -56,6 +61,17 @@ def test_same_id_different_params_is_conflict(ledger):
     ledger.reserve(coid(1), "buy", BUY_PARAMS)
     verdict, _ = ledger.reserve(coid(1), "buy", {**BUY_PARAMS, "amount": 200})
     assert verdict == "conflict", "同 id 换参数必须拒绝，不能静默返回首次回执"
+
+
+def test_same_id_different_order_type_is_conflict(ledger):
+    ledger.reserve(coid(1), "buy", BUY_PARAMS)
+    verdict, _ = ledger.reserve(
+        coid(1),
+        "buy",
+        {"stock_no": "600000", "amount": 100,
+         "order_type": "FIVE_LEVEL_IOC"},
+    )
+    assert verdict == "conflict", "同 id 切换 LIMIT/FIVE_LEVEL_IOC 必须拒绝"
 
 
 def test_complete_and_entrust_join(ledger):
@@ -125,7 +141,8 @@ class OrderBackend:
 
 def _buy(backend, coid, amount=100):
     frame = {"type": "call", "id": "x", "method": "buy",
-             "params": {"stock_no": "600000", "amount": amount, "price": 8.1,
+             "params": {"stock_no": "600000", "amount": amount,
+                        "order_type": "LIMIT", "price": 8.1,
                         "client_order_id": coid}}
     return asyncio.run(dispatcher.handle_call(frame, backend))
 
@@ -186,6 +203,44 @@ def test_same_coid_different_params_rejected(ledger):
     assert other["result"]["data"]["submitted"] is False
 
 
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"stock_no": "600000", "amount": 100},
+        {"stock_no": "600000", "amount": 100, "price": 8.1},
+        {"stock_no": "600000", "amount": 100,
+         "order_type": "UNKNOWN", "price": 8.1},
+        {"stock_no": "600000", "amount": 100,
+         "order_type": "LIMIT"},
+        {"stock_no": "600000", "amount": 100,
+         "order_type": "LIMIT", "price": 0},
+        {"stock_no": "600000", "amount": 100,
+         "order_type": "LIMIT", "price": -1},
+        {"stock_no": "600000", "amount": 100,
+         "order_type": "LIMIT", "price": float("inf")},
+        {"stock_no": "600000", "amount": 100,
+         "order_type": "FIVE_LEVEL_IOC", "price": None},
+        {"stock_no": "600000", "amount": 100,
+         "order_type": "FIVE_LEVEL_IOC", "price": 8.1},
+    ],
+)
+@pytest.mark.parametrize("method", ["buy", "sell"])
+def test_invalid_order_contract_rejected_before_ledger_or_backend(ledger, method, params):
+    class NoReserveLedger:
+        def reserve(self, *args, **kwargs):
+            raise AssertionError("非法买卖请求不应触碰台账")
+
+    backend = OrderBackend(ledger)
+    backend.ledger = NoReserveLedger()
+    frame = {"type": "call", "id": "invalid-order", "method": method,
+             "params": {**params, "client_order_id": coid(40)}}
+    reply = asyncio.run(dispatcher.handle_call(frame, backend))
+    assert reply["ok"] is False
+    assert reply["result"]["code"] == "invalid_params"
+    assert reply["result"]["data"]["submitted"] is False
+    assert backend.submits == 0
+
+
 def test_ledger_unavailable_rejects_order(tmp_path):
     """台账不可用一律拒单，禁静默降级为无幂等下单。"""
     class NoLedgerBackend(OrderBackend):
@@ -200,8 +255,10 @@ def test_ledger_unavailable_rejects_order(tmp_path):
 
 
 @pytest.mark.parametrize("method, params", [
-    ("buy", {"stock_no": "600000", "amount": 100, "price": 8.1}),
-    ("sell", {"stock_no": "600000", "amount": 100, "price": 8.1}),
+    ("buy", {"stock_no": "600000", "amount": 100,
+             "order_type": "LIMIT", "price": 8.1}),
+    ("sell", {"stock_no": "600000", "amount": 100,
+              "order_type": "LIMIT", "price": 8.1}),
     ("cancel", {"entrust_no": "777"}),
 ])
 @pytest.mark.parametrize("value", [
@@ -228,8 +285,10 @@ def test_order_requires_canonical_uuid_v7(ledger, method, params, value):
 
 
 @pytest.mark.parametrize("method, params", [
-    ("buy", {"stock_no": "600000", "amount": 100, "price": 8.1}),
-    ("sell", {"stock_no": "600000", "amount": 100, "price": 8.1}),
+    ("buy", {"stock_no": "600000", "amount": 100,
+             "order_type": "LIMIT", "price": 8.1}),
+    ("sell", {"stock_no": "600000", "amount": 100,
+              "order_type": "LIMIT", "price": 8.1}),
     ("cancel", {"entrust_no": "777"}),
 ])
 def test_order_accepts_canonical_uuid_v7(ledger, method, params):

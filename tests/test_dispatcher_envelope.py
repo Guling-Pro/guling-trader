@@ -98,6 +98,7 @@ def test_submitted_unconfirmed_is_not_unknown_error():
     """已提交未确认必须给出明确文案 + 透传信封，绝不能塌成'未知错误'。"""
     frame = {"type": "call", "id": "id2", "method": "sell",
              "params": {"stock_no": "300459", "amount": 100,
+                        "order_type": "FIVE_LEVEL_IOC",
                         "client_order_id": COID}}
     result = contract.submitted_unconfirmed("已提交但未能在委托表中匹配到对应订单",
                                             data={"submitted": True})
@@ -138,6 +139,7 @@ def test_broker_rejection_carries_class_and_raw_text():
     """柜台拒单：class 可机器分流，broker_msg 保留原文（C2 两层分类）。"""
     frame = {"type": "call", "id": "id5", "method": "buy",
              "params": {"stock_no": "600000", "amount": 100,
+                        "order_type": "LIMIT", "price": 8.1,
                         "client_order_id": COID}}
     reply, _ = _call(frame, contract.broker_rejected("可用资金不足，无法委托"))
     assert reply["ok"] is False
@@ -156,6 +158,7 @@ def test_method_not_whitelisted():
 def test_backend_exception_is_caught():
     frame = {"type": "call", "id": "id7", "method": "sell",
              "params": {"stock_no": "300459", "amount": 100,
+                        "order_type": "LIMIT", "price": 8.1,
                         "client_order_id": COID}}
     reply, _ = _call(frame, RuntimeError("窗口未找到"))
     assert reply["ok"] is False
@@ -182,14 +185,15 @@ def test_settlement_default_date_range():
 
 
 def test_buy_params_forwarded_to_backend():
-    """确认 price 透传——市价单(price 缺省→None)不会被 dispatcher 篡改。"""
+    """显式 IOC 请求不带 price，后端仍收到 None 进入市价路径。"""
     frame = {"type": "call", "id": "id8", "method": "sell",
              "params": {"stock_no": "300459", "amount": 100,
+                        "order_type": "FIVE_LEVEL_IOC",
                         "client_order_id": COID}}
     _, backend = _call(frame, {"code": 0})
     name, args = backend.calls[-1]
     assert name == "sell"
-    assert args == ("300459", 100, None)   # price 缺省 → None（市价语义）
+    assert args == ("300459", 100, None)   # 显式 IOC → None（市价路径）
 
 
 def test_tools_list_returns_correct_schema():
