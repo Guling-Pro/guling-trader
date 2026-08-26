@@ -38,6 +38,7 @@ class FakeBackend:
         self.agent_entrust_nos: set[str] = set()
         self.ledger = FakeLedger()
         self.account_trading_blocked = False
+        self.account_checks = 0
 
     async def _run(self, name, *args):
         self.calls.append((name, args))
@@ -68,6 +69,16 @@ class FakeBackend:
 
     async def cancel(self, entrust_no):
         return await self._run("cancel", entrust_no)
+
+    async def verify_account_for_trade(self):
+        self.account_checks += 1
+        if self.account_trading_blocked:
+            return contract.fail(
+                contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                "当前账户身份尚未核验，已禁止买卖和撤单",
+                data={"account_verified": False, "submitted": False},
+            )
+        return contract.ok({"account_verified": True, "account_text": "测试账户"})
 
     async def switch_account(self, slot):
         return await self._run("switch_account", slot)
@@ -258,6 +269,7 @@ def test_buy_sell_blocked_after_account_verification_failure():
         "account_verified": False, "submitted": False,
     }
     assert backend.calls == []
+    assert backend.account_checks == 1
 
 
 def test_fallback_schema_matches_file_schema():

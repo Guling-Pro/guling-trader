@@ -273,7 +273,7 @@ FALLBACK_TOOLS_SCHEMA = {
     },
     {
       "name": "list_accounts",
-      "description": "只读列出同花顺账户下拉框中的可切换账户。仅点击当前控件快照确认的账户 ComboBox（ID 0x0912）打开下拉框，等待 0.5 秒后截取同花顺主窗口并 OCR 读取带 Alt+N 快捷键的账户行；不发送 Alt+N、不选择账户，账户名称保留 OCR 原文（包括 *）；返回 slot、shortcut、text 和 OCR 置信度。",
+      "description": "只读列出同花顺账户下拉框中的可切换账户。仅点击当前控件快照确认的账户 ComboBox（ID 0x0912）打开下拉框，等待 0.3 秒后读取展开的 ComboLBox（ID 0x03E8）原始列表项文本；过滤“编辑账户”，其余账户按显示顺序对应 Alt+1..Alt+9。不发送 Alt+N、不选择账户，账户名称原样保留（包括 *）；返回 slot、shortcut 和 text。",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -410,7 +410,7 @@ FALLBACK_TOOLS_SCHEMA = {
     },
     {
       "name": "switch_account",
-      "description": "切换同花顺客户端当前活跃的资金账户（向 xiadan 窗口发送 Alt+N，N=账户在客户端账户下拉列表中的槽位序号）。仅在 xiadan 登录了多个账户时有意义。切换后按账户控件 ID 0x094C 的 text 核验账户变化，并立即读取一次资金信息；成功时返回 account_text 和 balance，失败时禁止后续买卖。",
+      "description": "切换同花顺客户端当前活跃的资金账户（向 xiadan 窗口发送 Alt+N，N=账户在客户端账户下拉列表中的槽位序号）。仅在 xiadan 登录了多个账户时有意义。切换后按账户控件 ID 0x094C 的 text 核验账户变化，并立即读取一次资金信息；成功时返回 account_text 和 balance，失败时禁止后续买卖和撤单。每笔 buy/sell/cancel/confirm_external_cancel 前都会重新核对该账户文本。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1092,20 +1092,6 @@ async def handle_call(
             reply["error"] = validation_error
             return reply
 
-    # switch_account 在账户文本或资金查询核验失败后保持买卖闸门；查询和重试切换
-    # 仍可继续，避免在身份不明时把真实订单送入错误账户。
-    if method in ("buy", "sell") and getattr(backend, "account_trading_blocked", False):
-        msg = "当前账户身份尚未核验，已禁止买卖；请先成功调用 switch_account"
-        reply["ok"] = False
-        reply["result"] = contract.fail(
-            contract.CODE_READ_FAILED,
-            contract.CLS_READ_FAILED,
-            msg,
-            data={"account_verified": False, "submitted": False},
-        )
-        reply["error"] = msg
-        return reply
-
     # --- C5a 幂等：下单/撤单必须带业务级 ID，在**拿锁之前**查台账。重发直接
     # 返回首次回执，连排队都不用排，更不会走到点提交那一步。
     reserved_coid: Optional[str] = None
@@ -1216,6 +1202,21 @@ async def handle_call(
             reply["error"] = msg
             return reply
     try:
+        # 账户文本是同花顺当前交易账户的唯一已确认身份信号。每个真实交易路径
+        # 均在持有 win_lock 后、读取订单表/消费人工撤单令牌/发送任何 UI 输入前
+        # 重新核验；首次成功读取建立本进程基线，之后文本变化一律阻断。
+        if method in ORDER_METHODS:
+            account_preflight = await backend.verify_account_for_trade()
+            if not contract.is_succeed(account_preflight):
+                if reserved_coid and not refreshing_confirmation_prompt:
+                    _release_reservation(backend, reserved_coid)
+                    reserved_coid = None
+                reply["ok"] = False
+                reply["result"] = account_preflight
+                reply["error"] = ((account_preflight.get("error") or {}).get("message")
+                                  or "交易前账户核验失败")
+                return reply
+
         # 上一笔调用超时（疑似弹窗阻塞）后进入 degraded：先清残留弹窗再干活。
         # 清扫失败不阻断本次调用。
         if getattr(backend, "degraded", False):

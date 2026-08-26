@@ -70,7 +70,7 @@
     },
     {
       "name": "list_accounts",
-      "description": "只读列出同花顺账户下拉框中的可切换账户。仅点击当前控件快照确认的账户 ComboBox（ID 0x0912）打开下拉框，等待 0.5 秒后截取同花顺主窗口并 OCR 读取带 Alt+N 快捷键的账户行；不发送 Alt+N、不选择账户，账户名称保留 OCR 原文（包括 *）；返回 slot、shortcut、text 和 OCR 置信度。",
+      "description": "只读列出同花顺账户下拉框中的可切换账户。仅点击当前控件快照确认的账户 ComboBox（ID 0x0912）打开下拉框，等待 0.3 秒后读取展开的 ComboLBox（ID 0x03E8）原始列表项文本；过滤“编辑账户”，其余账户按显示顺序对应 Alt+1..Alt+9。不发送 Alt+N、不选择账户，账户名称原样保留（包括 *）；返回 slot、shortcut 和 text。",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -207,7 +207,7 @@
     },
     {
       "name": "switch_account",
-      "description": "切换同花顺客户端当前活跃的资金账户（向 xiadan 窗口发送 Alt+N，N=账户在客户端账户下拉列表中的槽位序号）。仅在 xiadan 登录了多个账户时有意义。切换后按账户控件 ID 0x094C 的 text 核验账户变化，并立即读取一次资金信息；成功时返回 account_text 和 balance，失败时禁止后续买卖。",
+      "description": "切换同花顺客户端当前活跃的资金账户（向 xiadan 窗口发送 Alt+N，N=账户在客户端账户下拉列表中的槽位序号）。仅在 xiadan 登录了多个账户时有意义。切换后按账户控件 ID 0x094C 的 text 核验账户变化，并立即读取一次资金信息；成功时返回 account_text 和 balance，失败时禁止后续买卖和撤单。每笔 buy/sell/cancel/confirm_external_cancel 前都会重新核对该账户文本。",
       "inputSchema": {
         "type": "object",
         "properties": {

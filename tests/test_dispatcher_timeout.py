@@ -38,6 +38,10 @@ class HangingBackend:
     async def sell(self, *a, **k):
         await asyncio.sleep(3600)
 
+    async def verify_account_for_trade(self):
+        from trader import contract
+        return contract.ok({"account_verified": True, "account_text": "测试账户"})
+
     async def orders_active(self):
         from trader import contract
         return contract.ok([])

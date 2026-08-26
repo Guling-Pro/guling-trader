@@ -37,6 +37,9 @@ class LockFakeBackend:
     async def orders_active(self):
         return await self._hold(contract.ok([]))
 
+    async def verify_account_for_trade(self):
+        return contract.ok({"account_verified": True, "account_text": "测试账户"})
+
     async def buy(self, stock_no, amount, price, client_order_id):
         return await self._hold(contract.ok({"entrust_no": "777"}))
 

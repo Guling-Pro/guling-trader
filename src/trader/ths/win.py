@@ -50,7 +50,7 @@ from .const import (
     MARKET_STRATEGY,
     MARKET_STRATEGY_COMBO_ID,
     MARKET_SUBMIT_BTN_ID,
-    MARKET_TREE_PARENT,
+    MARKET_TREE_PATHS,
     VK_CODE,
 )
 from .table_guard import check_table
@@ -126,14 +126,22 @@ refresh_sleep_time = 0.5
 retry_time = 1
 
 # 账户列表项：每次按当前绑定主窗口重新枚举，不保存其 HWND；同花顺重启后
-# HWND 可能变化。0x0912 来自当前 Windows 控件快照：ComboBox、可见、可用，
-# rect=[546, 201, 678, 227]；运行时仍按 ID/class/可见性/进程归属重新核验。
+# HWND 可能变化。0x0912 来自当前 Windows 控件快照：ComboBox、可见、可用。
+# 展开后，同花顺创建可见的顶层 ComboLBox（ID 0x03E8）；真机确认其标准
+# LB_GETTEXT 可直接返回账户原文，末项“编辑账户”不是可切换账户。
 ACCOUNT_SELECTOR_ID = 0x094C
 ACCOUNT_SELECTOR_CLASS = "Button"
 ACCOUNT_VERIFY_TIMEOUT_SECS = 3.0
 ACCOUNT_TEXT_PLACEHOLDERS = frozenset({"", "NUL", "ＸＸ证券"})
 ACCOUNT_DROPDOWN_ID = 0x0912
-ACCOUNT_DROPDOWN_SETTLE_SECS = 0.5
+ACCOUNT_DROPDOWN_SETTLE_SECS = 0.3
+ACCOUNT_LISTBOX_ID = 0x03E8
+ACCOUNT_LISTBOX_CLASS = "ComboLBox"
+ACCOUNT_LISTBOX_NON_ACCOUNT_ITEMS = frozenset({"编辑账户"})
+LB_GETTEXT = 0x0189
+LB_GETTEXTLEN = 0x018A
+LB_GETCOUNT = 0x018B
+LB_ERR = -1
 
 # Set by `setup()` from Config. Module-level so the existing call sites
 # (`win32gui.FindWindow(None, window_title)`) keep working without threading
@@ -357,80 +365,18 @@ def get_text(hwnd):
     return buf.value
 
 
-def _ocr_text_lines(image) -> list[dict[str, Any]]:
-    """将 OCR data 按行合并，保留位置和置信度供账户列表解析。"""
-    from pytesseract import Output
-
-    data = pytesseract.image_to_data(
-        image, lang="chi_sim+eng", config="--psm 11", output_type=Output.DICT
-    )
-    groups: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
-    for i, raw in enumerate(data.get("text", [])):
-        text = (raw or "").strip()
-        if not text:
-            continue
-        try:
-            conf = float(data["conf"][i])
-        except (KeyError, TypeError, ValueError):
-            conf = -1.0
-        key = (
-            int(data.get("block_num", [0])[i]),
-            int(data.get("par_num", [0])[i]),
-            int(data.get("line_num", [0])[i]),
-        )
-        groups.setdefault(key, []).append({
-            "text": text,
-            "left": int(data["left"][i]),
-            "top": int(data["top"][i]),
-            "width": int(data["width"][i]),
-            "height": int(data["height"][i]),
-            "conf": conf,
-        })
-
-    lines = []
-    for words in groups.values():
-        words.sort(key=lambda item: item["left"])
-        left = min(item["left"] for item in words)
-        top = min(item["top"] for item in words)
-        right = max(item["left"] + item["width"] for item in words)
-        bottom = max(item["top"] + item["height"] for item in words)
-        lines.append({
-            "text": " ".join(item["text"] for item in words).strip(),
-            "left": left,
-            "top": top,
-            "right": right,
-            "bottom": bottom,
-            "conf": round(sum(item["conf"] for item in words) / len(words), 1),
-        })
-    return sorted(lines, key=lambda item: (item["top"], item["left"]))
-
-
-def _account_candidates_from_ocr(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """从下拉框 OCR 行中提取带 ``Alt+N`` 的账户候选。
-
-    截图证据显示每个可切换账户行都带快捷键（如 ``Alt+1``），而“编辑账户”
-    没有快捷键。因此只接受带槽位快捷键的行，避免把资金数字或菜单项当账户。
-    """
-    out: list[dict[str, Any]] = []
-    seen_slots: set[int] = set()
-    for line in lines:
-        text = " ".join(str(line.get("text") or "").split()).strip()
-        if not text:
-            continue
-        shortcut = re.search(r"Alt\s*[+＋]\s*([1-9])", text, re.IGNORECASE)
-        if not shortcut:
-            continue
-        slot = int(shortcut.group(1))
-        if slot in seen_slots:
-            continue
-        account_text = text[:shortcut.start()].strip(" -—:：")
-        if not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", account_text) or len(account_text) < 3:
-            continue
-        seen_slots.add(slot)
-        out.append({"slot": slot, "text": account_text,
-                    "shortcut": f"Alt+{slot}", "confidence": line["conf"],
-                    "rect": [line["left"], line["top"], line["right"], line["bottom"]]})
-    return sorted(out, key=lambda item: item["slot"])
+def _account_candidates_from_listbox(items: list[str]) -> list[dict[str, Any]]:
+    """Map verified account ListBox rows to Alt+1..Alt+9 in visible order."""
+    account_texts = [
+        text.strip() for text in items
+        if text.strip() and text.strip() not in ACCOUNT_LISTBOX_NON_ACCOUNT_ITEMS
+    ]
+    if len(account_texts) > 9:
+        raise ValueError(f"账户下拉列表含 {len(account_texts)} 个账户，超过 Alt+1..Alt+9 范围")
+    return [
+        {"slot": index, "shortcut": f"Alt+{index}", "text": text}
+        for index, text in enumerate(account_texts, start=1)
+    ]
 
 
 _PHANTOM_VALUES = frozenset({"", "0", "0.0", "0.00", "0.000", "-", "--"})
@@ -580,6 +526,11 @@ class WindowSafetyError(RuntimeError):
     """A global UI action was stopped before it could target an unverified window."""
 
 
+# Some xiadan builds write neither rows nor headers for an empty
+# CVirtualGridCtrl. This is never used for ordinary clipboard failures.
+_VERIFIED_EMPTY_GRID = object()
+
+
 def guarded(fn):
     """工作线程入口装饰器：登记调用代次，本笔被作废时在检查点中止。
 
@@ -601,8 +552,9 @@ class WinThsBackend:
         # action; title text by itself is not a sufficient identity proof.
         self._bound_pid: int | None = None
         self._bound_executable: str | None = None
-        # 仅在一次切换核验失败后阻断买卖；初次启动不改变既有使用流程。
-        self._account_trading_blocked = False
+        # 在首次交易前必须读取 0x094C 建立账户基线；之后每笔交易都核对该文本。
+        # 任何读取失败或文本变化都阻断买卖和撤单，直到成功切换账户或重新核验。
+        self._account_trading_blocked = True
         self._last_account_text: str | None = None
         # order_watch 与 RPC 共用：串行化对 THS 单窗口的访问，避免并发拷表。
         self.win_lock = asyncio.Lock()
@@ -614,6 +566,9 @@ class WinThsBackend:
         # stronger evidence than the generic query-table marker check, and an
         # empty but valid table has no rows from which to recover this fact.
         self._last_grid_columns: dict[str, tuple[str, ...]] = {}
+        # No-header empty grids retain their verification separately: an
+        # unqualified clipboard failure must not become an empty baseline.
+        self._last_grid_verified_empty: set[str] = set()
         # dispatcher 侧调用超时后置位；下一次调用进入前先跑 dialog_cleanup 自愈。
         self.degraded = False
         # 调用代次：dispatcher 超时后 +1，作废所有在飞的工作线程（见 _abort_if_stale）。
@@ -1042,18 +997,82 @@ class WinThsBackend:
 
     @property
     def account_trading_blocked(self) -> bool:
-        """Whether a failed account switch verification currently blocks buy/sell."""
+        """Whether account identity currently blocks every trading action."""
         return self._account_trading_blocked
 
+    @guarded
+    def _verify_account_for_trade(self) -> dict[str, Any]:
+        """建立或核对交易账户基线；失败时阻断所有交易动作。
+
+        首次交易读取到的账户文本成为本进程基线。此后 buy/sell/cancel 与人工单
+        confirm_external_cancel 每次执行前都必须读取到相同文本，避免用户手动切换
+        同花顺账户后订单落入错误账户。
+        """
+        self._abort_if_stale("verify_account_for_trade")
+        current = self._read_account_selector_text()
+        expected = self._last_account_text
+        if not current:
+            self._account_trading_blocked = True
+            return contract.fail(
+                contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                "交易前无法读取当前账户（控件 ID 0x094C），已禁止买卖和撤单",
+                data={
+                    "account_verified": False,
+                    "expected_account_text": expected,
+                    "account_text": None,
+                    "submitted": False,
+                },
+            )
+
+        if expected is None:
+            self._last_account_text = current
+            self._account_trading_blocked = False
+            logger.info("已建立交易账户基线：%s", current)
+            return contract.ok({
+                "account_verified": True,
+                "account_text": current,
+                "account_baseline_established": True,
+            })
+
+        if current != expected:
+            self._account_trading_blocked = True
+            logger.error("交易前账户不一致：expected=%r actual=%r", expected, current)
+            return contract.fail(
+                contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                "交易前账户已变化（期望：%s，当前：%s），已禁止买卖和撤单；"
+                "请确认同花顺账户后调用 switch_account 重新核验" % (expected, current),
+                data={
+                    "account_verified": False,
+                    "expected_account_text": expected,
+                    "account_text": current,
+                    "submitted": False,
+                },
+            )
+
+        self._account_trading_blocked = False
+        return contract.ok({
+            "account_verified": True,
+            "account_text": current,
+            "account_baseline_established": False,
+        })
+
+    async def verify_account_for_trade(self) -> dict[str, Any]:
+        """Async trading preflight; caller must already hold ``win_lock``."""
+        bound_err = self._ensure_bound()
+        if bound_err:
+            self._account_trading_blocked = True
+            return bound_err
+        return await asyncio.to_thread(self._verify_account_for_trade)
+
     def _find_grid(self, root: int) -> int:
-        """找面板里的表格控件(0x417)。优先【可见的】CVirtualGridCtrl —— 右区同时挂着
-        多个面板的 grid，只有当前激活面板的可见，不按可见性过滤会误读到隐藏的持仓表
-        (导致 orders_active/filled 错读成 position)。逐级放宽回退，保证总能拿到一个。"""
+        """只找当前可见面板的表格控件(0x417)。
+
+        右区会同时挂载多个页面的 grid；若页面未切换，回退读取隐藏 grid 会把持仓等旧页面
+        伪装成当前查询结果。因此找不到可见 grid 时宁可返回 0 并拒绝读取。
+        """
         return (
             self._find_ctrl_by_id(root, 0x417, cls="CVirtualGridCtrl", visible=True)
             or self._find_ctrl_by_id(root, 0x417, visible=True)
-            or self._find_ctrl_by_id(root, 0x417, cls="CVirtualGridCtrl")
-            or self._find_ctrl_by_id(root, 0x417)
         )
 
     @staticmethod
@@ -1246,13 +1265,26 @@ class WinThsBackend:
         grid 里还是上一次查询的表，Ctrl+C 原样抓走，过去非空即 code=0 出门。
         """
         self._last_grid_columns.pop(kind, None)
+        self._last_grid_verified_empty.discard(kind)
         got_columns: list[str] = []
         reason = ""
+        navigation_failed = False
         for attempt in range(1, self._GRID_ATTEMPTS + 1):
-            goto()
+            navigated = goto()
+            if navigated is False:
+                navigation_failed = True
+                logger.warning("%s 未能导航到目标页面（第 %d/%d 次），未读取当前残留表格",
+                               label, attempt, self._GRID_ATTEMPTS)
+                time.sleep(sleep_time)
+                continue
             hwnd = self.get_right_hwnd()
             ctrl = self._find_grid(hwnd)
             data = self.read_table_text(ctrl) if ctrl else None
+            if data is _VERIFIED_EMPTY_GRID:
+                logger.info("%s 已通过拷贝验证码核验为空表（客户端未输出表头）", label)
+                self._last_grid_verified_empty.add(kind)
+                self.state.update(kind, [])
+                return contract.ok([])
             if data:
                 # 表头取自原始文本而非解析结果：空表（今天无挂单/无成交）是合法
                 # 结果，它照样有表头，必须能通过校验并以 data=[] 正常返回。
@@ -1273,6 +1305,10 @@ class WinThsBackend:
                 f"{label}：抓到的不是本次请求的表（{reason}），"
                 f"重抓 {self._GRID_ATTEMPTS} 次仍不符，已拒绝返回错表，请稍后重试",
                 data={"got_columns": got_columns})
+        if navigation_failed:
+            return contract.fail(
+                contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                f"{label}：未能导航到目标页面，已中止读取以避免使用残留表格，请稍后重试")
         return contract.fail(contract.CODE_READ_FAILED, CLS_READ_FAILED,
                              f"{label}：读取数据失败（可能验证码弹窗或刷新超时），请稍后重试")
 
@@ -1309,6 +1345,8 @@ class WinThsBackend:
         def goto():
             self.switch_to_normal()
             _activate_window(self.hwnd_main)
+            # 当前 Windows 实机验证 F1 -> F8 可切到当日委托；保留表头校验和只读可见
+            # grid 的约束，热键失效时会安全拒绝错表，不能把持仓表当委托表返回。
             hot_key(["F1"])
             hot_key(["F8"])
             self.refresh()
@@ -1401,7 +1439,7 @@ class WinThsBackend:
                     pass
 
     def _open_account_dropdown(self) -> bool:
-        """点击当前快照确认的账户 ComboBox，不用 OCR 猜测下拉按钮位置。"""
+        """点击当前快照确认的账户 ComboBox。"""
         combo = self._find_ctrl_by_id(
             self.hwnd_main, ACCOUNT_DROPDOWN_ID, cls="ComboBox", visible=True
         )
@@ -1417,21 +1455,75 @@ class WinThsBackend:
             "未点击、未读取账户、未切换账户"
         )
 
+    def _find_open_account_listbox(self) -> int:
+        """Find the visible standard dropdown ListBox confirmed by the live snapshot."""
+        matches: list[int] = []
+
+        def visit(hwnd, _):
+            try:
+                if (
+                    win32gui.IsWindowVisible(hwnd)
+                    and win32gui.GetDlgCtrlID(hwnd) == ACCOUNT_LISTBOX_ID
+                    and win32gui.GetClassName(hwnd) == ACCOUNT_LISTBOX_CLASS
+                ):
+                    matches.append(hwnd)
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(visit, None)
+        if len(matches) != 1:
+            raise RuntimeError(
+                "未唯一定位到账户下拉列表：期望可见 %s / ID=0x%04X，实际命中=%s"
+                % (ACCOUNT_LISTBOX_CLASS, ACCOUNT_LISTBOX_ID,
+                   [f"0x{hwnd:X}" for hwnd in matches])
+            )
+        return matches[0]
+
+    def _read_account_listbox_items(self, listbox: int) -> list[str]:
+        """Read standard ListBox rows without changing its selected item."""
+        user32 = ctypes.windll.user32
+        send_message = user32.SendMessageW
+        send_message.argtypes = (
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        )
+        send_message.restype = ctypes.c_ssize_t
+        count = send_message(listbox, LB_GETCOUNT, 0, 0)
+        if count == LB_ERR or count < 0:
+            raise RuntimeError(f"账户下拉列表 LB_GETCOUNT 失败，返回 {count}")
+        items: list[str] = []
+        for index in range(count):
+            length = send_message(listbox, LB_GETTEXTLEN, index, 0)
+            if length == LB_ERR or length < 0:
+                raise RuntimeError(
+                    f"账户下拉列表 LB_GETTEXTLEN 失败，index={index}，返回 {length}"
+                )
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            copied = send_message(
+                listbox, LB_GETTEXT, index, ctypes.addressof(buffer)
+            )
+            if copied == LB_ERR:
+                raise RuntimeError(f"账户下拉列表 LB_GETTEXT 失败，index={index}")
+            items.append(buffer.value)
+        return items
+
     @guarded
     def get_account_list(self):
-        """展开账户下拉框并用截图 OCR 列出候选账户；不选择、不切换账户。"""
+        """展开账户下拉框并读取标准 ListBox 文本；不选择、不切换账户。"""
         self._switch_to_normal_safely()
         current = self._read_account_selector_text()
         opened = False
         try:
             opened = self._open_account_dropdown()
             time.sleep(ACCOUNT_DROPDOWN_SETTLE_SECS)
-            image = self._capture_window_png(self.hwnd_main)
-            candidates = _account_candidates_from_ocr(_ocr_text_lines(image))
+            listbox = self._find_open_account_listbox()
+            candidates = _account_candidates_from_listbox(
+                self._read_account_listbox_items(listbox)
+            )
             if not candidates:
                 return contract.fail(
                     contract.CODE_READ_FAILED, CLS_READ_FAILED,
-                    "账户下拉框已打开，但 OCR 未识别到账户列表；未切换账户",
+                    "账户下拉框已打开，但未读取到可切换账户；未切换账户",
                     data={"accounts": [], "current_account_text": current,
                           "partial": True, "submitted": False},
                 )
@@ -1441,7 +1533,6 @@ class WinThsBackend:
                     "slot": item["slot"],
                     "shortcut": item["shortcut"],
                     "text": item["text"],
-                    "ocr_confidence": item["confidence"],
                 }
                 for item in candidates
             ]
@@ -1449,11 +1540,11 @@ class WinThsBackend:
                 "accounts": accounts,
                 "current_account_text": current,
                 "partial": False,
-                "source": "screenshot_ocr",
-                "msg": "已读取带 Alt 快捷键的账户列表，未选择或切换任何账户",
+                "source": "listbox_text",
+                "msg": "已读取账户下拉列表原始文本，未选择或切换任何账户",
             })
         except Exception as e:
-            logger.warning("account list screenshot/OCR failed: %s", e, exc_info=True)
+            logger.warning("account list ListBox read failed: %s", e, exc_info=True)
             return contract.fail(
                 contract.CODE_READ_FAILED, CLS_READ_FAILED,
                 f"读取账户下拉列表失败：{e}；未切换账户",
@@ -1659,12 +1750,13 @@ class WinThsBackend:
                 k32.VirtualFreeEx(int(h_proc), remote_item, 0, MEM_RELEASE)
             win32api.CloseHandle(h_proc)
 
-    def _select_tree_child(self, parent_text: str, child_text: str,
-                           require_window_safety: bool = False) -> bool:
-        """先按 parent_text 定位父节点，再在其【直接子节点】里整串精确匹配 child_text 选中。
+    def _select_tree_path(self, path: tuple[str, ...],
+                          require_window_safety: bool = False) -> bool:
+        """按左树完整路径精确匹配节点，再选中并点击最终节点。
 
-        用于市价委托 └ 买入/卖出——子节点文字'买入'与顶层'买入[F1]'前缀相同，深度优先的
-        _select_tree_node_by_text 会先撞顶层，故必须限定在父节点子树内、且整串精确匹配。
+        市价入口的文字在不同券商版本中可能不同，且“买入”会与普通 ``买入[F1]`` 重名。
+        因此不做深度优先子串搜索；调用方必须提供从顶层开始的完整路径。当前真机路径为
+        ``("市价买入",)`` 或 ``("市价卖出",)``。
 
         跨进程 TreeView 读写/位数处理/DPI 点击与 _select_tree_node_by_text 同构；那套原语有
         交割单/自选股导航依赖，为免在无法回归的环境重构破坏，这里独立实现，真机稳定后可再合并。
@@ -1702,8 +1794,10 @@ class WinThsBackend:
             def _norm(s: str) -> str:
                 return s.replace(" ", "").replace("　", "")
 
-            parent_norm = _norm(parent_text)
-            child_norm = _norm(child_text)
+            normalized_path = tuple(_norm(item) for item in path)
+            if not normalized_path or any(not item for item in normalized_path):
+                logger.warning("market: invalid tree path %r", path)
+                return False
 
             def read_text(hitem: int) -> str:
                 item = TVITEM()
@@ -1718,49 +1812,34 @@ class WinThsBackend:
                 k32.ReadProcessMemory(int(h_proc), remote_text, buf, bufsize, None)
                 return buf.raw.decode("utf-16-le", "ignore").split("\x00", 1)[0]
 
-            # 1) 深度优先找父节点（parent_text 在菜单里唯一，子串匹配足够）
-            def find_parent(hitem: int):
+            def find_sibling(hitem: int, target: str) -> int:
+                seen: list[str] = []
                 while hitem:
-                    if parent_norm in _norm(read_text(hitem)):
+                    text = _norm(read_text(hitem))
+                    seen.append(text)
+                    if text == target:
                         return hitem
-                    child = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_CHILD, hitem)
-                    if child:
-                        found = find_parent(child)
-                        if found:
-                            return found
                     hitem = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_NEXT, hitem)
+                logger.warning("market: path component %r not found; siblings=%r", target, seen)
                 return 0
 
-            parent = find_parent(win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_ROOT, 0))
-            if not parent:
-                logger.warning("market: parent tree node %r not found", parent_text)
-                return False
-
-            # 2) 只在父节点的【直接子节点】里整串精确匹配 child_text（免撞顶层"买入[F1]"）
             node = 0
-            seen_children: list[str] = []
-            hchild = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_CHILD, parent)
-            while hchild:
-                ctext = _norm(read_text(hchild))
-                seen_children.append(ctext)
-                if ctext == child_norm:
-                    node = hchild
-                    break
-                hchild = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_NEXT, hchild)
-            if not node:
-                logger.warning("market: child %r under %r not found; children=%r",
-                               child_text, parent_text, seen_children)
-                return False
+            siblings = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_ROOT, 0)
+            for component in normalized_path:
+                node = find_sibling(siblings, component)
+                if not node:
+                    logger.warning("market: tree path %r not found", path)
+                    return False
+                siblings = win32gui.SendMessage(tree, TVM_GETNEXTITEM, TVGN_CHILD, node)
 
-            # 3) 选中 + 真实鼠标点击（触发右侧面板切换；同 _select_tree_node_by_text）
+            # 选中 + 真实鼠标点击（触发右侧面板切换；同 _select_tree_node_by_text）
             win32gui.SendMessage(tree, TVM_SELECTITEM, TVGN_CARET, node)
             k32.WriteProcessMemory(int(h_proc), remote_text,
                                    ctypes.byref(ctypes.c_ssize_t(node)),
                                    ctypes.sizeof(ctypes.c_ssize_t), None)
             got = win32gui.SendMessage(tree, TVM_GETITEMRECT, 0, remote_text)
             if not got:
-                logger.info("market: selected (no rect, 程序化) child %r/%r",
-                            parent_text, child_text)
+                logger.info("market: selected (no rect, 程序化) path %r", path)
                 return True
             rect = (wintypes.LONG * 4)()
             k32.ReadProcessMemory(int(h_proc), remote_text, ctypes.byref(rect),
@@ -1791,8 +1870,7 @@ class WinThsBackend:
                     except Exception:
                         pass
             time.sleep(sleep_time)
-            logger.info("market: clicked tree child %r/%r at client(%d,%d)",
-                        parent_text, child_text, cx, cy)
+            logger.info("market: clicked tree path %r at client(%d,%d)", path, cx, cy)
             return True
         finally:
             if remote_text:
@@ -2022,7 +2100,8 @@ class WinThsBackend:
                 data={"submitted": False},
             )
         columns = self._last_grid_columns.get("active_orders", ())
-        if not self._active_order_columns_reliable(columns):
+        verified_empty = "active_orders" in self._last_grid_verified_empty
+        if not verified_empty and not self._active_order_columns_reliable(columns):
             return None, contract.fail(
                 contract.CODE_TABLE_MISMATCH, CLS_TABLE_MISMATCH,
                 "限价委托提交前的委托表缺少合同号、代码、方向、数量、价格或状态列，"
@@ -2036,6 +2115,14 @@ class WinThsBackend:
                 "限价委托提交前的委托表结果不是行列表，无法建立可靠基线，已中止未提交",
                 data={"submitted": False},
             )
+        if verified_empty:
+            if rows:
+                return None, contract.fail(
+                    contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                    "委托表空表核验与返回行数不一致，无法建立可靠基线，已中止未提交",
+                    data={"submitted": False},
+                )
+            return set(), None
         ids = [self._entrust_no(row.get("entrust_no")) for row in rows if isinstance(row, dict)]
         if len(ids) != len(rows) or any(not entrust_no for entrust_no in ids) or len(set(ids)) != len(ids):
             return None, contract.fail(
@@ -2064,12 +2151,16 @@ class WinThsBackend:
             result = self.get_active_orders_all()
             if contract.is_succeed(result):
                 columns = self._last_grid_columns.get("active_orders", ())
-                if not self._active_order_columns_reliable(columns):
+                verified_empty = "active_orders" in self._last_grid_verified_empty
+                if not verified_empty and not self._active_order_columns_reliable(columns):
                     logger.warning("lookup_entrust_no refused unreliable columns=%r", columns)
                     return None
                 rows = result.get("data") or []
                 if not isinstance(rows, list):
                     logger.warning("lookup_entrust_no got non-list order rows")
+                    return None
+                if verified_empty and rows:
+                    logger.warning("lookup_entrust_no got rows with verified-empty marker")
                     return None
                 last_seen_rows = len(rows)
                 entrust_no, candidate_count = self._unique_new_limit_entrust_no(
@@ -2292,8 +2383,8 @@ class WinThsBackend:
                     "下单前成交表回执基线格式异常，已中止未提交",
                     data={"submitted": False})
 
-            if not self._select_tree_child(
-                    MARKET_TREE_PARENT, op_keyword, require_window_safety=True):
+            path = MARKET_TREE_PATHS.get(op_keyword)
+            if not path or not self._select_tree_path(path, require_window_safety=True):
                 return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
                                      "未能导航到市价委托面板", data={"submitted": False})
             time.sleep(sleep_time)
@@ -2572,7 +2663,12 @@ class WinThsBackend:
         seq0 = user32.GetClipboardSequenceNumber()  # 清空后取基线，之后变化=本次拷贝
         _activate_window(hwnd)
         hot_key(["ctrl", "c"])
+        # Some empty grids produce no text at all. Only accept that as empty
+        # after the known copy-data captcha was present and cleared; any
+        # no-popup copy failure remains None and is retried/failed by callers.
+        captcha_seen = bool(self.get_ocr_hwnd())
         self.input_ocr()  # 处理"检测到您正在拷贝数据"验证码（无弹窗立即返回）
+        captcha_cleared = captcha_seen and not self.get_ocr_hwnd()
         deadline = time.time() + timeout
         data = None
         while time.time() < deadline:
@@ -2582,6 +2678,9 @@ class WinThsBackend:
                     break
             time.sleep(0.02)
         self._empty_clipboard()  # 读完立刻清空——剪贴板只当毫秒级中转点
+        if data is None and captcha_cleared:
+            logger.info("grid copy produced no text after known captcha cleared; verified empty grid")
+            return _VERIFIED_EMPTY_GRID
         return data
 
     def _preprocess_captcha(self, image):
@@ -2708,9 +2807,9 @@ class WinThsBackend:
                 text = ""
             code = text.strip()
             logger.info(
-                "ocr attempt=%d edit=%s ok_btn=%s raw=%r code=%r",
+                "ocr attempt=%d edit=%s ok_btn=%s recognized=%s length=%d",
                 attempt, hex(edit_hwnd),
-                hex(ok_btn) if ok_btn else None, text, code,
+                hex(ok_btn) if ok_btn else None, bool(code), len(code),
             )
             if not code:
                 time.sleep(short_sleep_time)
@@ -2754,8 +2853,8 @@ class WinThsBackend:
             )
             actual = buf.value
             logger.info(
-                "ocr attempt=%d wrote=%r read_back=%r match=%s",
-                attempt, code, actual, actual == code,
+                "ocr attempt=%d wrote_length=%d read_back_length=%d match=%s",
+                attempt, len(code), len(actual), actual == code,
             )
             time.sleep(short_sleep_time)
             if ok_btn:
@@ -2768,9 +2867,9 @@ class WinThsBackend:
                 )
             time.sleep(sleep_time)
             if not self.get_ocr_hwnd():
-                logger.info("ocr accepted attempt=%d code=%r", attempt, code)
+                logger.info("ocr accepted attempt=%d", attempt)
                 return
-            logger.info("ocr rejected attempt=%d code=%r", attempt, code)
+            logger.info("ocr rejected attempt=%d", attempt)
         logger.warning("ocr gave up after %d attempts", max_retries)
 
     def capture_window(self, hwnd, file_name):
@@ -2932,17 +3031,15 @@ class WinThsBackend:
 
         盲切：新版 xiadan 的账户下拉框给每个已登录账户注册了 Alt+1..Alt+9
         加速键（与下拉列表顺序一致）。发送按键后按账户列表项 0x094C 的
-        文本变化核验，并同步读取一次资金面板；核验失败时保留买卖闸门。"""
+        文本变化核验，并同步读取一次资金面板；核验失败时保留交易闸门。"""
         previous = self._read_account_selector_text()
         self._account_trading_blocked = True
         if not previous:
             return contract.fail(
                 contract.CODE_READ_FAILED, CLS_READ_FAILED,
-                "切换前无法读取当前账户（控件 ID 0x094C），未发送切换按键，已禁止买卖",
+                "切换前无法读取当前账户（控件 ID 0x094C），未发送切换按键，已禁止买卖和撤单",
                 data={"slot": slot, "account_verified": False, "submitted": False},
             )
-        self._last_account_text = previous
-
         self._send_hotkey(["alt", str(slot)], "switch_account")
 
         # 切换会触发账户列表和资金/持仓面板重载。账户控件可能先保留旧文本，
@@ -2959,7 +3056,7 @@ class WinThsBackend:
         if not current or current == previous:
             return contract.fail(
                 contract.CODE_READ_FAILED, CLS_READ_FAILED,
-                "Alt+%s 已发送，但账户控件文本未发生可验证变化，已禁止买卖；"
+                "Alt+%s 已发送，但账户控件文本未发生可验证变化，已禁止买卖和撤单；"
                 "请确认目标账户后重试" % slot,
                 data={
                     "slot": slot,
@@ -2974,7 +3071,7 @@ class WinThsBackend:
         if not contract.is_succeed(balance):
             return contract.fail(
                 contract.CODE_READ_FAILED, CLS_READ_FAILED,
-                "已检测到账户切换为 %s，但资金信息读取失败，已禁止买卖；请稍后重试"
+                "已检测到账户切换为 %s，但资金信息读取失败，已禁止买卖和撤单；请稍后重试"
                 % current,
                 data={
                     "slot": slot,

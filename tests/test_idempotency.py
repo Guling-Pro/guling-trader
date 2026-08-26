@@ -110,6 +110,14 @@ class OrderBackend:
         self.filled_queries = 0
         self.all_order_queries = 0
         self.calls: list[str] = []
+        self.account_checks = 0
+        self.account_preflight = contract.ok(
+            {"account_verified": True, "account_text": "测试账户"}
+        )
+
+    async def verify_account_for_trade(self):
+        self.account_checks += 1
+        return self.account_preflight
 
     async def buy(self, stock_no, amount, price, client_order_id):
         self.submits += 1
@@ -300,6 +308,68 @@ def test_order_accepts_canonical_uuid_v7(ledger, method, params):
     reply = asyncio.run(dispatcher.handle_call(frame, backend))
     assert reply["ok"] is True
     assert backend.calls == [method]
+
+
+def test_failed_account_preflight_blocks_buy_and_releases_idempotency_reservation(ledger):
+    """核验失败不得触发下单；修复后可用同一 ID 安全重试。"""
+    backend = OrderBackend(ledger)
+    backend.account_preflight = contract.fail(
+        contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+        "账户文本不一致", data={"account_verified": False, "submitted": False},
+    )
+
+    blocked = _buy(backend, coid(70))
+    assert blocked["result"]["code"] == "read_failed"
+    assert backend.calls == []
+
+    backend.account_preflight = contract.ok(
+        {"account_verified": True, "account_text": "测试账户"}
+    )
+    retried = _buy(backend, coid(70))
+    assert retried["ok"] is True
+    assert backend.calls == ["buy"]
+    assert backend.account_checks == 2
+
+
+def test_failed_account_preflight_blocks_external_cancel_before_table_read(ledger):
+    """人工订单撤单在核验失败时不能读表、发确认令牌或点击撤单。"""
+    backend = OrderBackend(ledger)
+    backend.account_preflight = contract.fail(
+        contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+        "账户文本不一致", data={"account_verified": False, "submitted": False},
+    )
+
+    blocked = _cancel(backend, coid(71))
+    assert blocked["result"]["code"] == "read_failed"
+    assert backend.all_order_queries == 0
+    assert backend.calls == []
+
+
+def test_failed_account_preflight_does_not_consume_external_cancel_token(ledger):
+    """确认撤单先核账户；失败后原令牌仍可在账户恢复后完成一次确认。"""
+    class B(OrderBackend):
+        async def orders_active_all(self):
+            self.all_order_queries += 1
+            return contract.ok([EXTERNAL_ORDER])
+
+    backend = B(ledger)
+    token = _cancel(backend, coid(72))["result"]["data"]["confirmation_token"]
+    backend.account_preflight = contract.fail(
+        contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+        "账户文本不一致", data={"account_verified": False, "submitted": False},
+    )
+
+    blocked = _confirm_external_cancel(backend, coid(73), token)
+    assert blocked["result"]["code"] == "read_failed"
+    assert backend.calls == []
+    assert backend.all_order_queries == 1
+
+    backend.account_preflight = contract.ok(
+        {"account_verified": True, "account_text": "测试账户"}
+    )
+    confirmed = _confirm_external_cancel(backend, coid(74), token)
+    assert confirmed["ok"] is True
+    assert backend.calls == ["cancel"]
 
 
 def test_unconfirmed_cancel_auto_verifies_target_without_resubmitting(ledger):

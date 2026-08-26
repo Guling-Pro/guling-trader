@@ -89,6 +89,9 @@ def _setup_file_logging() -> Path:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         force=True,
     )
+    # 根 logger 维持 INFO，避免 websockets 等依赖把文件日志淹没；项目自己的
+    # DEBUG 是排查 UI、表格和弹窗动作所需的完整诊断信息，应写入 trader.log。
+    logging.getLogger("trader").setLevel(logging.DEBUG)
 
     # 3) 顶层异常都写到日志（uncaught exception hook）
     def _excepthook(exc_type, exc_value, exc_tb):

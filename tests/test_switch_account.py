@@ -7,10 +7,12 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from trader import contract
 from trader.ths import win as w
 
-from trader.ths.win import WinThsBackend, _account_candidates_from_ocr
+from trader.ths.win import WinThsBackend, _account_candidates_from_listbox
 
 
 def _switch(slot):
@@ -59,7 +61,7 @@ def test_switch_reads_account_text_and_balance(monkeypatch):
     """切换后按 0x094C 文本确认，并在同一回执中返回资金信息。"""
     backend = WinThsBackend()
     monkeypatch.setattr(backend, "_read_account_selector_text",
-                        iter(["中信证券 王*洲", "银河证券 周*英"]).__next__)
+                        iter(["示例券商 甲*乙", "示例券商 丙*丁"]).__next__)
     sent = []
     monkeypatch.setattr(backend, "_send_hotkey",
                         lambda keys, where: sent.append((keys, where)))
@@ -73,9 +75,9 @@ def test_switch_reads_account_text_and_balance(monkeypatch):
 
     assert result["status"] == "succeed"
     assert result["data"]["account_verified"] is True
-    assert result["data"]["account_text"] == "银河证券 周*英"
+    assert result["data"]["account_text"] == "示例券商 丙*丁"
     assert result["data"]["balance"]["可用金额"] == 20000.78
-    assert result["data"]["msg"] == "已切换到：银河证券 周*英"
+    assert result["data"]["msg"] == "已切换到：示例券商 丙*丁"
     assert sent == [(["alt", "2"], "switch_account")]
     assert backend.account_trading_blocked is False
 
@@ -83,7 +85,7 @@ def test_switch_reads_account_text_and_balance(monkeypatch):
 def test_switch_text_unchanged_blocks_trading(monkeypatch):
     """账户文本没有变化时不能伪报切换成功，且保留买卖闸门。"""
     backend = WinThsBackend()
-    monkeypatch.setattr(backend, "_read_account_selector_text", lambda: "中信证券 王*洲")
+    monkeypatch.setattr(backend, "_read_account_selector_text", lambda: "示例券商 甲*乙")
     monkeypatch.setattr(backend, "_send_hotkey", lambda keys, where: None)
     monkeypatch.setattr(w, "ACCOUNT_VERIFY_TIMEOUT_SECS", 0)
     balance_called = []
@@ -98,23 +100,87 @@ def test_switch_text_unchanged_blocks_trading(monkeypatch):
     assert balance_called == []
 
 
-def test_account_ocr_only_accepts_rows_with_shortcut():
-    """截图中的账户行带 Alt+N；编辑账户和资金数字不能进入列表。"""
-    lines = [
-        {"text": "中信证券-王*洲 Alt+1", "left": 340, "top": 130,
-         "right": 730, "bottom": 160, "conf": 95.0},
-        {"text": "银河证券-周*英 Alt+2", "left": 340, "top": 170,
-         "right": 730, "bottom": 200, "conf": 91.0},
-        {"text": "编辑账户", "left": 340, "top": 210,
-         "right": 450, "bottom": 240, "conf": 99.0},
-        {"text": "可用 20000.78", "left": 400, "top": 260,
-         "right": 600, "bottom": 290, "conf": 90.0},
-    ]
-    accounts = _account_candidates_from_ocr(lines)
+def test_trade_account_preflight_establishes_then_checks_baseline(monkeypatch):
+    """启动后先读 0x094C 建基线，后续每笔交易都必须与其一致。"""
+    backend = WinThsBackend()
+    assert backend.account_trading_blocked is True
 
-    assert [(x["slot"], x["text"]) for x in accounts] == [
-        (1, "中信证券-王*洲"), (2, "银河证券-周*英"),
+    monkeypatch.setattr(backend, "_read_account_selector_text",
+                        lambda: "示例券商 甲*乙")
+    first = backend._verify_account_for_trade()
+    second = backend._verify_account_for_trade()
+
+    assert first["status"] == "succeed"
+    assert first["data"]["account_baseline_established"] is True
+    assert second["status"] == "succeed"
+    assert second["data"]["account_baseline_established"] is False
+    assert backend.account_trading_blocked is False
+
+
+def test_trade_account_preflight_blocks_changed_or_unreadable_text(monkeypatch):
+    """手动切户或控件不可读时，后续买卖和撤单都必须保持关闭。"""
+    backend = WinThsBackend()
+    monkeypatch.setattr(backend, "_read_account_selector_text",
+                        lambda: "示例券商 甲*乙")
+    assert backend._verify_account_for_trade()["status"] == "succeed"
+
+    monkeypatch.setattr(backend, "_read_account_selector_text",
+                        lambda: "示例券商 丙*丁")
+    changed = backend._verify_account_for_trade()
+    assert changed["code"] == "read_failed"
+    assert changed["data"]["expected_account_text"] == "示例券商 甲*乙"
+    assert changed["data"]["account_text"] == "示例券商 丙*丁"
+    assert backend.account_trading_blocked is True
+
+    monkeypatch.setattr(backend, "_read_account_selector_text", lambda: None)
+    unreadable = backend._verify_account_for_trade()
+    assert unreadable["code"] == "read_failed"
+    assert unreadable["data"]["account_text"] is None
+    assert backend.account_trading_blocked is True
+
+
+def test_account_listbox_filters_edit_item_and_assigns_slots_by_row_order():
+    """真机 ListBox 最后一行“编辑账户”不是账户，账户行从上至下对应 Alt+1..9。"""
+    accounts = _account_candidates_from_listbox([
+        "示例券商-甲*乙", "示例券商-丙*丁", "编辑账户",
+    ])
+
+    assert accounts == [
+        {"slot": 1, "shortcut": "Alt+1", "text": "示例券商-甲*乙"},
+        {"slot": 2, "shortcut": "Alt+2", "text": "示例券商-丙*丁"},
     ]
+
+
+def test_account_listbox_rejects_more_than_nine_accounts():
+    with pytest.raises(ValueError, match="超过 Alt\\+1..Alt\\+9 范围"):
+        _account_candidates_from_listbox([f"账户{i}" for i in range(10)])
+
+
+def test_get_account_list_reads_listbox_text_without_ocr(monkeypatch):
+    backend = WinThsBackend()
+    monkeypatch.setattr(backend, "_switch_to_normal_safely", lambda: None)
+    monkeypatch.setattr(backend, "_read_account_selector_text", lambda: "示例券商-甲*乙")
+    monkeypatch.setattr(backend, "_open_account_dropdown", lambda: True)
+    monkeypatch.setattr(backend, "_find_open_account_listbox", lambda: 123)
+    monkeypatch.setattr(
+        backend, "_read_account_listbox_items",
+        lambda hwnd: ["示例券商-甲*乙", "编辑账户"],
+    )
+    closed = []
+    monkeypatch.setattr(backend, "_send_hotkey", lambda keys, where: closed.append((keys, where)))
+    monkeypatch.setattr(w, "ACCOUNT_DROPDOWN_SETTLE_SECS", 0)
+
+    result = backend.get_account_list()
+
+    assert result["status"] == "succeed"
+    assert result["data"] == {
+        "accounts": [{"slot": 1, "shortcut": "Alt+1", "text": "示例券商-甲*乙"}],
+        "current_account_text": "示例券商-甲*乙",
+        "partial": False,
+        "source": "listbox_text",
+        "msg": "已读取账户下拉列表原始文本，未选择或切换任何账户",
+    }
+    assert closed == [(["esc"], "close_account_dropdown")]
 
 
 def test_account_dropdown_click_uses_visible_verified_combobox(monkeypatch):

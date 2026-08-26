@@ -148,8 +148,12 @@ VK_CODE = {
     "`": 0xC0,
 }
 
-# 市价委托面板控件（真机已 dump 验证；原生控件，非 CEF；新旧皮肤一致）
-MARKET_TREE_PARENT = "市价委托"     # 左树父节点，子节点为 买入/卖出（无 F 快捷键）
+# 市价委托面板控件（当前实机菜单 dump 验证；原生控件，非 CEF）。
+# 此券商版本的市价入口是两个顶层节点，不是“市价委托 -> 买入/卖出”父子结构。
+MARKET_TREE_PATHS = {
+    "买入": ("市价买入",),
+    "卖出": ("市价卖出",),
+}
 MARKET_CODE_ID = 0x408             # 证券代码 Edit（与 F1/F2 同 ID）
 MARKET_AMOUNT_ID = 0x40A           # 数量 Edit（与 F1/F2 同 ID）
 MARKET_SUBMIT_BTN_ID = 0x3EE       # 买入/卖出 提交 Button

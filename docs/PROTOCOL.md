@@ -219,8 +219,11 @@ reply 帧本身仍是单层 `{type,id,ok,result|error}`；除发现接口 `tools
   回显 coid；撤单动作引用同一编号但不会覆盖原买卖单的回显。回查不到合同编号的单
   （超时那批）与外部/人工单为 `null`。**对账主键是 entrust_no，coid 是增强关联**。
 * coid 应全局唯一；调用方的持久记录必须把它与目标账户绑定。固定 UUID v7 格式不
-  携带账户文本；受控端 `switch_account` 会读取账户控件 `0x094C` 的 `text` 并在切换后
-  返回 `account_text` 与一次资金查询结果，核验失败时禁止买卖。
+  携带账户文本；受控端启动后不会把任何账户视为已核验。第一笔交易前会读取账户控件
+  `0x094C` 的 `text` 建立本进程账户基线；此后每笔 `buy`/`sell`/`cancel`/
+  `confirm_external_cancel` 前都会重新读取并比对。读取失败或文本变化时禁止买卖和撤单，
+  不读取订单表、不消费人工撤单令牌，也不向同花顺发送交易输入。`switch_account` 会在
+  切换后返回 `account_text` 与一次资金查询结果，成功后更新该基线。
 * `buy`/`sell` 首次或幂等重放返回 `submitted_unconfirmed` 时，受控端会自动执行**一次**
   只读 `query_order`，把结果放入 `data.auto_query`；顶层仍保持
   `submitted_unconfirmed`，不会把启发式命中伪装成精确确认，**绝不自动重发下单**。
