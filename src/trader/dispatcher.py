@@ -1465,7 +1465,7 @@ async def handle_call(
                               or f"{result.get('status')}/{result.get('code')}")
 
     except Exception as e:
-        logger.error("处理 RPC '%s' 出错：%s", method, e)
+        logger.exception("处理 RPC '%s' 出错：%s", method, e)
         reply["ok"] = False
         reply["result"] = contract.fail(contract.CODE_INTERNAL_ERROR,
                                         contract.CLS_INTERNAL_ERROR, str(e))

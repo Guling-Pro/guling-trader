@@ -1482,7 +1482,11 @@ class WinThsBackend:
 
     def _read_account_listbox_items(self, listbox: int) -> list[str]:
         """Read standard ListBox rows without changing its selected item."""
-        user32 = ctypes.windll.user32
+        # ctypes.windll.user32 is process-global. Do not set SendMessageW.argtypes
+        # there: other paths intentionally use its two-argument form to read
+        # controls such as 0x094C, and a global four-argument signature makes
+        # every later account read fail with "takes 4 arguments (2 given)".
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
         send_message = user32.SendMessageW
         send_message.argtypes = (
             wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,

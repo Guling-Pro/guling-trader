@@ -156,6 +156,33 @@ def test_account_listbox_rejects_more_than_nine_accounts():
         _account_candidates_from_listbox([f"账户{i}" for i in range(10)])
 
 
+def test_account_listbox_uses_a_private_four_argument_send_message(monkeypatch):
+    """ListBox 的四参数绑定不能污染后续普通控件的两参数 SendMessageW 调用。"""
+    calls = []
+
+    class SendMessage:
+        def __call__(self, hwnd, message, wparam, lparam):
+            calls.append((hwnd, message, wparam, lparam))
+            if message == w.LB_GETCOUNT:
+                return 2
+            return 0
+
+    sender = SendMessage()
+    monkeypatch.setattr(
+        w.ctypes, "WinDLL", lambda *_args, **_kwargs: SimpleNamespace(SendMessageW=sender),
+        raising=False,
+    )
+
+    assert WinThsBackend()._read_account_listbox_items(123) == ["", ""]
+    assert calls == [
+        (123, w.LB_GETCOUNT, 0, 0),
+        (123, w.LB_GETTEXTLEN, 0, 0),
+        (123, w.LB_GETTEXT, 0, pytest.approx(calls[2][3])),
+        (123, w.LB_GETTEXTLEN, 1, 0),
+        (123, w.LB_GETTEXT, 1, pytest.approx(calls[4][3])),
+    ]
+
+
 def test_get_account_list_reads_listbox_text_without_ocr(monkeypatch):
     backend = WinThsBackend()
     monkeypatch.setattr(backend, "_switch_to_normal_safely", lambda: None)
