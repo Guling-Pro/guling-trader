@@ -151,10 +151,11 @@ xiadan 是 32 位，`TVITEMW` 的 `hItem/pszText/lParam` 是 4 字节；64 位 P
 | 提交 | Button | `0x3EE` |
 | 委托策略 | ComboBox | `0x605`（标准 `ComboBox`）|
 
-**导航**：当前券商实机树菜单中，市价入口是两个顶层节点 `市价买入`、`市价卖出`，均无 F
-快捷键。用 `_select_tree_path(("市价买入",))` 或 `_select_tree_path(("市价卖出",))`，从根节点起逐层
-精确匹配，不会撞到普通 `买入[F1]` / `卖出[F2]`。跨进程 TreeView 读写/位数/DPI 点击与
-`_select_tree_node_by_text` 同构；券商或版本变更后须以 `tools/ths_diag.py` 的真机导出为准。
+**导航**：已观察到两种真实菜单结构：顶层 `市价买入` / `市价卖出`，或
+`市价委托 └ 买入/卖出`。`_select_market_tree_path` 依次精确尝试两种完整路径，绝不在根层
+搜索裸 `买入` / `卖出`，因此不会撞到普通 `买入[F1]` / `卖出[F2]`。跨进程 TreeView
+读写、位数处理和 DPI 点击与 `_select_tree_node_by_text` 同构；券商或版本变更后须以
+`tools/ths_diag.py` 的真机导出为准。
 
 **委托策略设置**：买卖下拉不同 → 用**键盘位置数字**切换（`_set_market_strategy`：`SetFocus` +
 `AttachThreadInput` + `WM_CHAR`，`CB_GETCURSEL` 校验，未命中回退 `CB_SETCURSEL`）。

@@ -32,6 +32,23 @@ def test_client_order_id_joined_from_ledger_else_null():
     assert rows.normalize_active_row(ACTIVE_RAW, {})["client_order_id"] is None
 
 
+def test_active_row_accepts_broker_buy_sell_column_alias():
+    """实机委托表的“买卖”列也必须进入完整下单回执指纹。"""
+    raw = {
+        "合同编号": "A-1", "证券代码": "518800", "买卖": "买入",
+        "委托数量": "100", "委托价格": "1.000", "成交数量": "0",
+        "委托状态": "已报",
+    }
+
+    row = rows.normalize_active_row(raw)
+
+    assert row["entrust_no"] == "A-1"
+    assert row["方向"] == "买入"
+    assert row["委托数量"] == 100
+    assert row["委托价"] == 1.0
+    assert row["状态"] == "已报"
+
+
 @pytest.mark.parametrize("note,expected", [
     ("已报", rows.ST_PLACED), ("未报", rows.ST_PENDING), ("部成", rows.ST_PARTIAL),
     ("已成", rows.ST_FILLED), ("已撤", rows.ST_CANCELED), ("废单", rows.ST_REJECTED),

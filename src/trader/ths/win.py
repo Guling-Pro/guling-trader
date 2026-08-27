@@ -1883,6 +1883,16 @@ class WinThsBackend:
                 k32.VirtualFreeEx(int(h_proc), remote_item, 0, MEM_RELEASE)
             win32api.CloseHandle(h_proc)
 
+    def _select_market_tree_path(self, op_keyword: str) -> bool:
+        """选择当前客户端实际存在的市价买卖路径，兼容两种已验证菜单结构。"""
+        paths = MARKET_TREE_PATHS.get(op_keyword, ())
+        for path in paths:
+            if self._select_tree_path(path, require_window_safety=True):
+                logger.info("market: selected compatible path %r for %s", path, op_keyword)
+                return True
+        logger.warning("market: no compatible path found for %s; attempted=%r", op_keyword, paths)
+        return False
+
     def _real_click_hwnd(self, h: int) -> None:
         """对控件做一次真实鼠标点击（取窗口中心 → SetCursorPos → 按下抬起）。
 
@@ -2032,7 +2042,9 @@ class WinThsBackend:
         required = (
             ("合同编号", "委托编号"),
             ("证券代码",),
-            ("操作", "买卖标志"),
+            # 券商皮肤实际可见三种方向列名；必须与 normalize_active_row
+            # 的取值别名保持一致，否则基线通过后仍无法按完整指纹认领新合同号。
+            ("操作", "买卖标志", "买卖"),
             ("委托数量",),
             ("委托价格", "委托价"),
             ("成交数量",),
@@ -2387,8 +2399,7 @@ class WinThsBackend:
                     "下单前成交表回执基线格式异常，已中止未提交",
                     data={"submitted": False})
 
-            path = MARKET_TREE_PATHS.get(op_keyword)
-            if not path or not self._select_tree_path(path, require_window_safety=True):
+            if not self._select_market_tree_path(op_keyword):
                 return contract.fail(contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
                                      "未能导航到市价委托面板", data={"submitted": False})
             time.sleep(sleep_time)
