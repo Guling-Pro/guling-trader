@@ -383,6 +383,18 @@ def _account_candidates_from_listbox(items: list[str]) -> list[dict[str, Any]]:
 _PHANTOM_VALUES = frozenset({"", "0", "0.0", "0.00", "0.000", "-", "--"})
 
 
+def _is_phantom_value(value: Any) -> bool:
+    """Return whether a copied cell is an empty-table placeholder value."""
+    text = str(value).strip().strip("\x00")
+    if text in _PHANTOM_VALUES:
+        return True
+    # THS emits different decimal precision depending on the selected table,
+    # e.g. 0.0000 in the order grid. Treat only an actual numeric zero as empty.
+    if re.fullmatch(r"[+-]?0+(?:\.0+)?", text):
+        return True
+    return False
+
+
 def table_columns(text):
     """取 THS 剪贴板表格的表头列名（与 parse_table 同一套切分约定）。
 
@@ -417,7 +429,7 @@ def parse_table(text):
             continue
         items = raw.split("\t")
         info = {keys[j]: (items[j] if j < len(items) else "") for j in range(len(keys))}
-        if all(str(v).strip() in _PHANTOM_VALUES for v in info.values()):
+        if all(_is_phantom_value(v) for v in info.values()):
             continue
         result.append(info)
     return result
@@ -1393,7 +1405,7 @@ class WinThsBackend:
                 "委托数量", "委托价格", "委托价", "成交数量",
             )
             return all(
-                str(raw.get(field, "")).strip().strip("\x00") in _PHANTOM_VALUES
+                _is_phantom_value(raw.get(field, ""))
                 for field in identity_fields
             )
 
