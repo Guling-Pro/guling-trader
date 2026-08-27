@@ -22,6 +22,7 @@ import asyncio
 import ctypes
 from ctypes import wintypes
 import functools
+import json
 import logging
 import os
 import platform
@@ -566,6 +567,9 @@ class WinThsBackend:
         # stronger evidence than the generic query-table marker check, and an
         # empty but valid table has no rows from which to recover this fact.
         self._last_grid_columns: dict[str, tuple[str, ...]] = {}
+        # 原始剪贴板与最终订单行只保存在内存；仅基线拒绝时写入 trader.log，
+        # 用于定位券商空表占位行、短行或合同号异常，绝不随普通查询回执上送。
+        self._last_grid_debug: dict[str, dict[str, Any]] = {}
         # No-header empty grids retain their verification separately: an
         # unqualified clipboard failure must not become an empty baseline.
         self._last_grid_verified_empty: set[str] = set()
@@ -1266,6 +1270,7 @@ class WinThsBackend:
         """
         self._last_grid_columns.pop(kind, None)
         self._last_grid_verified_empty.discard(kind)
+        self._last_grid_debug.pop(kind, None)
         got_columns: list[str] = []
         reason = ""
         navigation_failed = False
@@ -1294,6 +1299,10 @@ class WinThsBackend:
                 if not reason:
                     rows = normalize(parsed) if normalize else parsed
                     self._last_grid_columns[kind] = tuple(got_columns)
+                    self._last_grid_debug[kind] = {
+                        "clipboard_text": data,
+                        "normalized_rows": rows,
+                    }
                     self.state.update(kind, rows)
                     return contract.ok(rows)
                 logger.warning("%s 抓到错表（第 %d/%d 次）：%s cols=%r",
@@ -1372,12 +1381,31 @@ class WinThsBackend:
     def _grab_active(self, goto, include_terminal: bool):
         coid_map = self._coid_map()
 
+        def is_empty_order_placeholder(raw: dict[str, Any]) -> bool:
+            """识别空委托表带时间/展示列的残留占位行。
+
+            同花顺有时在没有任何委托时仍复制一行时间或市场展示值，因此通用
+            ``parse_table`` 不会把它视作全空行。只有订单身份及数量/价格等核心字段
+            全部为占位值才过滤；有任一真实订单字段却没有合同号的行仍必须拒绝基线。
+            """
+            identity_fields = (
+                "合同编号", "委托编号", "证券代码", "操作", "买卖标志", "买卖",
+                "委托数量", "委托价格", "委托价", "成交数量",
+            )
+            return all(
+                str(raw.get(field, "")).strip().strip("\x00") in _PHANTOM_VALUES
+                for field in identity_fields
+            )
+
         def normalize(rows):
             out = []
             for raw in rows:
+                if is_empty_order_placeholder(raw):
+                    logger.debug("委托查询过滤空表展示占位行：keys=%r", list(raw))
+                    continue
                 row = normalize_active_row(raw, coid_map)
                 if include_terminal or is_in_flight(
-                        row["状态"], row["委托数量"], row["已成数量"]):
+                    row["状态"], row["委托数量"], row["已成数量"]):
                     out.append(row)
             return out
 
@@ -2116,8 +2144,12 @@ class WinThsBackend:
                 data={"submitted": False},
             )
         columns = self._last_grid_columns.get("active_orders", ())
+        debug_snapshot = self._last_grid_debug.get("active_orders", {})
         verified_empty = "active_orders" in self._last_grid_verified_empty
         if not verified_empty and not self._active_order_columns_reliable(columns):
+            self._log_limit_baseline_debug(
+                "unreliable_columns", columns, debug_snapshot,
+            )
             return None, contract.fail(
                 contract.CODE_TABLE_MISMATCH, CLS_TABLE_MISMATCH,
                 "限价委托提交前的委托表缺少合同号、代码、方向、数量、价格或状态列，"
@@ -2126,6 +2158,9 @@ class WinThsBackend:
             )
         rows = result.get("data")
         if not isinstance(rows, list):
+            self._log_limit_baseline_debug(
+                "non_list_rows", columns, debug_snapshot,
+            )
             return None, contract.fail(
                 contract.CODE_READ_FAILED, CLS_READ_FAILED,
                 "限价委托提交前的委托表结果不是行列表，无法建立可靠基线，已中止未提交",
@@ -2141,12 +2176,47 @@ class WinThsBackend:
             return set(), None
         ids = [self._entrust_no(row.get("entrust_no")) for row in rows if isinstance(row, dict)]
         if len(ids) != len(rows) or any(not entrust_no for entrust_no in ids) or len(set(ids)) != len(ids):
+            missing_indexes = [
+                index for index, row in enumerate(rows)
+                if not isinstance(row, dict) or not self._entrust_no(row.get("entrust_no"))
+            ]
+            id_indexes: dict[str, list[int]] = {}
+            for index, row in enumerate(rows):
+                if isinstance(row, dict):
+                    entrust_no = self._entrust_no(row.get("entrust_no"))
+                    if entrust_no:
+                        id_indexes.setdefault(entrust_no, []).append(index)
+            duplicates = {
+                entrust_no: indexes for entrust_no, indexes in id_indexes.items()
+                if len(indexes) > 1
+            }
+            self._log_limit_baseline_debug(
+                "missing_or_duplicate_contract", columns, debug_snapshot,
+                missing_contract_row_indexes=missing_indexes,
+                duplicate_contract_ids=duplicates,
+            )
             return None, contract.fail(
                 contract.CODE_TABLE_MISMATCH, CLS_TABLE_MISMATCH,
                 "限价委托提交前的委托表存在缺失或重复合同号，无法证明新旧订单边界，已中止未提交",
                 data={"submitted": False, "got_columns": list(columns)},
             )
         return set(ids), None
+
+    @staticmethod
+    def _log_limit_baseline_debug(reason: str, columns: tuple[str, ...] | list[str],
+                                  snapshot: dict[str, Any], **details: Any) -> None:
+        """将委托表基线拒绝时的剪贴板和解析中间态写入本地诊断日志。"""
+        payload = {
+            "reason": reason,
+            "columns": list(columns),
+            "clipboard_text": snapshot.get("clipboard_text"),
+        "normalized_rows": snapshot.get("normalized_rows"),
+            **details,
+        }
+        logger.error(
+            "[LIMIT_BASELINE_DEBUG] %s",
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+        )
 
     def _lookup_entrust_no(self, stock_no, op_keyword, amount, price,
                            baseline_entrust_nos: set[str] | None, timeout=8.0):

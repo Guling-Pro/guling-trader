@@ -27,6 +27,17 @@ EMPTY_ACTIVE_TABLE = (  # 无挂单时 THS 照样拷出表头 + 空占位行
     "证券代码\t操作\t委托数量\t委托价格\t成交数量\t成交均价\t合同编号\t备注\t\r\n"
     "\t\t\t\t\t\t\t\t\r\n"
 )
+EMPTY_ACTIVE_TABLE_WITH_DISPLAY_ROW = (
+    # 实机皮肤可能在空表中残留委托时间、成交价格等展示值；核心订单字段全空/零。
+    "委托时间\t证券代码\t证券名称\t买卖\t委托状态\t委托数量\t成交数量\t委托价格\t"
+    "成交价格\t已撤数量\t合同编号\t交易市场\t\r\n"
+    "11:26:48\t\t\t\t\t0\t0\t0\t0\t0\t\t\t\r\n"
+)
+ACTIVE_TABLE_MISSING_CONTRACT = (
+    "委托时间\t证券代码\t证券名称\t买卖\t委托状态\t委托数量\t成交数量\t委托价格\t"
+    "成交价格\t已撤数量\t合同编号\t交易市场\t\r\n"
+    "11:26:48\t518800\t示例基金\t买入\t已报\t100\t0\t5.000\t0\t0\t\t沪A\t\r\n"
+)
 
 
 def _backend(monkeypatch, texts):
@@ -65,6 +76,36 @@ def test_empty_table_is_still_success(monkeypatch):
     r = b.get_active_orders()
     assert r["status"] == "succeed"
     assert r["data"] == []
+
+
+def test_empty_order_display_row_is_not_mistaken_for_missing_contract(monkeypatch):
+    """空委托表即使保留时间展示行，限价单基线也应安全视为无历史订单。"""
+    b = _backend(monkeypatch, [EMPTY_ACTIVE_TABLE_WITH_DISPLAY_ROW])
+
+    baseline, error = b._read_limit_order_baseline()
+
+    assert error is None
+    assert baseline == set()
+    assert b._last_grid_columns["active_orders"] == (
+        "委托时间", "证券代码", "证券名称", "买卖", "委托状态", "委托数量",
+        "成交数量", "委托价格", "成交价格", "已撤数量", "合同编号", "交易市场",
+    )
+
+
+def test_limit_baseline_error_logs_clipboard_and_normalized_rows(monkeypatch, caplog):
+    """合同号异常时，trader.log 必须能还原本次复制原文与最终订单行。"""
+    b = _backend(monkeypatch, [ACTIVE_TABLE_MISSING_CONTRACT])
+
+    baseline, error = b._read_limit_order_baseline()
+
+    assert baseline is None
+    assert error["code"] == "table_mismatch"
+    rendered = caplog.text
+    assert "[LIMIT_BASELINE_DEBUG]" in rendered
+    assert "clipboard_text" in rendered
+    assert "normalized_rows" in rendered
+    assert "missing_contract_row_indexes" in rendered
+    assert "518800" in rendered
 
 
 def test_no_header_empty_table_is_success_only_with_verified_marker(monkeypatch):
