@@ -364,7 +364,7 @@ FALLBACK_TOOLS_SCHEMA = {
     },
     {
       "name": "cancel",
-      "description": "撤销指定委托编号的未成交订单。",
+      "description": "撤销指定委托编号的未成交订单。点击确认后会短暂只读轮询 F3 委托表；仅明确显示已撤/部撤时返回成功。目标消失、仍在飞、状态不明、错表或读取失败均返回 submitted_unconfirmed，并自动做一次只读全量表核验，绝不再次点击撤单。",
       "inputSchema": {
         "type": "object",
         "properties": {

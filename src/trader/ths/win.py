@@ -57,6 +57,8 @@ from .const import (
 )
 from .table_guard import check_table
 from .rows import (
+    ST_CANCELED,
+    classify_order_state,
     normalize_active_row,
     normalize_balance,
     normalize_filled_row,
@@ -126,6 +128,11 @@ sleep_time = 0.2
 short_sleep_time = 0.05
 refresh_sleep_time = 0.5
 retry_time = 1
+
+# 撤单确认按钮点击后，只读轮询 F3 可撤委托表的时间预算。该轮询绝不再次
+# 双击订单行；若 F3 不能明确证明已撤，dispatcher 会再读一次含终态的全量委托表。
+CANCEL_VERIFY_TIMEOUT_SECS = 3.0
+CANCEL_VERIFY_INTERVAL_SECS = 0.3
 
 # 账户列表项：每次按当前绑定主窗口重新枚举，不保存其 HWND；同花顺重启后
 # HWND 可能变化。0x0912 来自当前 Windows 控件快照：ComboBox、可见、可用。
@@ -479,6 +486,52 @@ def parse_table(text):
             continue
         result.append(info)
     return result
+
+
+def _cancel_f3_outcome(data: Any, entrust_no: Any) -> tuple[str, str | None]:
+    """Classify one post-submit F3 snapshot without inferring a cancel.
+
+    F3 is a *revocable orders* view. A row disappearing can mean either a
+    successful cancel or a concurrent full fill, so disappearance deliberately
+    remains unresolved. Only a uniquely matched row with an explicit canceled
+    status proves the broker accepted the cancel.
+
+    The return value is ``(outcome, state)`` where outcome is one of
+    ``canceled``, ``pending``, ``unresolved``, or ``unreadable``.
+    """
+    if data is _VERIFIED_EMPTY_GRID:
+        return "unresolved", None
+    if not isinstance(data, str) or not data:
+        return "unreadable", None
+
+    columns = table_columns(data)
+    id_cols = tuple(name for name in ("委托编号", "合同编号") if name in columns)
+    state_col = next((name for name in ("委托状态", "状态", "备注") if name in columns), None)
+    if not id_cols or not state_col:
+        return "unreadable", None
+
+    target = str(entrust_no).strip()
+    matches = [
+        row for row in parse_table(data)
+        if any(str(row.get(id_col, "")).strip() == target for id_col in id_cols)
+    ]
+    if len(matches) != 1:
+        return "unresolved", None
+
+    raw_state = str(matches[0].get(state_col, "")).strip()
+    state = classify_order_state(raw_state)
+    # ``classify_order_state`` intentionally groups broad wording such as
+    # "撤单中" into ST_CANCELED for passive order-list consumers. Here the
+    # bar is higher: a post-submit success reply needs a completed cancel,
+    # not merely evidence that cancellation is in progress.
+    explicit_cancel = any(
+        token in raw_state for token in ("已撤", "部撤", "撤单成功", "撤销成功")
+    )
+    if state == ST_CANCELED and explicit_cancel:
+        return "canceled", state
+    if state == ST_CANCELED:
+        state = "未知"
+    return "pending", state
 
 
 # --- TreeView (SysTreeView32) 跨进程消息常量 ----------------------------------
@@ -2644,6 +2697,54 @@ class WinThsBackend:
             return contract.fail(contract.CODE_INTERNAL_ERROR, contract.CLS_INTERNAL_ERROR,
                                  f"cancel error: {e}")
 
+    def _verify_cancel_after_submit(self, entrust_no: str) -> dict[str, Any]:
+        """Read F3 after a confirmed cancel click; never submit a second cancel.
+
+        A successful click only proves that the client accepted our input. The
+        broker result is confirmed only when the same F3 row explicitly says
+        ``已撤``. F3 excludes non-revocable orders, therefore a missing row is
+        intentionally not a success signal: it can also be a full fill.
+        """
+        deadline = time.time() + CANCEL_VERIFY_TIMEOUT_SECS
+        last_outcome = "unreadable"
+        last_state: str | None = None
+        last_columns: list[str] = []
+
+        while time.time() < deadline:
+            self.refresh(require_window_safety=True)
+            hwnd = self.get_right_hwnd()
+            ctrl = self._find_grid(hwnd) if hwnd else None
+            data = self.read_table_text(ctrl) if ctrl else None
+            if isinstance(data, str):
+                last_columns = table_columns(data)
+            outcome, state = _cancel_f3_outcome(data, entrust_no)
+            last_outcome, last_state = outcome, state
+            if outcome == "canceled":
+                logger.info("撤单柜台状态已由 F3 确认 entrust_no=%s", entrust_no)
+                return contract.ok({
+                    "entrust_no": str(entrust_no),
+                    "submitted": True,
+                    "cancel_state": ST_CANCELED,
+                    "cancel_verified": True,
+                })
+            time.sleep(CANCEL_VERIFY_INTERVAL_SECS)
+
+        logger.warning(
+            "撤单确认后 F3 未能确认柜台已撤 entrust_no=%s outcome=%s state=%s columns=%r",
+            entrust_no, last_outcome, last_state, last_columns,
+        )
+        return contract.submitted_unconfirmed(
+            "撤单确认已点击，但未在 F3 委托表确认柜台已撤；本次未再次点击撤单。"
+            "请用原 client_order_id 查询订单状态",
+            data={
+                "entrust_no": str(entrust_no),
+                "submitted": True,
+                "cancel_verified": False,
+                "cancel_state": last_state or "未知",
+                "f3_verification": last_outcome,
+            },
+        )
+
     def _cancel_inner(self, entrust_no):
         self._switch_to_normal_safely()
         self._send_hotkey(["F3"], "cancel_panel")
@@ -2711,7 +2812,29 @@ class WinThsBackend:
                 "撤单确认弹窗未找到可识别的肯定按钮，未自动确认撤单；请人工核对订单状态",
                 data=pump.attach_to({"entrust_no": str(entrust_no), "submitted": False}),
             )
-        return contract.ok(pump.attach_to({"entrust_no": str(entrust_no), "submitted": True}))
+        try:
+            result = self._verify_cancel_after_submit(str(entrust_no))
+        except StaleCallAborted:
+            raise
+        except Exception as e:
+            # The confirmation click has already been accepted. A later read,
+            # focus, or UI error cannot truthfully turn this into "not
+            # submitted"; preserve the unknown outcome for dispatcher query.
+            logger.exception("撤单确认后 F3 核验异常 entrust_no=%s", entrust_no)
+            result = contract.submitted_unconfirmed(
+                "撤单确认已点击，但 F3 委托表核验异常；本次未再次点击撤单。"
+                "请用原 client_order_id 查询订单状态",
+                data={
+                    "entrust_no": str(entrust_no),
+                    "submitted": True,
+                    "cancel_verified": False,
+                    "cancel_state": "未知",
+                    "f3_verification": "error",
+                },
+            )
+        if isinstance(result.get("data"), dict):
+            result["data"] = pump.attach_to(result["data"])
+        return result
 
     def get_result(self, cid=0x3EC):
         tid, pid = win32process.GetWindowThreadProcessId(self.hwnd_main)

@@ -230,7 +230,9 @@ reply 帧本身仍是单层 `{type,id,ok,result|error}`；除发现接口 `tools
 * `buy`/`sell` 首次或幂等重放返回 `submitted_unconfirmed` 时，受控端会自动执行**一次**
   只读 `query_order`，把结果放入 `data.auto_query`；顶层仍保持
   `submitted_unconfirmed`，不会把启发式命中伪装成精确确认，**绝不自动重发下单**。
-* `cancel` 的 coid 标识的是撤单动作，而非原买卖单。其首次或幂等重放返回
+* `cancel` 点击确认后会短暂只读轮询 F3 委托表。只有唯一目标行明确显示 `已撤`/`部撤` 才
+  返回成功；目标消失、仍在飞、状态不明、错表或读取失败都返回 `submitted_unconfirmed`，因为
+  F3 中消失也可能是订单已全部成交，不能伪装成撤单成功。其首次或幂等重放返回
   `submitted_unconfirmed` 时，受控端会用该撤单请求保存的目标 `entrust_no`，自动读取**一次**
   含终态的内部全量委托表，结果同样放入 `data.auto_query`；它不会调用买卖单的启发式
   查询，也**绝不自动重发撤单**。只在全量表精确命中且 `cancel_state` 为 `已撤` 或
