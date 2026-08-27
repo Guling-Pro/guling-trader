@@ -109,7 +109,7 @@ When the AI Client triggers a tool, the Gateway unwraps the tool parameter block
     "stock_no": "600000",
     "amount": 100,
     "price": 7.58,
-    "client_order_id": "custom-uuid"
+    "client_order_id": "gl-0198f6a1-0001-7000-8000-000000000001"
   }
 }
 ```
@@ -117,8 +117,8 @@ When the AI Client triggers a tool, the Gateway unwraps the tool parameter block
 
 ### 3.2. Trader-to-Gateway: `reply` Envelope（契约 v2）
 
-reply 帧本身仍是单层 `{type,id,ok,result|error}`；**`result` 一律是契约 v2 信封**，
-所有工具无例外形（含 buy/sell/cancel，含失败与 busy）：
+reply 帧本身仍是单层 `{type,id,ok,result|error}`；除发现接口 `tools/list` 外，业务工具的
+**`result` 一律是契约 v2 信封**，含 buy/sell/cancel/confirm_external_cancel 的失败与 busy：
 
 ```json
 {
@@ -132,6 +132,10 @@ reply 帧本身仍是单层 `{type,id,ok,result|error}`；**`result` 一律是�
 
 `contract_version` 亦通过网关 `initialize` 的 `serverInfo.contract_version` 暴露，
 消费侧无需先调业务工具即可判版。
+
+`tools/list` 是唯一的发现接口例外：其 `reply.result` 为裸
+`{"tools": [...]}`，方便网关直接取得 JSON Schema；它不是业务回执，消费侧不能把它按
+契约 v2 信封解析。
 
 #### `code` 值域（机器枚举）
 
@@ -149,13 +153,14 @@ reply 帧本身仍是单层 `{type,id,ok,result|error}`；**`result` 一律是�
 | `invalid_params` | 参数非法 / coid 复用冲突 | failed |
 | `ledger_unavailable` | 下单台账不可用（**已拒单**） | failed |
 | `not_found` | query_order 查无此单 / 撤单找不到该委托 | failed |
+| `confirmation_required` | 未登记订单撤单需要显式确认，尚未点击 GUI | failed |
 | `aborted` | 本笔已被超时作废（代次机制） | failed |
 | `unsupported_method` | 方法不在白名单 | failed |
 | `internal_error` | 受控端内部错误 | failed |
 
 #### ⚠️ `status: failed` **不等于**「未提交」
 
-`code == submitted_unconfirmed` 时委托**可能已经在柜台**。判定必须看 `code`，不能看
+`code == submitted_unconfirmed` 时交易动作**可能已经在柜台**。判定必须看 `code`，不能看
 `status`。此时调用方唯一安全动作是**用同一 `client_order_id` 原样重发**（幂等，见
 3.2.3），或调 `query_order` 核实；**禁止改单重下**。
 
@@ -163,14 +168,15 @@ reply 帧本身仍是单层 `{type,id,ok,result|error}`；**`result` 一律是�
 
 * **结构性判定**（我方控制流得出，可靠）：`busy` `call_timeout` `unknown_outcome`
   `not_bound` `plugin_disabled` `read_failed` `table_mismatch` `invalid_params`
-  `ledger_unavailable` `not_found` `aborted` `internal_error`
+  `ledger_unavailable` `not_found` `confirmation_required` `aborted` `internal_error`
 * **柜台原文尽力映射**：`insufficient_funds` `price_out_of_limit` `invalid_quantity`
   `suspended` `no_permission` `broker_timeout`，**认不出一律 `unknown`**。
 
 `broker_msg` 永远保留柜台原文。**`class == unknown` 与所有 unknown_outcome
 一律不可自动重试**——关键词表是尽力而为的，误判「可重试」会真的重复下单。
 不可自动重试集合：`unknown` `unknown_outcome` `insufficient_funds` `no_permission`
-`invalid_quantity` `invalid_params` `ledger_unavailable`。
+`invalid_quantity` `invalid_params` `ledger_unavailable` `confirmation_required`。后者必须由
+用户显式确认后再调用 `confirm_external_cancel`，不能由通用重试器代为继续。
 
 #### 3.2.1 busy 背压语义（G3）
 
@@ -199,22 +205,79 @@ reply 帧本身仍是单层 `{type,id,ok,result|error}`；**`result` 一律是�
 
 * coid **不写入柜台**（同花顺委托无自定义字段），仅存于受控端本地台账（SQLite，
   保留 ≥5 交易日）。
-* **幂等**：`buy`/`sell`/`cancel` 传 coid 后，同 id 重复提交**绝不产生第二次提交**，
-  返回首次记录的回执；首次结果尚未落定时返回 `submitted_unconfirmed`——
-  这是合法态，不是 bug（最危险那一刻台账自己也不知道结果）。
+* **必填、格式与责任边界**：`buy`/`sell`/`cancel`/`confirm_external_cancel` 的 coid 必须为
+  `gl-<小写 UUID v7>`，例如 `gl-0198f6a1-0001-7000-8000-000000000001`。UUID v7
+  含毫秒时间戳和随机位；调用方必须在创建业务请求时生成并持久保存它，网络重发、
+  `query_order` 查询同一交易动作时原样复用。交易端只验证格式和台账幂等，不生成、
+  不改写，也不能替调用方判断两个未持久化的请求是否属于同一笔业务订单。
+* **幂等**：同 id 重复提交**绝不产生第二次提交**，返回首次记录的回执；首次结果
+  尚未落定时返回 `submitted_unconfirmed`——这是合法态，不是 bug（最危险那一刻台账
+  自己也不知道结果）。同 id 不同参数仍会被拒绝。
 * 同 id **不同参数** → `invalid_params` 拒绝执行（调用方 id 复用 bug，不静默）。
 * **台账不可用一律拒单**（`ledger_unavailable`），禁静默降级为无幂等下单。
-* **回显是尽力而为**：`orders_active` / `orders_filled` 按 entrust_no join 回显 coid；
-  回查不到合同编号的单（超时那批）与外部/人工单为 `null`。**对账主键是 entrust_no，
-  coid 是增强关联**。
-* 建议 coid 全局唯一且含账户维度——受控端 `switch_account` 是盲切，对账户身份无感知。
+* **回显是尽力而为**：`orders_active` / `orders_filled` 仅按原买卖单的 entrust_no join
+  回显 coid；撤单动作引用同一编号但不会覆盖原买卖单的回显。回查不到合同编号的单
+  （超时那批）与外部/人工单为 `null`。**对账主键是 entrust_no，coid 是增强关联**。
+* coid 应全局唯一；调用方的持久记录必须把它与目标账户绑定。固定 UUID v7 格式不
+  携带账户文本；受控端启动后不会把任何账户视为已核验。连接完成后会发送一次只读的
+  `account_event`，列出可选账户，供调用方选择；该事件丢失时调用方必须使用
+`list_accounts` 查询。每次连接后的首次 `buy`/`sell`/`cancel`/`confirm_external_cancel` 前必须
+  成功调用 `switch_account(slot)` 明确选择账户，即使目标已经是当前账户也一样。该工具会把
+  槽位对应的下拉列表文本与控件 `0x094C` 当前文本核对；目标已是当前账户时不发送热键，
+  否则才发送 `Alt+N`。成功后才建立本进程基线。此后每笔交易前都会重新读取并比对；读取
+  失败或文本变化时禁止买卖和撤单，不读取订单表、不消费人工撤单令牌，也不向同花顺发送
+  交易输入。
+* `buy`/`sell` 首次或幂等重放返回 `submitted_unconfirmed` 时，受控端会自动执行**一次**
+  只读 `query_order`，把结果放入 `data.auto_query`；顶层仍保持
+  `submitted_unconfirmed`，不会把启发式命中伪装成精确确认，**绝不自动重发下单**。
+* `cancel` 点击确认后会短暂只读轮询 F3 委托表。只有唯一目标行明确显示 `已撤`/`部撤` 才
+  返回成功；目标消失、仍在飞、状态不明、错表或读取失败都返回 `submitted_unconfirmed`，因为
+  F3 中消失也可能是订单已全部成交，不能伪装成撤单成功。其首次或幂等重放返回
+  `submitted_unconfirmed` 时，受控端会用该撤单请求保存的目标 `entrust_no`，自动读取**一次**
+  含终态的内部全量委托表，结果同样放入 `data.auto_query`；它不会调用买卖单的启发式
+  查询，也**绝不自动重发撤单**。只在全量表精确命中且 `cancel_state` 为 `已撤` 或
+  `部成后已撤` 时，才可判定柜台已确认撤单；`已成`、`仍在飞`、`废单`、`未知`都不是撤单成功。
+  表读取失败、零命中或多命中时保守返回 `未知`，不把“查不到”当作“已撤”。
+
+##### 未登记订单撤单二次确认
+
+本地配置 `external_cancel_confirmation` 的默认值是 `two_step`。订单是否“已登记”只以本系统
+本地台账中保存的目标 `entrust_no` 为准，不能用 `order_event.source` 等提示字段替代。
+
+* 已登记订单：`cancel(entrust_no, client_order_id)` 直接走普通撤单路径。
+* 未登记/人工/外部订单：`cancel` 会先从含终态的全量委托表唯一读取目标，再返回
+  `code=confirmation_required`、`error.class=confirmation_required` 和 60 秒一次性的
+  `data.confirmation_token`；此阶段 `submitted=false`，**绝不点击 GUI**。
+* 调用方展示该订单摘要后，必须以**新的** `client_order_id` 调用
+  `confirm_external_cancel(confirmation_token, client_order_id)`；不能复用产生令牌的
+  `cancel` ID。网络重发同一确认仍须复用该确认 ID，令牌本身只能消费一次。
+* 消费令牌后，受控端再次读取全量委托表，并按合同号唯一匹配，逐项比较合同号、证券代码、
+  方向、委托价、委托数量、已成数量及可撤状态。订单已成交、订单变化、零/多行匹配、表读取失败、
+  令牌过期或已使用时均停止，不执行撤单。
+* 令牌只保存在当前进程内，且绝不写入本地台账；进程重启或 WebSocket 连接代次切换会使它失效。
+  调用方用**原 `cancel` 的同一 client_order_id** 再次调用 `cancel`，受控端会重新读表并换发
+  令牌；旧令牌立即失效，整个刷新过程不点击 GUI。令牌的有效期固定为 60 秒。
+* 设置为 `external_cancel_confirmation=direct` 时，任何订单的 `cancel` 都按普通撤单路径
+  直接执行，不创建令牌，也不要求 `confirm_external_cancel`。
+
+无论处于哪种模式，超时、未知结果或自动回查都**绝不自动重发真实撤单**。调用方只能显式地
+使用同一动作的 `client_order_id` 进行幂等重放，或调用 `query_order` 核验。
 
 #### 3.2.4 查单（C5b）
 
-`query_order(client_order_id)` → `state` ∈ 未报/已报/部成/已成/已撤/废单/**未知**，
-并给出 `resolution`：`by_entrust_no`（精确命中）/ `heuristic`（台账无合同编号，按
-代码+数量匹配，**同参重复单存在歧义**）/ `unresolved`（零命中或多命中 → `state=未知`，
-需人工）。`unknown` 态被收窄到「回查确认前」，但**不可能被消灭**。
+买卖 `query_order(client_order_id)` → `state` ∈ 未报/已报/部成/已成/已撤/废单/**未知**，
+并给出 `resolution`：`by_entrust_no`（精确命中）/ `heuristic`（台账无合同编号时，
+活跃委托须代码、方向、数量一致；限价单还须委托价一致；成交表须代码、方向、数量一致；
+**同参重复单仍有歧义**）/ `unresolved`（零命中或多命中 → `state=未知`，需人工）。
+
+对实际执行撤单的 `cancel` 或 `confirm_external_cancel` 的 `client_order_id`，`query_order`
+按该撤单动作保存的目标 `entrust_no` 精确读取含终态的全量委托表，返回原委托的 `state` 与
+专用 `cancel_state`：`已撤`、`部成后已撤`、`已成`、`仍在飞`、`废单` 或 `未知`。这两类
+撤单查询都不使用买卖单的启发式匹配；只有 `resolution=by_entrust_no` 才表示精确关联。
+全量表读取失败或找不到唯一目标则 `resolution=unresolved`、`cancel_state=未知`。`unknown`
+态被收窄到「回查确认前」，但**不可能被消灭**。
+为兼容升级前已写入的台账，`query_order` 可读取历史的非 UUID v7 ID；新建的
+`buy`/`sell`/`cancel` 仍只接受规范 UUID v7。
 
 #### 3.2.5 数值与单位（C6）
 
@@ -276,7 +339,32 @@ Rationale：2026-07-13「报错但静默成交」几乎导致重复下单。
 * 收到 busy 按 `retry_after_secs` 退避，不要立即重试；
 * 下单类务必带 coid，超时后**重发同 id**而不是新建单。
 
-### 3.3. Trader-to-Gateway: `order_event` Push (Unsolicited)
+### 3.3. Trader-to-Gateway: `account_event` Push (Unsolicited)
+
+每次 WebSocket 连接完成后，受控端会**尝试一次**只读读取同花顺账户下拉列表，并发送：
+
+```json
+{
+  "type": "account_event",
+  "event": "available",
+  "accounts": [
+    {"slot": 1, "shortcut": "Alt+1", "text": "券商-王*甲"}
+  ],
+  "current_account_text": "券商 王*甲",
+  "partial": false,
+  "ts": 1782900000.0
+}
+```
+
+`event=unavailable` 表示连接时未能读取列表，会有空 `accounts`、`partial=true` 和可读的
+`message`。此事件不选择账户、不发送热键、不建立交易账户基线，且仅作提示：主动事件在
+断线时可能丢失，调用方必须可通过 `list_accounts` 重新查询。调用方展示列表后，必须调用
+`switch_account(slot)` 明确核验用户选择的账户，哪怕该槽位已经是当前账户。
+
+与 `order_event` 一样，`account_event` 没有 `id`，由网关通用非 reply 路径广播给当前
+控制会话；无需网关改动。它不应被当作可靠状态存储或交易授权依据。
+
+### 3.4. Trader-to-Gateway: `order_event` Push (Unsolicited)
 
 Unlike `reply` (which always answers a preceding `call` and carries its `id`),
 `order_event` is an **unsolicited push** emitted by the trader on its own
@@ -297,9 +385,9 @@ client, and orders placed from the user's **mobile app** on the same account.
   "stock_no": "600000",
   "op": "买入",
   "order_qty": 100,
-  "order_price": "7.580",
+  "order_price": 7.58,
   "filled_qty": 0,
-  "avg_price": "",
+  "avg_price": null,
   "note": "已报",
   "seq": 12,
   "ts": 1782900000.0
@@ -308,11 +396,13 @@ client, and orders placed from the user's **mobile app** on the same account.
 
 - `event`: one of `placed` | `partially_filled` | `filled` | `canceled`.
   `partially_filled` may fire multiple times; `filled` is terminal.
-- All business fields use the **verbatim THS column names** as source:
+- All business fields use the **verbatim THS column names** as source and are
+  normalized before transmission:
   `stock_no`=证券代码, `op`=操作(买入/卖出), `order_qty`=委托数量,
   `order_price`=委托价格, `filled_qty`=成交数量, `avg_price`=成交均价,
-  `note`=备注. `order_price`/`avg_price` are strings and **may be empty**
-  (e.g. market orders, or before any fill).
+  `note`=备注. `order_price`/`avg_price` are `number | null`; `null` means the
+  client did not provide a usable numeric value (for example a market order,
+  or before any fill).
 
 #### Gateway handling
 `order_event` is **not** a `reply` and carries no `id`, so the gateway does
@@ -323,11 +413,10 @@ bound to this connection's `agent_token` (e.g. `guling-mcp-gateway`'s
 required** to relay it.
 
 #### Contract notes (consumers MUST honor)
-- **Account identity is carried by the connection token, not the frame.**
-  One WebSocket connection = one THS account; the frame body intentionally
-  omits any account/portfolio field. Consumers map `agent_token` →
-  (user, portfolio). (An optional `account` echo field MAY be added later for
-  defensive logging only; it must never be used for routing.)
+- **网关路由身份仍由连接 token 决定，而不是券商账户文本。** 一个受控端连接可登录
+  多个同花顺账户；`account_event` 和 `switch_account` 回执中的账户文本只用于让用户
+  选择和让受控端做本地核验，绝不能作为网关路由或跨账户订单归属的依据。消费者应把
+  `agent_token` 映射到用户/受控端，再根据其明确的账户选择维护自己的业务归属。
 - **Delivery is best-effort and lossy.** If no live SSE control session
   exists for the token, if the buffer is full, or during disconnects, events
   are **dropped and never replayed**. Consumers MUST keep a
@@ -382,7 +471,7 @@ When an AI client issues an MCP tool call:
          "content": [
            {
              "type": "text",
-             "text": "{\"code\": 0, \"status\": \"succeed\", ...}"
+            "text": "{\"status\":\"succeed\",\"code\":\"ok\",\"data\":{...},\"error\":null,\"contract_version\":\"2\"}"
            }
          ],
          "isError": false
@@ -398,14 +487,14 @@ When an AI client issues an MCP tool call:
          "content": [
            {
              "type": "text",
-             "text": "可用资金不足"
+            "text": "{\"status\":\"failed\",\"code\":\"rejected\",\"data\":null,\"error\":{\"class\":\"insufficient_funds\",\"broker_msg\":\"可用资金不足\",\"message\":\"柜台拒绝本次委托\"},\"contract_version\":\"2\"}"
            }
          ],
          "isError": true
        }
      }
      ```
-     *Crucial Rule: Do NOT collapse the standard HTTP or JSON-RPC transport layer with error statuses (-32xxx codes) during tool failures. Tool errors must be mapped as HTTP 200 containing `isError: true` inside standard JSON-RPC results, ensuring diagnostics are clearly read by Cursor/Claude.*
+     *Crucial Rule: Do NOT collapse the standard HTTP or JSON-RPC transport layer with error statuses (-32xxx codes) during tool failures. Tool errors must be mapped as HTTP 200 containing `isError: true` inside standard JSON-RPC results. The `text` field must retain the complete v2 envelope rather than flattening it to a bare error message.*
 
 ---
 

@@ -14,6 +14,20 @@ import asyncio
 from trader import contract, dispatcher
 
 
+COID = "gl-0198f6a1-0001-7000-8000-000000000001"
+
+
+class FakeLedger:
+    def reserve(self, client_order_id, method, params):
+        return "new", None
+
+    def complete(self, client_order_id, receipt, entrust_no=None):
+        pass
+
+    def release(self, client_order_id):
+        pass
+
+
 class FakeBackend:
     """按方法名返回预置 result dict 的假后端。"""
 
@@ -22,6 +36,9 @@ class FakeBackend:
         self.calls = []
         self.win_lock = asyncio.Lock()
         self.agent_entrust_nos: set[str] = set()
+        self.ledger = FakeLedger()
+        self.account_trading_blocked = False
+        self.account_checks = 0
 
     async def _run(self, name, *args):
         self.calls.append((name, args))
@@ -53,6 +70,16 @@ class FakeBackend:
     async def cancel(self, entrust_no):
         return await self._run("cancel", entrust_no)
 
+    async def verify_account_for_trade(self):
+        self.account_checks += 1
+        if self.account_trading_blocked:
+            return contract.fail(
+                contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+                "当前账户身份尚未核验，已禁止买卖和撤单",
+                data={"account_verified": False, "submitted": False},
+            )
+        return contract.ok({"account_verified": True, "account_text": "测试账户"})
+
     async def switch_account(self, slot):
         return await self._run("switch_account", slot)
 
@@ -82,7 +109,9 @@ def test_success_is_single_layer_with_id_echoed():
 def test_submitted_unconfirmed_is_not_unknown_error():
     """已提交未确认必须给出明确文案 + 透传信封，绝不能塌成'未知错误'。"""
     frame = {"type": "call", "id": "id2", "method": "sell",
-             "params": {"stock_no": "300459", "amount": 100}}
+             "params": {"stock_no": "300459", "amount": 100,
+                        "order_type": "FIVE_LEVEL_IOC",
+                        "client_order_id": COID}}
     result = contract.submitted_unconfirmed("已提交但未能在委托表中匹配到对应订单",
                                             data={"submitted": True})
     reply, _ = _call(frame, result)
@@ -121,7 +150,9 @@ def test_non_contract_shape_is_rejected_loudly():
 def test_broker_rejection_carries_class_and_raw_text():
     """柜台拒单：class 可机器分流，broker_msg 保留原文（C2 两层分类）。"""
     frame = {"type": "call", "id": "id5", "method": "buy",
-             "params": {"stock_no": "600000", "amount": 100}}
+             "params": {"stock_no": "600000", "amount": 100,
+                        "order_type": "LIMIT", "price": 8.1,
+                        "client_order_id": COID}}
     reply, _ = _call(frame, contract.broker_rejected("可用资金不足，无法委托"))
     assert reply["ok"] is False
     assert reply["result"]["error"]["class"] == "insufficient_funds"
@@ -138,7 +169,9 @@ def test_method_not_whitelisted():
 
 def test_backend_exception_is_caught():
     frame = {"type": "call", "id": "id7", "method": "sell",
-             "params": {"stock_no": "300459", "amount": 100}}
+             "params": {"stock_no": "300459", "amount": 100,
+                        "order_type": "LIMIT", "price": 8.1,
+                        "client_order_id": COID}}
     reply, _ = _call(frame, RuntimeError("窗口未找到"))
     assert reply["ok"] is False
     assert "窗口未找到" in reply["error"]
@@ -164,13 +197,15 @@ def test_settlement_default_date_range():
 
 
 def test_buy_params_forwarded_to_backend():
-    """确认 price 透传——市价单(price 缺省→None)不会被 dispatcher 篡改。"""
+    """显式 IOC 请求不带 price，后端仍收到 None 进入市价路径。"""
     frame = {"type": "call", "id": "id8", "method": "sell",
-             "params": {"stock_no": "300459", "amount": 100}}
+             "params": {"stock_no": "300459", "amount": 100,
+                        "order_type": "FIVE_LEVEL_IOC",
+                        "client_order_id": COID}}
     _, backend = _call(frame, {"code": 0})
     name, args = backend.calls[-1]
     assert name == "sell"
-    assert args == ("300459", 100, None)   # price 缺省 → None（市价语义）
+    assert args == ("300459", 100, None)   # 显式 IOC → None（市价路径）
 
 
 def test_tools_list_returns_correct_schema():
@@ -211,6 +246,30 @@ def test_switch_account_forwards_slot_and_single_layer_reply():
     assert reply["id"] == "sw-1"
     assert reply["result"]["data"]["slot"] == 2
     assert backend.calls == [("switch_account", (2,))]
+
+
+def test_buy_sell_blocked_after_account_verification_failure():
+    """账户切换核验失败后，dispatcher 不得把买卖请求送入后端。"""
+    backend = FakeBackend(contract.ok({"submitted": True}))
+    backend.account_trading_blocked = True
+    frame = {
+        "type": "call", "id": "blocked-1", "method": "buy",
+        "params": {
+            "stock_no": "600000", "amount": 100,
+            "order_type": "LIMIT", "price": 8.1,
+            "client_order_id": COID,
+        },
+    }
+
+    reply = asyncio.run(dispatcher.handle_call(frame, backend))
+
+    assert reply["ok"] is False
+    assert reply["result"]["code"] == "read_failed"
+    assert reply["result"]["data"] == {
+        "account_verified": False, "submitted": False,
+    }
+    assert backend.calls == []
+    assert backend.account_checks == 1
 
 
 def test_fallback_schema_matches_file_schema():

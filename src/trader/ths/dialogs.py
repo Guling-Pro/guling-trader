@@ -1,21 +1,18 @@
 """交易弹窗看门人（DialogSentry）：结构化发现-处置-记录 xiadan 弹窗。
 
 设计（docs/superpowers/specs/2026-07-13-ths-dialog-handling-design.md）：
-**不读正文猜语义**。决策只依赖两个结构信号：
+**先按既有动作处置，再完整记录未知弹窗**。决策只依赖两个结构信号：
 
-1. 弹窗含 ``Edit`` 输入框 → 验证码/身份验证类，必须输入内容才能通过 →
-   交给 backend.input_ocr()，绝不盲点按钮；
-2. 否则按按钮标签的肯定优先级（是 > 确定 > 确认 > 同意 > 唯一按钮）
-   ``PostMessage(BM_CLICK)`` 点掉；找不到可点按钮时退而给弹窗发 Enter，
-   再不行 ``WM_CLOSE``。
+1. 已知撤单确认框优先按肯定按钮确认，即使其中含有改价 ``Edit`` 输入框；
+2. 其他弹窗含 ``Edit`` 输入框 → 交给既有 ``backend.input_ocr()``；
+3. 否则按按钮标签的肯定优先级（是 > 确定 > 确认 > 同意 > 唯一按钮）
+   ``PostMessage(BM_CLICK)``；没有可点按钮时使用 Enter/WM_CLOSE 兜底。
 
-安全性不靠读懂弹窗，靠两条：处置窗口仅限我们自己发起的动作前后；
-以及点完后照旧走成交表/委托表核实回执。每个被处置的弹窗的
-标题 + 全文 + 所采取动作都记录进返回值（进而进回执与日志）——
-调用方永远知道流程中间发生过什么。
+未知弹窗仍按上述既有动作继续处理，但会在日志、截图和回执的
+``unknown_dialogs`` 中反馈标题、正文、判定原因和实际动作。
 
 本模块 Windows-only 部分全部惰性引用 win32 模块；纯决策函数
-（choose_button / extract_entrust_no）无平台依赖，可在任意平台单测。
+（classify_dialog / choose_button / extract_entrust_no）无平台依赖，可在任意平台单测。
 """
 
 from __future__ import annotations
@@ -46,12 +43,16 @@ def normalize_button_label(raw: str) -> str:
     return s.replace("&", "").replace(" ", "").strip()
 
 
+_DIALOG_NEGATIVE_LABELS = ("否", "取消", "不同意", "拒绝")
+_KNOWN_CAPTCHA_MARKERS = ("检测到您正在拷贝数据",)
+_CANCEL_CONFIRMATION_MARKERS = ("撤单确认", "是否确定以上撤销")
+
+
 def choose_button(labels: list[str]) -> Optional[str]:
     """从归一化按钮标签中选出要点击的肯定项。
 
     优先级 DIALOG_AFFIRM_LABELS（是 > 确定 > 确认 > 同意）；都没有但
-    只有一个按钮时点它（信息框的唯一按钮无论叫什么都等价于关闭）；
-    多个按钮且无肯定项 → None（交给 Enter/WM_CLOSE 兜底）。
+    只有一个按钮时点它（信息框的唯一按钮无论叫什么都等价于关闭）。
     """
     for want in DIALOG_AFFIRM_LABELS:
         if want in labels:
@@ -59,6 +60,61 @@ def choose_button(labels: list[str]) -> Optional[str]:
     if len(labels) == 1:
         return labels[0]
     return None
+
+
+def is_known_captcha(dlg: "DialogFingerprint") -> bool:
+    """Return whether ``dlg`` is the one captcha flow ``input_ocr`` supports.
+
+    ``has_edit`` alone is deliberately insufficient: it also describes OTP,
+    trading-password, identity-verification, and other sensitive dialogs.
+    The marker is the exact static text used by ``WinThsBackend.get_ocr_hwnd``;
+    until more real-client evidence exists, no looser heuristic is allowed.
+    """
+    if not dlg.has_edit:
+        return False
+    haystack = "\n".join((dlg.title or "", dlg.text or ""))
+    return any(marker in haystack for marker in _KNOWN_CAPTCHA_MARKERS)
+
+
+def is_known_confirmation(dlg: "DialogFingerprint") -> bool:
+    """Return whether the button structure is an observed confirmation shape.
+
+    A lone ``确定`` (or any other lone button) is not enough evidence: it may
+    be a rejection, warning, password prompt, or an unrelated application
+    dialog.  Requiring both a whitelisted affirmative and negative control
+    preserves the observed ``是/否`` and ``确定/取消`` confirmation flows.
+    """
+    labels = set(dlg.buttons)
+    affirmative = any(label in labels for label in DIALOG_AFFIRM_LABELS)
+    negative = any(label in labels for label in _DIALOG_NEGATIVE_LABELS)
+    return affirmative and negative
+
+
+def is_known_cancel_confirmation(dlg: "DialogFingerprint") -> bool:
+    """Return whether this is the observed THS cancellation confirmation.
+
+    The real dialog includes an optional "cancel and resubmit at a new price"
+    area, so it has an ``Edit`` control even for an ordinary cancellation.
+    Recognise it from both the fixed title/body markers before applying the
+    generic Edit-to-OCR rule.
+    """
+    haystack = "\n".join((dlg.title or "", dlg.text or ""))
+    return all(marker in haystack for marker in _CANCEL_CONFIRMATION_MARKERS)
+
+
+def classify_dialog(dlg: "DialogFingerprint") -> str:
+    """Pure safety decision used by :meth:`DialogSentry.dismiss`.
+
+    Results are used to label feedback; unlike a fail-closed policy, an
+    ``unknown`` result does not prevent the legacy handling action.
+    """
+    if is_known_cancel_confirmation(dlg):
+        return "known_cancel_confirmation"
+    if dlg.has_edit:
+        return "known_captcha" if is_known_captcha(dlg) else "unknown_edit"
+    if is_known_confirmation(dlg):
+        return "known_confirmation"
+    return "unknown"
 
 
 def extract_entrust_no(text: str) -> Optional[str]:
@@ -84,11 +140,16 @@ class PumpResult:
 
     dialogs: list[dict] = field(default_factory=list)  # {title, text, action}
     entrust_no: Optional[str] = None
+    status: str = "ok"
+    unknown_dialogs: list[dict] = field(default_factory=list)
 
     def attach_to(self, receipt: dict) -> dict:
         """把弹窗存证挂到回执上（无弹窗则不加字段，保持回执干净）。"""
         if self.dialogs:
             receipt["dialogs"] = self.dialogs
+        if self.unknown_dialogs:
+            receipt["unknown_dialogs"] = self.unknown_dialogs
+            receipt["unknown_dialog"] = True
         return receipt
 
     @property
@@ -164,31 +225,40 @@ class DialogSentry:
     def dismiss(self, dlg: DialogFingerprint) -> str:
         """按结构规则处置一个弹窗，返回所采取的动作（进存证）。
 
-        原则（2026-07-13 用户定）：任何弹窗都以**肯定**方式快速消除、回到既定
-        轨道，不耦合弹窗内容。肯定优先级：点「是/确定」按钮（=精确版回车，
-        不依赖焦点与默认按钮设定）→ 向弹窗投递回车（真机验证对新版自绘提示框
-        有效）→ 两次回车仍在才 WM_CLOSE 兜底。**禁止 ESC**——在下单/撤单
-        确认框上 ESC 语义是「否/取消」。
+        继续沿用原有输入、点击、Enter/WM_CLOSE 处置动作。未知判定由
+        ``pump`` 额外记录并反馈，不在这里改变动作结果。
         """
+        if is_known_cancel_confirmation(dlg):
+            # A cancellation confirmation can contain an optional repricing
+            # Edit. It is not a captcha and must never be sent to OCR.
+            for label in DIALOG_AFFIRM_LABELS:
+                button = dlg.buttons.get(label)
+                if button:
+                    win32api.PostMessage(button, win32con.BM_CLICK, 0, 0)
+                    return f"click:{label}"
+            logger.warning(
+                "cancel confirmation has no recognizable affirmative button; "
+                "leaving it pending title=%r text=%r",
+                dlg.title, dlg.text[:200],
+            )
+            return "pending:cancel_confirmation_no_affirmative"
         if dlg.has_edit:
-            # 验证码/身份验证：必须输入内容才能通过，回车关不掉 →
-            # 交给既有 OCR 流程（内部自带重试）。
+            # 验证码/身份验证：沿用原逻辑交给 OCR；未知类型会在 pump 回执中标记。
             self.backend.input_ocr()
             return "input_ocr"
         label = choose_button(list(dlg.buttons))
         if label:
             win32api.PostMessage(dlg.buttons[label], win32con.BM_CLICK, 0, 0)
             return f"click:{label}"
-        # 无可用按钮标签（自绘弹窗）：回车 = 默认按钮（肯定）。投递给弹窗
-        # 本身而非全局按键——不依赖弹窗是否前台，也绝不会敲进别的窗口。
+        # 无可用按钮标签：沿用原逻辑向弹窗本身投递 Enter，再 WM_CLOSE 兜底。
         for attempt in (1, 2):
             win32api.PostMessage(dlg.hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
             win32api.PostMessage(dlg.hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
             time.sleep(0.2)
             if not (_safe_is_window(dlg.hwnd) and win32gui.IsWindowVisible(dlg.hwnd)):
                 return "enter" if attempt == 1 else "enter*2"
-        # 连回车都消不掉的弹窗几乎不可能是确认框 → 关窗兜底（≈点X），大声留痕。
-        logger.warning("dialog ignores Enter, WM_CLOSE fallback title=%r", dlg.title)
+        logger.warning("unknown dialog ignores Enter, WM_CLOSE fallback title=%r text=%r",
+                       dlg.title, dlg.text[:200])
         win32api.PostMessage(dlg.hwnd, win32con.WM_CLOSE, 0, 0)
         return "enter*2+wm_close"
 
@@ -223,22 +293,39 @@ class DialogSentry:
                 if time.time() - last < 0.5:
                     continue  # 刚点过，给它时间消失
                 self._snapshot(dlg)
+                decision = classify_dialog(dlg)
                 action = self.dismiss(dlg)
                 handled[dlg.hwnd] = time.time()
                 logger.info("dialog handled title=%r action=%s text=%r",
                             dlg.title, action, dlg.text[:200])
-                result.dialogs.append(
-                    {"title": dlg.title, "text": dlg.text, "action": action})
+                record = {"title": dlg.title, "text": dlg.text, "action": action}
+                if decision not in {
+                    "known_captcha", "known_confirmation", "known_cancel_confirmation",
+                }:
+                    record["unknown"] = True
+                    record["reason"] = decision
+                    result.unknown_dialogs.append(dict(record))
+                    logger.warning(
+                        "unknown dialog auto-handled title=%r reason=%s action=%s text=%r",
+                        dlg.title, decision, action, dlg.text[:200],
+                    )
+                result.dialogs.append(record)
                 if not result.entrust_no:
                     result.entrust_no = extract_entrust_no(dlg.text)
+                if action.startswith("pending:"):
+                    # A recognised cancellation prompt without a safe button
+                    # must not be retried, Entered, closed, or reported as a
+                    # completed cancellation.
+                    result.status = "pending"
+                    return result
             time.sleep(0.1)
         return result
 
     def cleanup(self) -> PumpResult:
-        """degraded 自愈：清掉残留弹窗（同一套「肯定+存证」规则）。
+        """degraded 自愈：检查并按既有规则处理残留弹窗，同时保留未知反馈。
 
         与 pump 的区别只有预算更短——此时上一笔已按 unknown 上报，
-        调用方被要求核单，无论弹窗被肯定还是关闭，真相都以核单为准。
+        调用方被要求核单；本轮仍记录每个未知弹窗及实际动作，真相都以核单为准。
         """
         return self.pump(budget=2.0, settle=0.2)
 

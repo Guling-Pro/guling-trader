@@ -14,8 +14,8 @@ def _backend(monkeypatch, pre_result):
     calls = []
     monkeypatch.setattr(b, "switch_to_normal", lambda: None)
     monkeypatch.setattr(b, "get_filled_orders", lambda: pre_result)
-    monkeypatch.setattr(b, "_select_tree_child",
-                        lambda parent, child: calls.append("navigate") or True)
+    monkeypatch.setattr(b, "_select_market_tree_path",
+                        lambda path, **kwargs: calls.append(("navigate", path)) or True)
     monkeypatch.setattr(w, "_activate_window", lambda hwnd: None)
     monkeypatch.setattr(w, "sleep_time", 0)
     return b, calls
@@ -42,3 +42,98 @@ def test_wrong_table_baseline_also_aborts(monkeypatch):
     r = b._submit_market_trade("卖出", "300458", 500)
     assert r["status"] == "failed"
     assert calls == []
+
+
+def test_empty_filled_table_is_a_valid_market_order_baseline(monkeypatch):
+    """成功读取到空成交表就是合法基线，不能误判为读取失败。"""
+    from trader import contract
+    b, calls = _backend(monkeypatch, contract.ok([]))
+    monkeypatch.setattr(
+        b, "_select_market_tree_path",
+        lambda path, **kwargs: calls.append(("navigate", path)) or False,
+    )
+
+    r = b._submit_market_trade("买入", "300458", 500)
+
+    assert r["status"] == "failed"
+    assert "未能导航到市价委托面板" in r["error"]["message"]
+    assert calls == [("navigate", "买入")], "空成交表必须通过基线校验，继续进入下单面板"
+
+
+def test_verified_no_header_empty_active_table_is_valid_limit_baseline(monkeypatch):
+    """同花顺空委托表不复制表头时，已通过验证码核验的空结果可作空基线。"""
+    from trader import contract
+
+    b = WinThsBackend()
+    monkeypatch.setattr(b, "get_active_orders_all", lambda: contract.ok([]))
+    b._last_grid_verified_empty.add("active_orders")
+
+    baseline, error = b._read_limit_order_baseline()
+
+    assert error is None
+    assert baseline == set()
+
+
+def test_unverified_no_header_active_table_still_aborts_limit_baseline(monkeypatch):
+    """普通读取失败不能借空表语义绕过限价单的归属保护。"""
+    from trader import contract
+
+    b = WinThsBackend()
+    monkeypatch.setattr(b, "get_active_orders_all", lambda: contract.ok([]))
+
+    baseline, error = b._read_limit_order_baseline()
+
+    assert baseline is None
+    assert error["status"] == "failed"
+    assert error["code"] == "table_mismatch"
+
+
+def test_limit_baseline_accepts_real_broker_buy_sell_columns(monkeypatch):
+    """真机“买卖/委托状态/合同编号”表头可安全组成限价单归属基线。"""
+    from trader import contract
+
+    b = WinThsBackend()
+    monkeypatch.setattr(
+        b, "get_active_orders_all",
+        lambda: contract.ok([{"entrust_no": "A-1"}]),
+    )
+    b._last_grid_columns["active_orders"] = (
+        "委托时间", "证券代码", "证券名称", "买卖", "委托状态",
+        "委托数量", "成交数量", "委托价格", "成交价格", "已撤数量",
+        "合同编号", "交易市场",
+    )
+
+    baseline, error = b._read_limit_order_baseline()
+
+    assert error is None
+    assert baseline == {"A-1"}
+
+
+def test_market_sell_uses_compatible_market_entry(monkeypatch):
+    """卖出只能从精确市价路径进入，不得落到普通卖出 F2。"""
+    from trader import contract
+    b, calls = _backend(monkeypatch, contract.ok([]))
+    monkeypatch.setattr(
+        b, "_select_market_tree_path",
+        lambda path, **kwargs: calls.append(("navigate", path)) or False,
+    )
+
+    r = b._submit_market_trade("卖出", "300458", 500)
+
+    assert r["status"] == "failed"
+    assert calls == [("navigate", "卖出")]
+
+
+def test_market_navigation_falls_back_to_market_parent_child_path(monkeypatch):
+    b = WinThsBackend()
+    attempted = []
+    monkeypatch.setattr(
+        b, "_select_tree_path",
+        lambda path, **kwargs: attempted.append((path, kwargs)) or path == ("市价委托", "买入"),
+    )
+
+    assert b._select_market_tree_path("买入") is True
+    assert attempted == [
+        (("市价买入",), {"require_window_safety": True}),
+        (("市价委托", "买入"), {"require_window_safety": True}),
+    ]

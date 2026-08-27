@@ -9,7 +9,7 @@ Win32 层全部打桩，可跨平台跑。
 import pytest
 
 from trader.ths import win as w
-from trader.ths.win import WinThsBackend
+from trader.ths.win import WinThsBackend, _VERIFIED_EMPTY_GRID
 
 POSITION_TABLE = (
     "操作\t证券代码\t证券名称\t股票余额\t可用余额\t冻结数量\t参考成本价\t市价\t\r\n"
@@ -26,6 +26,18 @@ FILLED_TABLE = (
 EMPTY_ACTIVE_TABLE = (  # 无挂单时 THS 照样拷出表头 + 空占位行
     "证券代码\t操作\t委托数量\t委托价格\t成交数量\t成交均价\t合同编号\t备注\t\r\n"
     "\t\t\t\t\t\t\t\t\r\n"
+)
+EMPTY_ACTIVE_TABLE_WITH_DISPLAY_ROW = (
+    # 实机皮肤可能在空表中残留委托时间、成交价格等展示值；核心订单字段全空/零。
+    "委托时间\t证券代码\t证券名称\t买卖\t委托状态\t委托数量\t成交数量\t委托价格\t"
+    "成交价格\t已撤数量\t合同编号\t交易市场\t\r\n"
+    "11:26:48\t\t\t\t\t0.00\t0.00\t0.0000\t0.0000\t0\t\t\t\r\n"
+    "\t\t\t\t\t0.00\t0.00\t0.0000\t0.0000\t0\t\t\t\r\n"
+)
+ACTIVE_TABLE_MISSING_CONTRACT = (
+    "委托时间\t证券代码\t证券名称\t买卖\t委托状态\t委托数量\t成交数量\t委托价格\t"
+    "成交价格\t已撤数量\t合同编号\t交易市场\t\r\n"
+    "11:26:48\t518800\t示例基金\t买入\t已报\t100\t0\t5.000\t0\t0\t\t沪A\t\r\n"
 )
 
 
@@ -67,6 +79,54 @@ def test_empty_table_is_still_success(monkeypatch):
     assert r["data"] == []
 
 
+def test_empty_order_display_row_is_not_mistaken_for_missing_contract(monkeypatch):
+    """空委托表即使保留时间展示行，限价单基线也应安全视为无历史订单。"""
+    b = _backend(monkeypatch, [EMPTY_ACTIVE_TABLE_WITH_DISPLAY_ROW])
+
+    baseline, error = b._read_limit_order_baseline()
+
+    assert error is None
+    assert baseline == set()
+    assert b._last_grid_columns["active_orders"] == (
+        "委托时间", "证券代码", "证券名称", "买卖", "委托状态", "委托数量",
+        "成交数量", "委托价格", "成交价格", "已撤数量", "合同编号", "交易市场",
+    )
+
+
+def test_limit_baseline_error_logs_clipboard_and_normalized_rows(monkeypatch, caplog):
+    """合同号异常时，trader.log 必须能还原本次复制原文与最终订单行。"""
+    b = _backend(monkeypatch, [ACTIVE_TABLE_MISSING_CONTRACT])
+
+    baseline, error = b._read_limit_order_baseline()
+
+    assert baseline is None
+    assert error["code"] == "table_mismatch"
+    rendered = caplog.text
+    assert "[LIMIT_BASELINE_DEBUG]" in rendered
+    assert "clipboard_text" in rendered
+    assert "normalized_rows" in rendered
+    assert "missing_contract_row_indexes" in rendered
+    assert "518800" in rendered
+
+
+def test_no_header_empty_table_is_success_only_with_verified_marker(monkeypatch):
+    """验证码已处理、空表却没输出表头时，才能明确返回无挂单。"""
+    b = _backend(monkeypatch, [_VERIFIED_EMPTY_GRID])
+    r = b.get_active_orders()
+    assert r["status"] == "succeed"
+    assert r["data"] == []
+    assert "active_orders" in b._last_grid_verified_empty
+    assert b._last_grid_columns.get("active_orders") is None
+
+
+def test_plain_clipboard_failure_is_not_empty_table(monkeypatch):
+    """普通 None 没有经过验证码闭环，必须保持读取失败。"""
+    b = _backend(monkeypatch, [None] * WinThsBackend._GRID_ATTEMPTS)
+    r = b.get_active_orders()
+    assert r["status"] == "failed"
+    assert r["code"] == "read_failed"
+
+
 @pytest.mark.parametrize("method,wrong", [
     ("get_position", FILLED_TABLE),
     ("get_active_orders", FILLED_TABLE),   # 最险：错表会被读成「无挂单」
@@ -89,6 +149,17 @@ def test_retry_recovers_when_page_finally_switches(monkeypatch):
     r = b.get_active_orders()
     assert r["status"] == "succeed"
     assert r["data"][0]["entrust_no"] == "123456"
+
+
+def test_active_orders_uses_f1_f8_hotkeys(monkeypatch):
+    b = _backend(monkeypatch, [ACTIVE_TABLE])
+    keys = []
+    monkeypatch.setattr(w, "hot_key", lambda value: keys.append(value))
+
+    r = b.get_active_orders()
+
+    assert r["status"] == "succeed"
+    assert keys == [["F1"], ["F8"]]
 
 
 def test_clipboard_failure_keeps_old_message(monkeypatch):

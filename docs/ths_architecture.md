@@ -36,13 +36,13 @@ xiadan.exe 顶层窗口「网上股票交易系统5.0[ - 券商后缀]」   ← 
 ## 2. 左侧树菜单布局（SysTreeView32）
 
 ```
-买入[F1] · 卖出[F2] · 撤单[F3]
+买入[F1] · 卖出[F2] · 市价买入 · 市价卖出 · 对买对卖 · 撤单[F3]
 自选股 └ 行情
 条件单 └ 条件单监控/股价条件/止盈止损/涨停买入/涨跌幅条件/反弹买入/回落卖出/通用回购
 新股申购 └ 新股申购/新股批量申购/新股配号/新股中签/新股申购额度查询
 北交所交易 └ 北交所新股发行 └ 公开发行询价/申购/批量.../发行询价委托查询/...
-双向委托 · 市价委托(└买入/卖出)
-查询[F4] └ 资金股票·当日委托·当日成交·历史委托·历史成交·历史持仓·资金明细·对帐单·交割单·新股申购额度查询·账户分析
+市价买入 · 市价卖出
+查询[F4] └ 资金股份·当日委托·当日委托汇总·当日成交·当日成交汇总·资金明细·资金流水·历史委托·历史成交·历史持仓·对账单·交割单·...
 通用回购 · 新三板交易 · 银证转帐 · 场内基金 · ETF业务 · 修改密码 · 多银行存管
 批量下单 · 其它交易 · 基金盘后业务 · 隔日证券预委托 · 盘后定价委托 · 修改联系信息 · 风险提示 · ...
 ```
@@ -71,8 +71,11 @@ xiadan 是 32 位，`TVITEMW` 的 `hItem/pszText/lParam` 是 4 字节；64 位 P
 ## 5. 数据读取：剪贴板毫秒级中转 + 内存 state
 
 `read_table_text(hwnd)`：清空剪贴板 → 取 `GetClipboardSequenceNumber` 基线 → `Ctrl+C` →
-**确认序列号变化（本次拷贝真落定）** → 读文本 → **立刻清空**。序列号没变 = 拷贝没落定
-（窗口没焦点/被弹窗挡），返回 `None` 让调用方重试，**绝不返回上一次遗留的陈旧表格**。
+**确认序列号变化（本次拷贝真落定）** → 读文本 → **立刻清空**。序列号没变通常表示拷贝没
+落定（窗口没焦点/被弹窗挡），返回 `None` 让调用方重试，**绝不返回上一次遗留的陈旧表格**。
+唯一例外是：已出现并由项目处理完“检测到您正在拷贝数据”验证码、验证码消失后剪贴板仍未
+写入内容。当前 xiadan 的空 `CVirtualGridCtrl` 在该情形连表头也不输出，项目将其标记为
+已核验空表并返回 `data: []`；未经过该验证码闭环的无输出仍是读取失败，绝不冒充空表。
 
 各查询结果落 `ThsState`（线程安全内存态，`state.get(key, max_age=)` 读 last-known）。
 剪贴板里几乎不留数据，不受并发/同步干扰。
@@ -125,13 +128,14 @@ xiadan 是 32 位，`TVITEMW` 的 `hItem/pszText/lParam` 是 4 字节；64 位 P
 → 与上次 diff → 有变化经 WS 推 `watchlist_event`（含 `added`/`codes`/`partial`）。仿 `order_watch`。
 配置：`enable_watchlist_watch` / `watchlist_sync_hours`。
 
-## 7.6 市价委托路径（`buy`/`sell` 不传 price）
+## 7.6 市价委托路径（`buy`/`sell` 显式 `order_type`）
 
-`buy`/`sell` 有两条路径，在 `_do_buy`/`_do_sell` 内按 `price` 分派：
+对外工具必须显式传 `order_type`，dispatcher 校验后才进入后端；不会再按
+`price` 是否缺失猜测订单意图。后端仍以归一化后的 `price` 分派两条路径：
 
-- **传 `price`** → `_submit_trade("F1"/"F2", …)`：**限价挂单**（原逻辑），未成交留 `orders_active`，
-  由 agent 用 `cancel` 管理。
-- **不传 `price`（`None`）** → `_submit_market_trade(op, code, amount)`：走左树 **市价委托 └ 买入/卖出**
+- **`order_type=LIMIT` + 正数 `price`** → `_submit_trade("F1"/"F2", …)`：**限价挂单**（原逻辑），
+  未成交留 `orders_active`，由 agent 用 `cancel` 管理。
+- **`order_type=FIVE_LEVEL_IOC`，且不传 `price`** → `_submit_market_trade(op, code, amount)`：走左树 **市价委托 └ 买入/卖出**
   面板，**委托策略固定「五档即成剩撤」**——扫对手方最优五档立即成交、剩余自动撤销、**无残留挂单**。
 
 **为什么是五档即成剩撤**：市价 5 个策略里唯一同时满足"立即成交 + 剩余自动撤 + 沪深北全市场通用"。
@@ -147,10 +151,11 @@ xiadan 是 32 位，`TVITEMW` 的 `hItem/pszText/lParam` 是 4 字节；64 位 P
 | 提交 | Button | `0x3EE` |
 | 委托策略 | ComboBox | `0x605`（标准 `ComboBox`）|
 
-**导航**：市价买入/卖出**无 F 快捷键**，且子节点文字"买入"/"卖出"与顶层"买入[F1]"前缀相同 →
-用 `_select_tree_child("市价委托", "买入"/"卖出")`：**先定位父节点、再在其直接子节点里整串精确匹配**
-（深度优先的 `_select_tree_node_by_text` 会先撞顶层，不能用）。跨进程 TreeView 读写/位数/DPI
-点击与 `_select_tree_node_by_text` 同构。
+**导航**：已观察到两种真实菜单结构：顶层 `市价买入` / `市价卖出`，或
+`市价委托 └ 买入/卖出`。`_select_market_tree_path` 依次精确尝试两种完整路径，绝不在根层
+搜索裸 `买入` / `卖出`，因此不会撞到普通 `买入[F1]` / `卖出[F2]`。跨进程 TreeView
+读写、位数处理和 DPI 点击与 `_select_tree_node_by_text` 同构；券商或版本变更后须以
+`tools/ths_diag.py` 的真机导出为准。
 
 **委托策略设置**：买卖下拉不同 → 用**键盘位置数字**切换（`_set_market_strategy`：`SetFocus` +
 `AttachThreadInput` + `WM_CHAR`，`CB_GETCURSEL` 校验，未命中回退 `CB_SETCURSEL`）。
@@ -185,6 +190,17 @@ Enter，改为 `pump()`「等待-发现-处置」循环。处置**不耦合弹�
 每个被处置的弹窗：截图存证到 work_dir、标题+全文+动作记入回执 `dialogs`
 字段；全文机会性提取合同编号。安全性靠委托表/成交表回查，不靠读懂弹窗。
 弹窗结构对不上时跑 `python tools/ths_dialog_dump.py`（开着弹窗）核对。
+
+## 7.8 本地完整诊断日志
+
+`guling-trader-data/trader.log` 是完整的**本地业务诊断链路**，而不是 UI 的镜像：
+
+- 所有 `trader.*` 模块的 `DEBUG`、`INFO`、`WARNING`、`ERROR` 都会落盘；第三方库仍维持 `INFO`，避免掩盖交易动作；
+- WebSocket 边界记录脱敏后的接收帧、RPC 开始执行、最终回执、回执本地写入结果，以及主动事件的尝试与本地写入结果；
+- “本地写入成功”不等于网关已收到或业务已确认，断线、跨连接回执丢弃仍会明确记录；
+- `agent_token`、各类 token / authorization、密码、验证码、确认令牌和配对码一律以 `<redacted>` 写入，不能为了日志完整性记录明文。
+
+主窗口中的日志是单独的业务状态队列，最多保留最近 500 条，供操作时浏览；它不是 `trader.log` 的完整副本。
 
 ## 8. 出新版本时怎么排查
 

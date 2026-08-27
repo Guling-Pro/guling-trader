@@ -69,8 +69,17 @@
       }
     },
     {
+      "name": "list_accounts",
+      "description": "只读列出同花顺账户下拉框中的可切换账户。仅点击当前控件快照确认的账户 ComboBox（ID 0x0912）打开下拉框，等待 0.3 秒后读取展开的 ComboLBox（ID 0x03E8）原始列表项文本；过滤“编辑账户”，其余账户按显示顺序对应 Alt+1..Alt+9。不发送 Alt+N、不选择账户，账户名称原样保留（包括 *）；返回 slot、shortcut 和 text。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
       "name": "buy",
-      "description": "下买入委托单。**会真实下单**，慎重调用。不传 price=五档即成剩撤市价单(立即成交、剩余自动撤销、无残留挂单)，回执 status/filled_amount/avg_price 为实际成交；传 price=限价挂单，返回 entrust_no，未成交需自行用 orders_active+cancel 管理。",
+      "description": "下买入委托单。**会真实下单**，慎重调用。必须显式指定 order_type：LIMIT 为限价挂单，FIVE_LEVEL_IOC 为五档即成剩撤（立即成交、剩余自动撤销、无残留挂单）。LIMIT 必须传正数 price；FIVE_LEVEL_IOC 禁止传 price。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -82,25 +91,36 @@
             "type": "integer",
             "description": "买入股数（必须为 100 股的整数倍）"
           },
+          "order_type": {
+            "type": "string",
+            "enum": [
+              "LIMIT",
+              "FIVE_LEVEL_IOC"
+            ],
+            "description": "订单类型。LIMIT=限价挂单（必须传正数 price）；FIVE_LEVEL_IOC=五档即成剩撤（禁止传 price）。"
+          },
           "price": {
             "type": "number",
-            "description": "限价买入价格。不传则走同花顺市价委托(五档即成剩撤)立即成交、剩余自动撤销、无残留挂单；传则限价挂单，需自行 orders_active/cancel 管理。"
+            "description": "LIMIT 必填的正数限价。order_type=FIVE_LEVEL_IOC 时禁止传入。"
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+            "pattern": "^gl-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "description": "客户端订单 ID，**必填幂等键**。格式必须为 gl-<小写 UUID v7>，如 gl-0198f6a1-0001-7000-8000-000000000001；UUID v7 含毫秒时间戳和随机位。调用方必须在创建买卖请求时生成并持久保存该 ID：新买卖用新 ID；网络重发或 query_order 查询同一买卖单必须原样复用。交易端只验证，不生成或改写。同一 ID 重复提交只会执行一次。buy/sell 返回 submitted_unconfirmed 时，交易端会自动执行一次只读 query_order，结果位于 data.auto_query，绝不自动重发。"
           }
         },
         "required": [
           "stock_no",
-          "amount"
+          "amount",
+          "order_type",
+          "client_order_id"
         ],
         "additionalProperties": false
       }
     },
     {
       "name": "sell",
-      "description": "下卖出委托单。**会真实下单**，慎重调用。不传 price=五档即成剩撤市价单(立即成交、剩余自动撤销、无残留挂单)，回执 status/filled_amount/avg_price 为实际成交；传 price=限价挂单，返回 entrust_no，未成交需自行用 orders_active+cancel 管理。",
+      "description": "下卖出委托单。**会真实下单**，慎重调用。必须显式指定 order_type：LIMIT 为限价挂单，FIVE_LEVEL_IOC 为五档即成剩撤（立即成交、剩余自动撤销、无残留挂单）。LIMIT 必须传正数 price；FIVE_LEVEL_IOC 禁止传 price。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -112,25 +132,36 @@
             "type": "integer",
             "description": "卖出股数"
           },
+          "order_type": {
+            "type": "string",
+            "enum": [
+              "LIMIT",
+              "FIVE_LEVEL_IOC"
+            ],
+            "description": "订单类型。LIMIT=限价挂单（必须传正数 price）；FIVE_LEVEL_IOC=五档即成剩撤（禁止传 price）。"
+          },
           "price": {
             "type": "number",
-            "description": "限价卖出价格。不传则走同花顺市价委托(五档即成剩撤)立即成交、剩余自动撤销、无残留挂单；传则限价挂单，需自行 orders_active/cancel 管理。"
+            "description": "LIMIT 必填的正数限价。order_type=FIVE_LEVEL_IOC 时禁止传入。"
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+            "pattern": "^gl-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "description": "客户端订单 ID，**必填幂等键**。格式必须为 gl-<小写 UUID v7>，如 gl-0198f6a1-0001-7000-8000-000000000001；UUID v7 含毫秒时间戳和随机位。调用方必须在创建买卖请求时生成并持久保存该 ID：新买卖用新 ID；网络重发或 query_order 查询同一买卖单必须原样复用。交易端只验证，不生成或改写。同一 ID 重复提交只会执行一次。buy/sell 返回 submitted_unconfirmed 时，交易端会自动执行一次只读 query_order，结果位于 data.auto_query，绝不自动重发。"
           }
         },
         "required": [
           "stock_no",
-          "amount"
+          "amount",
+          "order_type",
+          "client_order_id"
         ],
         "additionalProperties": false
       }
     },
     {
       "name": "cancel",
-      "description": "撤销指定委托编号的未成交订单。",
+      "description": "撤销指定委托编号的未成交订单。点击确认后会短暂只读轮询 F3 委托表；仅明确显示已撤/部撤时返回成功。目标消失、仍在飞、状态不明、错表或读取失败均返回 submitted_unconfirmed，并自动做一次只读全量表核验，绝不再次点击撤单。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -140,18 +171,43 @@
           },
           "client_order_id": {
             "type": "string",
-            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+            "pattern": "^gl-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "description": "撤单请求 ID，**必填幂等键**。格式必须为 gl-<小写 UUID v7>，如 gl-0198f6a1-0001-7000-8000-000000000001；UUID v7 含毫秒时间戳和随机位。调用方必须在创建撤单请求时生成并持久保存该 ID：每个新撤单动作使用新 ID；网络重发同一撤单请求必须原样复用。交易端只验证，不生成或改写。同一 ID 重复提交只会执行一次。cancel 返回 submitted_unconfirmed 时，交易端会按目标 entrust_no 自动读取一次含终态的全量委托表，结果位于 data.auto_query；其中 cancel_state 为已撤/部成后已撤/已成/仍在飞/废单/未知。仅一次只读核验，绝不自动重发。"
+          }
+        },
+      "required": [
+        "entrust_no",
+        "client_order_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "confirm_external_cancel",
+      "description": "确认撤销未登记订单。仅接受此前 cancel 回执给出的短时一次性 confirmation_token；确认前会再次核验合同号及证券代码、方向、委托价、委托数量仍一致且订单仍可撤。必须使用新的 client_order_id，令牌过期、已使用或订单变化时绝不执行撤单。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "confirmation_token": {
+            "type": "string",
+            "description": "此前 cancel 对未登记订单返回的短时一次性确认令牌"
+          },
+          "client_order_id": {
+            "type": "string",
+            "pattern": "^gl-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "description": "本次确认动作的新客户端订单 ID，必填幂等键，格式必须为 gl-<小写 UUID v7>；网络重发同一确认时必须原样复用，不能复用原 cancel 的 ID。"
           }
         },
         "required": [
-          "entrust_no"
+          "confirmation_token",
+          "client_order_id"
         ],
         "additionalProperties": false
       }
     },
     {
       "name": "switch_account",
-      "description": "切换同花顺客户端当前活跃的资金账户（向 xiadan 窗口发送 Alt+N，N=账户在客户端账户下拉列表中的槽位序号）。仅在 xiadan 登录了多个账户时有意义。**盲切**：本工具不核验切换是否成功，受控端对账户身份无感知；切换后所有工具(查询/下单)都作用于新的当前账户。调用方必须紧接着用 balance/position 做指纹核对、确认账户无误后再继续操作。",
+      "description": "明确选择并核验同花顺当前交易账户。连接后会收到只读 account_event（可选账户列表）；也可先调用 list_accounts。传入槽位后，程序先核对该槽位对应的账户文本：若已是当前账户，不发送热键，直接核验并返回资金；否则才发送 Alt+N 并确认当前账户匹配该槽位。每次连接后的首次买卖或撤单前必须成功调用一次本工具；失败时禁止后续买卖和撤单。每笔 buy/sell/cancel/confirm_external_cancel 前都会重新核对该账户文本。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -170,13 +226,13 @@
     },
     {
       "name": "query_order",
-      "description": "按 client_order_id 查单（契约 v2 C5b）。返回 state（未报/已报/部成/已成/已撤/废单/未知）＋首次回执快照＋分辨率 resolution：by_entrust_no=按合同编号精确命中；heuristic=台账无合同编号时按代码/数量匹配，存在同参重复单歧义；unresolved=实表中无法唯一定位，state=未知需人工。与 buy/sell/cancel 的幂等（同 id 重发不重复下单）配对使用。",
+      "description": "按 client_order_id 查单（契约 v2 C5b）。买卖单返回 state（未报/已报/部成/已成/已撤/废单/未知）＋首次回执快照＋分辨率 resolution：by_entrust_no=按合同编号精确命中；heuristic=台账无合同编号时按代码、方向、数量匹配，限价活单还须委托价一致，仍可能有同参重复单歧义；unresolved=实表中无法唯一定位，state=未知需人工。对 cancel 请求 ID，按其目标 entrust_no 精确读取含终态的全量委托表，并额外返回 cancel_state（已撤/部成后已撤/已成/仍在飞/废单/未知）。与 buy/sell/cancel 的幂等（同 id 重发不重复下单）配对使用。",
       "inputSchema": {
         "type": "object",
         "properties": {
           "client_order_id": {
             "type": "string",
-            "description": "下单时传入的 client_order_id"
+            "description": "买卖或撤单时传入的 client_order_id"
           }
         },
         "required": [

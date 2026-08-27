@@ -3,8 +3,9 @@
 沿用本仓库测试约定：同步测试，async 用 asyncio.run 驱动，不依赖 pytest-asyncio。
 """
 from datetime import datetime
+from types import SimpleNamespace
 
-from trader import order_watch
+from trader import order_watch, watchlist_watch
 
 
 def test_in_trading_session_morning_and_afternoon():
@@ -143,6 +144,7 @@ class WatchFakeClient:
 
     async def send_frame(self, frame):
         self.sent.append(frame)
+        return True
 
 
 def test_first_round_builds_baseline_no_emit():
@@ -217,52 +219,153 @@ def test_next_interval_idle_when_empty():
     assert order_watch.next_interval({}, 300, 60) == 300
 
 
-def test_send_frame_failure_does_not_advance_baseline():
-    """Regression: if send_frame raises, baseline should not advance; next round retries."""
+def test_false_send_frame_queues_same_event_and_seq_for_reconnect_retry():
+    """False keeps the observed transition in FIFO; a retry uses its original seq."""
     r0 = _active([_row("1", 100, 0, "已报")])
     r1 = _active([_row("1", 100, 100, "已成", avg=1699.8)])
     backend = WatchFakeBackend([r0, r1])
 
-    # Client that raises on first send_frame call
-    class FailingClient:
+    # Runtime WsClient returns False on send failure.
+    class ReconnectingClient:
         def __init__(self, backend):
             self.backend = backend
             self.sent = []
-            self._call_count = 0
+            self.connected = True
 
         async def send_frame(self, frame):
-            self._call_count += 1
-            if self._call_count == 1:
-                raise RuntimeError("simulated send_frame failure")
             self.sent.append(frame)
+            return self.connected
 
     async def drive():
-        failing_client = FailingClient(backend)
+        client = ReconnectingClient(backend)
 
         # Round 1: establish baseline from r0
-        prev, seq, ok = await order_watch._poll_once(backend, failing_client, None, 0)
+        prev, seq, ok = await order_watch._poll_once(backend, client, None, 0)
         assert ok is True
         assert set(prev) == {"1"}
-        baseline_snapshot = prev
 
-        # Round 2: try to send filled event (r0→r1), but send_frame raises
-        prev_after, seq_after, ok_after = await order_watch._poll_once(
-            backend, failing_client, prev, seq
-        )
+        # Round 2: try to send filled event (r0→r1), but send_frame returns False.
+        client.connected = False
+        prev_after, seq_after, ok_after = await order_watch._poll_once(backend, client, prev, seq)
         assert ok_after is False, "should return False when send fails"
-        assert (
-            prev_after is baseline_snapshot
-        ), "baseline should not advance on send failure"
-        assert len(failing_client.sent) == 0, "no events should be sent on failure"
+        assert prev_after == order_watch.build_snapshot(r1)
+        assert seq_after == 1
+        assert [frame["seq"] for frame in client.sent] == [1]
 
-        # Round 3: same baseline with new working client re-emits the event
-        working_client = WatchFakeClient(backend)
+        # The same WsClient instance survives reconnect; it only replays the
+        # failed frame and never reconstructs/resubmits a trading RPC.
+        client.connected = True
         prev_retry, seq_retry, ok_retry = await order_watch._poll_once(
-            backend, working_client, prev_after, seq_after
+            backend, client, prev_after, seq_after
         )
         assert ok_retry is True, "should succeed on retry"
-        assert len(working_client.sent) == 1, "event should be sent on retry"
-        assert working_client.sent[0]["event"] == "filled"
-        assert working_client.sent[0]["entrust_no"] == "1"
+        assert len(client.sent) == 2
+        assert [frame["seq"] for frame in client.sent] == [1, 1]
+        assert client.sent[-1]["event"] == "filled"
+        assert client.sent[-1]["entrust_no"] == "1"
+        assert seq_retry == 1
 
     asyncio.run(drive())
+
+
+def test_multi_event_failure_replays_only_unsent_frame():
+    r0 = _active([])
+    r1 = _active([
+        _row("1", 100, 0, "已报"),
+        _row("2", 200, 0, "已报", code="000001"),
+    ])
+    backend = WatchFakeBackend([r0, r1])
+
+    class PartiallyFailingClient:
+        def __init__(self, backend):
+            self.backend = backend
+            self.sent = []
+
+        async def send_frame(self, frame):
+            self.sent.append(frame)
+            return len(self.sent) != 2
+
+    async def drive():
+        client = PartiallyFailingClient(backend)
+        prev, seq, ok = await order_watch._poll_once(backend, client, None, 0)
+        assert ok is True
+
+        prev_after, seq_after, ok_after = await order_watch._poll_once(
+            backend, client, prev, seq
+        )
+        assert ok_after is False
+        assert prev_after == order_watch.build_snapshot(r1)
+        assert seq_after == 2
+        assert [frame["seq"] for frame in client.sent] == [1, 2]
+
+        prev_retry, seq_retry, ok_retry = await order_watch._poll_once(
+            backend, client, prev_after, seq_after
+        )
+        assert ok_retry is True
+        assert prev_retry == order_watch.build_snapshot(r1)
+        assert seq_retry == 2
+        assert [frame["seq"] for frame in client.sent] == [1, 2, 2]
+
+    asyncio.run(drive())
+
+
+def test_watchlist_false_send_keeps_baseline_and_retries(monkeypatch):
+    class WatchlistBackend:
+        def __init__(self):
+            self.win_lock = asyncio.Lock()
+            self._results = [
+                {"status": "succeed", "data": {"codes": ["600519"]}},
+                {"status": "succeed", "data": {"codes": ["000001", "600519"]}},
+            ]
+            self._index = 0
+
+        async def watchlist(self):
+            result = self._results[min(self._index, len(self._results) - 1)]
+            self._index += 1
+            return result
+
+    class RetryingClient:
+        def __init__(self, backend):
+            self.backend = backend
+            self.sent = []
+
+        def send_frame(self, frame):
+            self.sent.append(frame)
+            return len(self.sent) > 1
+
+    class ConnectedState:
+        def __init__(self):
+            self._states = iter(("CONNECTED", "CONNECTED", "DISCONNECTED", "CONNECTED"))
+
+        def snapshot(self):
+            return {
+                "connection_state": next(self._states),
+                "enable_ths_plugin": True,
+            }
+
+    sleep_calls = 0
+
+    async def fake_sleep(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 5:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        watchlist_watch.config,
+        "load",
+        lambda: SimpleNamespace(
+            enable_watchlist_watch=True,
+            watchlist_sync_hours="8,12,16,20",
+        ),
+    )
+    monkeypatch.setattr(watchlist_watch.asyncio, "sleep", fake_sleep)
+
+    backend = WatchlistBackend()
+    client = RetryingClient(backend)
+    asyncio.run(watchlist_watch.watchlist_watch_task(ConnectedState(), client))
+
+    assert len(client.sent) == 2
+    assert [frame["seq"] for frame in client.sent] == [1, 1]
+    assert client.sent[0]["codes"] == client.sent[1]["codes"] == ["000001", "600519"]
+    assert backend._index == 2, "replay must not OCR/read THS again"

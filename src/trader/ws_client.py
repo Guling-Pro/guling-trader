@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import ssl
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional, TYPE_CHECKING
@@ -30,6 +31,42 @@ logger = logging.getLogger(__name__)
 
 WS_ENDPOINT = "wss://mcp.guling.pro/api/trader-tunnel"
 WS_ENDPOINT_DEV = "ws://localhost:8000/api/trader-tunnel"
+
+_AUDIT_REDACTED = "<redacted>"
+_AUDIT_SECRET_KEY_PARTS = (
+    "token", "authorization", "password", "passwd", "secret", "captcha",
+    "verification_code", "confirmation_token", "pairing_code", "credential",
+    "api_key", "access_key", "private_key", "otp", "pin",
+)
+
+
+def _redact_for_audit(value: Any, key: str = "") -> Any:
+    """返回可写入本地诊断日志的副本，绝不保留认证或验证码明文。"""
+    normalized_key = str(key).lower().replace("-", "_")
+    if any(part in normalized_key for part in _AUDIT_SECRET_KEY_PARTS):
+        return _AUDIT_REDACTED
+    if isinstance(value, dict):
+        is_pair_pending = value.get("type") == "pair_pending"
+        redacted = {}
+        for child_key, child in value.items():
+            child_key = str(child_key)
+            if is_pair_pending and child_key == "code":
+                redacted[child_key] = _AUDIT_REDACTED
+            else:
+                redacted[child_key] = _redact_for_audit(child, child_key)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_for_audit(child) for child in value]
+    if isinstance(value, tuple):
+        return [_redact_for_audit(child) for child in value]
+    return value
+
+
+def _audit_json(value: Any) -> str:
+    """稳定的单行审计表示，既能检索也不会因未知对象中断业务。"""
+    return json.dumps(
+        _redact_for_audit(value), ensure_ascii=False, sort_keys=True, default=str,
+    )
 
 
 def _normalize_endpoint(value: Optional[str]) -> Optional[str]:
@@ -156,6 +193,12 @@ class WsClient:
         )
         self.state = ConnectionState.UNPAIRED
         self.ws: Optional[Any] = None
+        # 每次成功建立连接递增。主动事件写入期间若连接已经切换，旧连接上的
+        # send 即使返回也不能视为当前会话投递成功，交给看门狗保留原帧重放。
+        self._connection_generation = 0
+        # 每个 WS 连接代次只尝试推送一次账户列表。推送失败不在本地重放：
+        # list_accounts 是可随时调用的权威只读查询，避免断线时反复开关账户下拉框。
+        self._account_event_generation = 0
         self.pending_rpcs: dict[str, PendingRPC] = {}
         self.reconnect_delay = 1.0
         self.max_reconnect_delay = 60.0
@@ -172,6 +215,59 @@ class WsClient:
             self.state = new_state
             if self.on_state_change:
                 self.on_state_change(new_state)
+
+    async def _publish_accounts_after_connected(self) -> None:
+        """连接成功后将可选账户作为只读事件发给上游选择。
+
+        账户列表事件只是连接时的提示，丢失或读取失败时上游仍须调用
+        ``list_accounts``。它不会建立交易账户基线，也不会发送任何切换热键。
+        """
+        generation = self._connection_generation
+        if (self.state != ConnectionState.CONNECTED
+                or self._account_event_generation == generation):
+            return
+        self._account_event_generation = generation
+
+        try:
+            async with self.backend.win_lock:
+                result = await self.backend.list_accounts()
+        except Exception as e:
+            logger.warning("连接后读取账户列表异常：%s", e, exc_info=True)
+            result = None
+
+        if self.state != ConnectionState.CONNECTED or generation != self._connection_generation:
+            return
+
+        data = result.get("data") if isinstance(result, dict) else {}
+        succeeded = isinstance(result, dict) and result.get("status") == "succeed"
+        frame = {
+            "type": "account_event",
+            "event": "available" if succeeded else "unavailable",
+            "accounts": data.get("accounts", []) if isinstance(data, dict) else [],
+            "current_account_text": (
+                data.get("current_account_text") if isinstance(data, dict) else None
+            ),
+            "partial": bool(data.get("partial", True)) if isinstance(data, dict) else True,
+            "ts": time.time(),
+        }
+        if not succeeded and isinstance(result, dict):
+            error = result.get("error")
+            if isinstance(error, dict):
+                frame["message"] = error.get("message")
+        sent = await self.send_frame(frame)
+        if sent:
+            logger.info("连接后账户列表事件已发送 event=%s accounts=%d",
+                        frame["event"], len(frame["accounts"]))
+        else:
+            logger.warning("连接后账户列表事件未写入；上游可调用 list_accounts 重试")
+
+    def _begin_connected_account_selection(self) -> None:
+        """A new control connection must not inherit the prior session's choice."""
+        reset = getattr(self.backend, "require_explicit_account_selection", None)
+        if callable(reset):
+            reset()
+        else:
+            logger.warning("后端不支持连接后账户核验重置；交易请求将由后端自身闸门决定")
 
     async def run(self) -> None:
         """主循环：连接 → 握手 → 消息处理 → 重连"""
@@ -194,41 +290,65 @@ class WsClient:
                     ssl=_SSL_CONTEXT if self.endpoint.startswith("wss://") else None,
                 ) as ws:  # type: ignore
                     self.ws = ws
-                    self.reconnect_delay = 1.0
-                    logger.info("已连接到服务器")
+                    self._connection_generation += 1
+                    try:
+                        # 确认令牌只对生成它的连接代次有效，重连后不能继续授权旧快照。
+                        dispatcher.clear_external_cancel_confirmations()
+                        self.reconnect_delay = 1.0
+                        logger.info("已连接到服务器")
 
-                    # 记录握手前是否已配对——决定握手成功后的状态
-                    was_paired = cfg.has_paired()
-                    result = await handshake.perform_handshake(ws, cfg)
+                        # 记录握手前是否已配对——决定握手成功后的状态
+                        was_paired = cfg.has_paired()
+                        result = await handshake.perform_handshake(ws, cfg)
 
-                    if not result.success:
-                        logger.error("握手失败：%s", result.error)
-                        self._set_state(ConnectionState.UNPAIRED)
-                        if result.should_clear_config:
-                            latest_cfg = config.load()
-                            latest_cfg.agent_token = None
-                            latest_cfg.account_name = None
-                            latest_cfg.paired_at = None
-                            config.save(latest_cfg)
-                        # 握手失败（如网络、服务不可用）退避 5 秒重试
-                        await asyncio.sleep(5)
-                        continue
+                        if not result.success:
+                            logger.error("握手失败：%s", result.error)
+                            self._set_state(ConnectionState.UNPAIRED)
+                            if result.should_clear_config:
+                                latest_cfg = config.load()
+                                latest_cfg.agent_token = None
+                                latest_cfg.account_name = None
+                                latest_cfg.paired_at = None
+                                config.save(latest_cfg)
+                            # 握手失败（如网络、服务不可用）退避 5 秒重试
+                            await asyncio.sleep(5)
+                            continue
 
-                    # pair_init 成功 → 收到 pair_pending，等 bind_ok 才 CONNECTED
-                    # resume 成功 → 收到 welcome，直接 CONNECTED
-                    if was_paired:
-                        self._set_state(ConnectionState.CONNECTED)
-                    else:
-                        self._set_state(ConnectionState.AWAITING_BIND)
-                        # 把 pair_pending 的 code/expires_at 推给上层（main_window）
-                        if result.pair_pending and self.on_pair_pending:
-                            self.on_pair_pending(
-                                result.pair_pending.get("code"),
-                                result.pair_pending.get("expires_at"),
-                            )
-                    logger.info("握手成功，状态：%s", self.state)
+                        # pair_init 成功 → 收到 pair_pending，等 bind_ok 才 CONNECTED
+                        # resume 成功 → 收到 welcome，直接 CONNECTED
+                        if was_paired:
+                            self._begin_connected_account_selection()
+                            self._set_state(ConnectionState.CONNECTED)
+                            await self._publish_accounts_after_connected()
+                        else:
+                            self._set_state(ConnectionState.AWAITING_BIND)
+                            # 把 pair_pending 的 code/expires_at 推给上层（main_window）
+                            if result.pair_pending and self.on_pair_pending:
+                                self.on_pair_pending(
+                                    result.pair_pending.get("code"),
+                                    result.pair_pending.get("expires_at"),
+                                )
+                        logger.info("握手成功，状态：%s", self.state)
 
-                    await self._main_loop(ws)
+                        await self._main_loop(ws)
+                    finally:
+                        # 不能留下已经退出上下文的 socket：否则看门狗会把它误当作可写。
+                        if self.ws is ws:
+                            self.ws = None
+                        if self.state in (
+                            ConnectionState.DIALING,
+                            ConnectionState.AWAITING_BIND,
+                            ConnectionState.CONNECTED,
+                        ):
+                            self._set_state(ConnectionState.DISCONNECTED)
+
+                # 远端正常关闭不会抛异常；仍按退避重连，避免紧循环占满 CPU。
+                if self.state == ConnectionState.DISCONNECTED:
+                    logger.info("WebSocket 已关闭，%d 秒后重连...", self.reconnect_delay)
+                    await asyncio.sleep(self.reconnect_delay)
+                    self.reconnect_delay = min(
+                        self.reconnect_delay * 2, self.max_reconnect_delay
+                    )
 
             except asyncio.CancelledError:
                 logger.info("WS 客户端已取消")
@@ -264,7 +384,8 @@ class WsClient:
                 except SessionRejectedException:
                     raise
                 except Exception as e:
-                    logger.error("处理帧出错：%s，原始数据：%s", e, raw_msg)
+                    # 原始文本可能含 bind_ok 的 agent_token；解析失败时只保留长度。
+                    logger.exception("处理帧出错：%s（原始帧长度=%d）", e, len(raw_msg))
         except asyncio.CancelledError:
             raise
         except SessionRejectedException:
@@ -275,12 +396,13 @@ class WsClient:
     async def _handle_frame(self, frame: dict[str, Any], origin_ws: Any = None) -> None:
         """处理接收到的帧。origin_ws=收到该帧的那条连接（用于回执归属校验）。"""
         frame_type = frame.get("type")
+        logger.info("[WS<-] received=%s", _audit_json(frame))
 
         if frame_type == "pair_pending":
             self._set_state(ConnectionState.AWAITING_BIND)
             code = frame.get("code")
             expires_at = frame.get("expires_at")
-            logger.info("配对码已生成：%s", code)
+            logger.info("配对码已生成（已脱敏） expires_at=%s", expires_at)
             # 新码到来时，通知上层更新 pairing_code + expires_at + 清除 refreshing
             if self.on_pair_pending:
                 self.on_pair_pending(code, expires_at)
@@ -306,10 +428,12 @@ class WsClient:
             except Exception as e:
                 logger.exception("⚠ 保存 agent_token 到 config 失败：%s", e)
 
+            self._begin_connected_account_selection()
             self._set_state(ConnectionState.CONNECTED)
+            await self._publish_accounts_after_connected()
 
         elif frame_type == "welcome":
-            logger.info("欢迎消息：%s", frame)
+            logger.info("欢迎消息已接收")
             self._set_state(ConnectionState.CONNECTED)
 
         elif frame_type == "reject":
@@ -347,7 +471,7 @@ class WsClient:
         rpc_id = frame.get("id")
         method = frame.get("method")
         params = frame.get("params", {})
-        logger.info("收到 RPC call：id=%s, method=%s", rpc_id, method)
+        logger.info("[RPC] dispatch_begin id=%s method=%s", rpc_id, method)
         try:
             # dispatcher.handle_call 已返回完整 reply 帧（type/id/ok/result|error）。
             # 直接转发，不要再包一层 {ok:true, result:...}——否则外层永远 ok:true，
@@ -363,26 +487,69 @@ class WsClient:
                         _format_rpc_log(method, params, error=reply.get("error"))
                     )
         except Exception as e:
+            logger.exception("[RPC] dispatch_exception id=%s method=%s", rpc_id, method)
             reply = {"type": "reply", "id": rpc_id, "ok": False, "error": str(e)}
             if self.on_rpc_log:
                 self.on_rpc_log(_format_rpc_log(method, params, error=str(e)))
+        logger.info(
+            "[WS->] reply_ready id=%s method=%s reply=%s",
+            rpc_id, method, _audit_json(reply),
+        )
         if origin_ws is not None and self.ws is not origin_ws:
             logger.warning(
                 "丢弃跨连接回执：id=%s method=%s（执行期间已重连，回执归属无法保证）",
                 rpc_id, method)
             return
-        if self.ws:
-            await self.ws.send(json.dumps(reply, ensure_ascii=False))
-
-    async def send_frame(self, frame: dict[str, Any]) -> None:
-        """发送帧"""
         if not self.ws:
-            logger.warning("WebSocket 未连接，无法发送帧")
+            logger.warning("[WS->] reply_not_written id=%s method=%s（连接不存在）", rpc_id, method)
             return
         try:
-            await self.ws.send(json.dumps(frame, ensure_ascii=False))
+            await self.ws.send(json.dumps(reply, ensure_ascii=False))
+        except Exception:
+            logger.exception("[WS->] reply_write_failed id=%s method=%s", rpc_id, method)
+            raise
+        logger.info("[WS->] reply_written id=%s method=%s（仅本地写入成功）", rpc_id, method)
+
+    @staticmethod
+    def _socket_is_closing(ws: Any) -> bool:
+        """兼容 websockets 版本与测试替身，判断 socket 是否已不可写。"""
+        state = getattr(ws, "state", None)
+        state_name = str(getattr(state, "name", state)).upper()
+        return bool(getattr(ws, "closed", False)) or state_name in ("CLOSING", "CLOSED")
+
+    async def send_frame(self, frame: dict[str, Any]) -> bool:
+        """发送主动事件帧；仅当前连接完整写入时返回 ``True``。
+
+        此返回值表示本地 WebSocket 写入结果，不是网关业务确认。网络在写入后
+        中断时无法证明对端是否收到，因此调用方会按同一事件/序号保守重放。
+        """
+        ws = self.ws
+        generation = self._connection_generation
+        logger.info("[WS->] active_frame_attempt=%s", _audit_json(frame))
+        if ws is None:
+            logger.warning("WebSocket 未连接，无法发送帧 type=%s", frame.get("type"))
+            return False
+
+        if self._socket_is_closing(ws):
+            logger.warning("WebSocket 已关闭，无法发送帧 type=%s", frame.get("type"))
+            return False
+        try:
+            await ws.send(json.dumps(frame, ensure_ascii=False))
         except Exception as e:
-            logger.error("发送帧出错：%s", e)
+            logger.error("发送帧出错 type=%s：%s", frame.get("type"), e)
+            return False
+
+        logger.info("[WS->] active_frame_written type=%s（仅本地写入成功）", frame.get("type"))
+
+        # send() 可在 await 时让出控制权；若此期间 run() 已断开并换了连接，
+        # 旧会话上的写入不能推进本地事件基线。
+        if self.ws is not ws or self._connection_generation != generation:
+            logger.warning("发送帧期间连接已切换，保留事件重试 type=%s", frame.get("type"))
+            return False
+        if self._socket_is_closing(ws):
+            logger.warning("发送帧后连接已关闭，保留事件重试 type=%s", frame.get("type"))
+            return False
+        return True
 
     def is_connected(self) -> bool:
         """是否已连接"""

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import sqlite3
 import threading
@@ -54,9 +55,21 @@ class LedgerUnavailable(RuntimeError):
 
 
 def fingerprint(method: str, params: dict[str, Any]) -> str:
-    """请求指纹：同 id 不同参数要能认出来。"""
-    keys = ("stock_no", "amount", "price", "entrust_no")
+    """请求指纹：同 id 不同参数要能认出来。
+
+    ``order_type`` 是买卖的业务语义，而不仅是 price 的表现形式；必须写入
+    指纹，避免同一个 client_order_id 在限价和五档即成剩撤之间切换。
+    """
+    keys = ("stock_no", "amount", "price", "order_type", "entrust_no")
     payload = {k: params.get(k) for k in keys if params.get(k) is not None}
+    if method == "confirm_external_cancel":
+        # 确认令牌只应留在进程内；台账只保存摘要来区分同一 coid 被换令牌的
+        # 调用，不能把可执行令牌落盘。
+        token = params.get("confirmation_token")
+        if isinstance(token, str):
+            payload["confirmation_token_sha256"] = hashlib.sha256(
+                token.encode("utf-8")
+            ).hexdigest()
     return json.dumps({"method": method, **payload}, sort_keys=True, ensure_ascii=False)
 
 
@@ -162,21 +175,44 @@ class OrderLedger:
             raise LedgerUnavailable(f"台账读取失败：{e}") from e
 
     def coid_by_entrust(self) -> dict[str, str]:
-        """entrust_no → client_order_id，供 orders_active/orders_filled 回显 join。
+        """买卖 entrust_no → client_order_id，供 orders_active/orders_filled 回显 join。
 
         读失败返回空表：**回显是尽力而为的增强字段**（对账主键是 entrust_no），
-        不能因为 join 不上就让查询整体失败。
+        不能因为 join 不上就让查询整体失败。撤单动作也会引用目标 entrust_no，但不能
+        覆盖原买卖单的关联；撤单 ID 的核验走其自身台账记录。
         """
         try:
             with self._connect() as conn:
                 rows = conn.execute(
                     "SELECT entrust_no, client_order_id FROM orders"
-                    " WHERE entrust_no IS NOT NULL AND entrust_no != ''").fetchall()
+                    " WHERE method IN ('buy', 'sell')"
+                    " AND entrust_no IS NOT NULL AND entrust_no != ''").fetchall()
                 return {str(r["entrust_no"]): str(r["client_order_id"]) for r in rows}
         except sqlite3.Error:
             logger.warning("台账 entrust_no 映射读取失败，本次不回显 client_order_id",
                            exc_info=True)
             return {}
+
+    def has_entrust_no(self, entrust_no: object) -> bool:
+        """是否存在本机登记的买卖订单合同号。
+
+        撤单记录本身只能说明曾请求撤某个编号，不能证明该原始订单由本机工具创建；
+        因此这里严格只查买卖记录，供未登记订单的撤单确认闸门使用。
+        """
+        value = str(entrust_no or "").strip()
+        if not value:
+            return False
+        try:
+            with self._lock, self._connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM orders"
+                    " WHERE method IN ('buy', 'sell') AND entrust_no=?"
+                    " LIMIT 1",
+                    (value,),
+                ).fetchone()
+                return row is not None
+        except sqlite3.Error as e:
+            raise LedgerUnavailable(f"台账合同号映射读取失败：{e}") from e
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:

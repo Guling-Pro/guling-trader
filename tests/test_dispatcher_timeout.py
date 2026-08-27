@@ -11,6 +11,20 @@ import asyncio
 from trader import dispatcher
 
 
+COID = "gl-0198f6a1-0003-7000-8000-000000000003"
+
+
+class FakeLedger:
+    def reserve(self, client_order_id, method, params):
+        return "new", None
+
+    def complete(self, client_order_id, receipt, entrust_no=None):
+        pass
+
+    def release(self, client_order_id):
+        pass
+
+
 class HangingBackend:
     """sell 永远不返回（模拟弹窗卡死）；查询正常。"""
 
@@ -19,9 +33,14 @@ class HangingBackend:
         self.agent_entrust_nos: set[str] = set()
         self.degraded = False
         self.cleanup_calls = 0
+        self.ledger = FakeLedger()
 
     async def sell(self, *a, **k):
         await asyncio.sleep(3600)
+
+    async def verify_account_for_trade(self):
+        from trader import contract
+        return contract.ok({"account_verified": True, "account_text": "测试账户"})
 
     async def orders_active(self):
         from trader import contract
@@ -40,7 +59,9 @@ def _call(backend, method, params=None, **frame_extra):
 def test_order_timeout_returns_unknown_not_bare_error(monkeypatch):
     monkeypatch.setattr(dispatcher, "CALL_TIMEOUT_SECS", 0.05)
     backend = HangingBackend()
-    reply = _call(backend, "sell", {"stock_no": "300458", "amount": 500})
+    reply = _call(backend, "sell", {"stock_no": "300458", "amount": 500,
+                                      "order_type": "FIVE_LEVEL_IOC",
+                                      "client_order_id": COID})
     assert reply["ok"] is False
     assert reply["result"]["code"] == "submitted_unconfirmed"
     assert reply["result"]["error"]["class"] == "unknown_outcome"
@@ -69,7 +90,9 @@ def test_lock_busy_instead_of_starvation(monkeypatch):
     async def drive():
         await backend.win_lock.acquire()  # 模拟持锁方被拖住
         frame = {"type": "call", "id": "t2", "method": "buy",
-                 "params": {"stock_no": "600000", "amount": 100}}
+                 "params": {"stock_no": "600000", "amount": 100,
+                            "order_type": "FIVE_LEVEL_IOC",
+                            "client_order_id": COID}}
         return await dispatcher.handle_call(frame, backend)
 
     reply = asyncio.run(drive())

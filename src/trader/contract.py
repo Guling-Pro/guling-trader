@@ -13,10 +13,10 @@
 
 两条容易踩的语义，PROTOCOL.md 同步写死：
 
-* **status=failed 不等于「未提交」**。下单动作超时时真相不可知，此时
-  status=failed + code=submitted_unconfirmed + error.class=unknown_outcome。
-  调用方的安全动作是**用同一个 client_order_id 原样重发**（幂等，见 order_ledger），
-  绝不是改单重下。
+* **status=failed 不等于「未提交」**。交易动作超时时真相不可知，此时
+  status=failed + code=submitted_unconfirmed + error.class=unknown_outcome。调用方可先
+  查阅 `data.auto_query`（buy/sell/cancel）或显式查询；若明确重发，唯一安全方式是**用同一个
+  client_order_id 原样重发**（幂等，见 order_ledger），绝不是改单重下。
 * **error.class=unknown 一律不可自动重试**。柜台原文映射是尽力而为的关键词表，
   认不出来就必须认不出来——误判「可重试」会真的重复下单。
 """
@@ -44,6 +44,7 @@ CODE_PLUGIN_DISABLED = "plugin_disabled"
 CODE_INVALID_PARAMS = "invalid_params"
 CODE_LEDGER_UNAVAILABLE = "ledger_unavailable"         # 台账不可用 → 拒单，禁降级
 CODE_NOT_FOUND = "not_found"                           # query_order 查无此单
+CODE_CONFIRMATION_REQUIRED = "confirmation_required"   # 未登记订单须显式二次确认
 CODE_UNSUPPORTED_METHOD = "unsupported_method"
 CODE_INTERNAL_ERROR = "internal_error"
 CODE_ABORTED = "aborted"                               # 本笔已被超时作废（代次机制）
@@ -60,6 +61,7 @@ CLS_TABLE_MISMATCH = "table_mismatch"
 CLS_INVALID_PARAMS = "invalid_params"
 CLS_LEDGER_UNAVAILABLE = "ledger_unavailable"
 CLS_NOT_FOUND = "not_found"
+CLS_CONFIRMATION_REQUIRED = "confirmation_required"
 CLS_INTERNAL_ERROR = "internal_error"
 CLS_ABORTED = "aborted"
 # 第二层：柜台原文尽力映射——认不出即 unknown，绝不猜。
@@ -87,6 +89,7 @@ _BROKER_PATTERNS: tuple[tuple[tuple[str, ...], str], ...] = (
 NON_RETRYABLE_CLASSES = frozenset({
     CLS_UNKNOWN, CLS_UNKNOWN_OUTCOME, CLS_INSUFFICIENT_FUNDS, CLS_NO_PERMISSION,
     CLS_INVALID_QUANTITY, CLS_INVALID_PARAMS, CLS_LEDGER_UNAVAILABLE,
+    CLS_CONFIRMATION_REQUIRED,
 })
 
 
@@ -129,7 +132,7 @@ def broker_rejected(broker_msg: str, message: Optional[str] = None,
 
 def submitted_unconfirmed(message: str, data: Any = None,
                           broker_msg: Optional[str] = None) -> dict[str, Any]:
-    """已点提交但结果不可知。调用方唯一安全动作=同 client_order_id 原样重发。"""
+    """已点提交但结果不可知；显式重发时必须原样复用 client_order_id。"""
     return fail(CODE_SUBMITTED_UNCONFIRMED, CLS_UNKNOWN_OUTCOME, message,
                 broker_msg=broker_msg, data=data)
 

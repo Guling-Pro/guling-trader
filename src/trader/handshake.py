@@ -13,6 +13,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CLIENT_VERSION = "0.8.0"
+_REDACTED = "<redacted>"
+
+
+def _redact_response_for_log(response: dict[str, Any]) -> dict[str, Any]:
+    """保留握手诊断字段，但配对码和凭证绝不能落入 trader.log。"""
+    safe = dict(response)
+    if safe.get("type") == "pair_pending" and "code" in safe:
+        safe["code"] = _REDACTED
+    for key in tuple(safe):
+        normalized = str(key).lower().replace("-", "_")
+        if any(part in normalized for part in ("token", "authorization", "password", "secret")):
+            safe[key] = _REDACTED
+    return safe
 
 
 @dataclass
@@ -62,7 +75,7 @@ async def _pair_init(
     try:
         raw_response = await asyncio.wait_for(ws.recv(), timeout=5.0)
         response = json.loads(raw_response)
-        logger.info("收到握手应答：%s", response)
+        logger.info("收到握手应答：%s", _redact_response_for_log(response))
 
         frame_type = response.get("type")
 
@@ -118,7 +131,7 @@ async def _resume(
     try:
         raw_response = await asyncio.wait_for(ws.recv(), timeout=5.0)
         response = json.loads(raw_response)
-        logger.info("收到握手应答：%s", response)
+        logger.info("收到握手应答：%s", _redact_response_for_log(response))
 
         frame_type = response.get("type")
 
