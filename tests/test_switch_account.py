@@ -16,6 +16,7 @@ from trader.ths.win import (
     WinThsBackend,
     _account_candidates_from_listbox,
     _account_identity,
+    _account_selector_matches_target,
 )
 
 
@@ -79,8 +80,11 @@ def test_switch_matches_requested_list_slot_and_returns_balance(monkeypatch):
         backend, "get_account_list",
         lambda: _account_list("示例券商-甲*乙", "示例券商-丙*丁"),
     )
-    monkeypatch.setattr(backend, "_read_account_selector_text",
-                        iter(["示例券商 甲*乙", "示例券商 丙*丁"]).__next__)
+    monkeypatch.setattr(
+        backend,
+        "_read_account_selector_text",
+        iter(["示例券商 甲*乙", "示例券商-z某营业部 丙*丁"]).__next__,
+    )
     sent = []
     monkeypatch.setattr(backend, "_send_hotkey",
                         lambda keys, where: sent.append((keys, where)))
@@ -94,11 +98,11 @@ def test_switch_matches_requested_list_slot_and_returns_balance(monkeypatch):
 
     assert result["status"] == "succeed"
     assert result["data"]["account_verified"] is True
-    assert result["data"]["account_text"] == "示例券商 丙*丁"
+    assert result["data"]["account_text"] == "示例券商-z某营业部 丙*丁"
     assert result["data"]["target_account_text"] == "示例券商-丙*丁"
     assert result["data"]["already_active"] is False
     assert result["data"]["balance"]["可用金额"] == 20000.78
-    assert result["data"]["msg"] == "已切换到：示例券商 丙*丁"
+    assert result["data"]["msg"] == "已切换到：示例券商-z某营业部 丙*丁"
     assert sent == [(["alt", "2"], "switch_account")]
     assert backend.account_trading_blocked is False
 
@@ -110,7 +114,11 @@ def test_switch_unmatched_target_blocks_trading(monkeypatch):
         backend, "get_account_list",
         lambda: _account_list("示例券商-甲*乙", "示例券商-丙*丁"),
     )
-    monkeypatch.setattr(backend, "_read_account_selector_text", lambda: "示例券商 甲*乙")
+    monkeypatch.setattr(
+        backend,
+        "_read_account_selector_text",
+        lambda: "示例券商-z某营业部 甲*乙",
+    )
     monkeypatch.setattr(backend, "_send_hotkey", lambda keys, where: None)
     monkeypatch.setattr(w, "ACCOUNT_VERIFY_TIMEOUT_SECS", 0)
     balance_called = []
@@ -132,7 +140,11 @@ def test_switch_to_current_account_verifies_without_sending_hotkey(monkeypatch):
         backend, "get_account_list",
         lambda: _account_list("示例券商-甲*乙", "示例券商-丙*丁"),
     )
-    monkeypatch.setattr(backend, "_read_account_selector_text", lambda: "示例券商 甲*乙")
+    monkeypatch.setattr(
+        backend,
+        "_read_account_selector_text",
+        lambda: "示例券商-z某营业部 甲*乙",
+    )
     sent = []
     monkeypatch.setattr(backend, "_send_hotkey", lambda keys, where: sent.append((keys, where)))
     monkeypatch.setattr(backend, "get_balance", lambda: contract.ok({"可用金额": 20000.78}))
@@ -141,7 +153,7 @@ def test_switch_to_current_account_verifies_without_sending_hotkey(monkeypatch):
 
     assert result["status"] == "succeed"
     assert result["data"]["already_active"] is True
-    assert result["data"]["msg"] == "当前已是：示例券商 甲*乙"
+    assert result["data"]["msg"] == "当前已是：示例券商-z某营业部 甲*乙"
     assert sent == []
     assert backend.account_trading_blocked is False
 
@@ -215,6 +227,16 @@ def test_account_listbox_rejects_more_than_nine_accounts():
 def test_account_identity_only_ignores_verified_formatting_difference():
     assert _account_identity("示例券商-甲*乙") == _account_identity("示例券商 甲*乙")
     assert _account_identity("示例券商-甲*乙") != _account_identity("示例券商-甲*丙")
+
+
+def test_account_selector_allows_only_the_observed_branch_insertion():
+    target = "示例券商-甲*乙"
+
+    assert _account_selector_matches_target("示例券商-z示例营业部 甲*乙", target)
+    assert _account_selector_matches_target("示例券商 甲*乙", target)
+    assert not _account_selector_matches_target("示例券商-z示例营业部 甲*丙", target)
+    assert not _account_selector_matches_target("其他券商-z示例营业部 甲*乙", target)
+    assert not _account_selector_matches_target("示例券商-z示例营业部甲*乙", target)
 
 
 def test_account_listbox_uses_a_private_four_argument_send_message(monkeypatch):

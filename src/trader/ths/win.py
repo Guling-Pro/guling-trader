@@ -382,6 +382,9 @@ def _account_candidates_from_listbox(items: list[str]) -> list[dict[str, Any]]:
 
 
 _ACCOUNT_IDENTITY_SEPARATORS = re.compile(r"[\s\-‐‑‒–—―]+")
+_ACCOUNT_LIST_IDENTITY_RE = re.compile(
+    r"^(?P<broker>.+?)[\s\-‐‑‒–—―]+(?P<holder>[^\s\-‐‑‒–—―]*\*+[^\s\-‐‑‒–—―]+)$"
+)
 
 
 def _account_identity(text: Any) -> str:
@@ -394,6 +397,33 @@ def _account_identity(text: Any) -> str:
     """
     normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
     return _ACCOUNT_IDENTITY_SEPARATORS.sub("", normalized)
+
+
+def _account_selector_matches_target(selector_text: Any, target_text: Any) -> bool:
+    """Compare a selector value against one unique ListBox account row.
+
+    Some THS clients insert a branch name into the selector, e.g.
+    ``示例券商-z示例营业部 甲*乙``, while the ListBox row only shows
+    ``示例券商-甲*乙``.  Accept that one observed rendering difference only
+    when the ListBox row provides both a broker and a masked holder name.  Any
+    unparseable text, different broker, or different holder remains a mismatch.
+    """
+    if _account_identity(selector_text) == _account_identity(target_text):
+        return bool(_account_identity(target_text))
+
+    target = unicodedata.normalize("NFKC", str(target_text or "")).strip()
+    selector = unicodedata.normalize("NFKC", str(selector_text or "")).strip()
+    match = _ACCOUNT_LIST_IDENTITY_RE.fullmatch(target)
+    if not match or not selector.startswith(match.group("broker")):
+        return False
+
+    remainder = selector[len(match.group("broker")):]
+    if not remainder or not _ACCOUNT_IDENTITY_SEPARATORS.match(remainder):
+        return False
+    parts = _ACCOUNT_IDENTITY_SEPARATORS.sub(" ", remainder).strip().split()
+    # At least one branch token is required. A plain broker-holder pair has
+    # already been handled by the strict identity comparison above.
+    return len(parts) >= 2 and parts[-1] == match.group("holder")
 
 
 _PHANTOM_VALUES = frozenset({"", "0", "0.0", "0.00", "0.000", "-", "--"})
@@ -3215,7 +3245,7 @@ class WinThsBackend:
                 data={"slot": slot, "account_verified": False, "submitted": False},
             )
 
-        if _account_identity(previous) == target_identity:
+        if _account_selector_matches_target(previous, target_text):
             current = previous
             already_active = True
         else:
@@ -3229,11 +3259,11 @@ class WinThsBackend:
             while time.monotonic() < deadline:
                 self._abort_if_stale("switch_account_verify")
                 current = self._read_account_selector_text()
-                if current and _account_identity(current) == target_identity:
+                if current and _account_selector_matches_target(current, target_text):
                     break
                 time.sleep(sleep_time)
 
-        if not current or _account_identity(current) != target_identity:
+        if not current or not _account_selector_matches_target(current, target_text):
             return contract.fail(
                 contract.CODE_READ_FAILED, CLS_READ_FAILED,
                 "Alt+%s 已发送，但当前账户未匹配目标账户 %s，已禁止买卖和撤单；"
