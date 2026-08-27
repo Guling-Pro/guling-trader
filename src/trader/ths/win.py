@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from typing import Any, Optional
 
 import pytesseract
@@ -380,6 +381,21 @@ def _account_candidates_from_listbox(items: list[str]) -> list[dict[str, Any]]:
     ]
 
 
+_ACCOUNT_IDENTITY_SEPARATORS = re.compile(r"[\s\-‐‑‒–—―]+")
+
+
+def _account_identity(text: Any) -> str:
+    """Canonical form used only to compare the selector with its ListBox row.
+
+    The verified THS controls render the same account as e.g. ``券商 王*甲`` in
+    the selector and ``券商-王*甲`` in the ListBox. Only formatting separators
+    are ignored; the broker name and masked holder name (including ``*``) remain
+    part of the identity.
+    """
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    return _ACCOUNT_IDENTITY_SEPARATORS.sub("", normalized)
+
+
 _PHANTOM_VALUES = frozenset({"", "0", "0.0", "0.00", "0.000", "-", "--"})
 
 
@@ -565,8 +581,8 @@ class WinThsBackend:
         # action; title text by itself is not a sufficient identity proof.
         self._bound_pid: int | None = None
         self._bound_executable: str | None = None
-        # 在首次交易前必须读取 0x094C 建立账户基线；之后每笔交易都核对该文本。
-        # 任何读取失败或文本变化都阻断买卖和撤单，直到成功切换账户或重新核验。
+        # 启动后必须先由 switch_account(slot) 按账户列表核验 0x094C；之后每笔
+        # 交易都核对该文本。任何读取失败或文本变化都阻断买卖和撤单。
         self._account_trading_blocked = True
         self._last_account_text: str | None = None
         # order_watch 与 RPC 共用：串行化对 THS 单窗口的访问，避免并发拷表。
@@ -1016,13 +1032,19 @@ class WinThsBackend:
         """Whether account identity currently blocks every trading action."""
         return self._account_trading_blocked
 
+    def require_explicit_account_selection(self) -> None:
+        """Clear a prior selection when the control connection starts a new session."""
+        self._last_account_text = None
+        self._account_trading_blocked = True
+        logger.info("账户交易核验已重置，等待 switch_account 明确选择")
+
     @guarded
     def _verify_account_for_trade(self) -> dict[str, Any]:
         """建立或核对交易账户基线；失败时阻断所有交易动作。
 
-        首次交易读取到的账户文本成为本进程基线。此后 buy/sell/cancel 与人工单
-        confirm_external_cancel 每次执行前都必须读取到相同文本，避免用户手动切换
-        同花顺账户后订单落入错误账户。
+        账户必须先由明确的 switch_account(slot) 与下拉列表槽位核验。此后
+        buy/sell/cancel 与人工单 confirm_external_cancel 每次执行前都必须读取到
+        相同文本，避免用户手动切换同花顺账户后订单落入错误账户。
         """
         self._abort_if_stale("verify_account_for_trade")
         current = self._read_account_selector_text()
@@ -1041,14 +1063,17 @@ class WinThsBackend:
             )
 
         if expected is None:
-            self._last_account_text = current
-            self._account_trading_blocked = False
-            logger.info("已建立交易账户基线：%s", current)
-            return contract.ok({
-                "account_verified": True,
-                "account_text": current,
-                "account_baseline_established": True,
-            })
+            self._account_trading_blocked = True
+            return contract.fail(
+                contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                "当前账户尚未通过 switch_account 明确核验，已禁止买卖和撤单；"
+                "请先调用 list_accounts，再调用 switch_account 选择账户",
+                data={
+                    "account_verified": False,
+                    "account_text": current,
+                    "submitted": False,
+                },
+            )
 
         if current != expected:
             self._account_trading_blocked = True
@@ -2649,6 +2674,13 @@ class WinThsBackend:
                 f"撤单双击已发出，但后续弹窗核验未完成：{e}",
                 data={"entrust_no": str(entrust_no), "submitted": True},
             )
+        if pump.status == "pending":
+            return contract.fail(
+                contract.CODE_READ_FAILED,
+                contract.CLS_READ_FAILED,
+                "撤单确认弹窗未找到可识别的肯定按钮，未自动确认撤单；请人工核对订单状态",
+                data=pump.attach_to({"entrust_no": str(entrust_no), "submitted": False}),
+            )
         return contract.ok(pump.attach_to({"entrust_no": str(entrust_no), "submitted": True}))
 
     def get_result(self, cid=0x3EC):
@@ -3126,38 +3158,90 @@ class WinThsBackend:
     def do_switch_account(self, slot: int):
         """向 xiadan 发送 Alt+N，切换多账户登录下的当前活跃资金账户。
 
-        盲切：新版 xiadan 的账户下拉框给每个已登录账户注册了 Alt+1..Alt+9
-        加速键（与下拉列表顺序一致）。发送按键后按账户列表项 0x094C 的
-        文本变化核验，并同步读取一次资金面板；核验失败时保留交易闸门。"""
-        previous = self._read_account_selector_text()
+        每次先读取下拉列表，以槽位对应的账户文本作为目标。若目标已经是当前
+        账户，直接核验并返回资金，绝不因文本未变化把交易锁死；否则才发送
+        Alt+N，并轮询到当前账户与目标账户匹配。
+        """
         self._account_trading_blocked = True
+        listed = self.get_account_list()
+        listed_data = listed.get("data") if isinstance(listed, dict) else None
+        if not contract.is_succeed(listed) or not isinstance(listed_data, dict):
+            return contract.fail(
+                contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                "切换前无法读取可选账户列表，未发送切换按键，已禁止买卖和撤单",
+                data={
+                    "slot": slot,
+                    "account_verified": False,
+                    "accounts": (listed_data or {}).get("accounts", []),
+                    "submitted": False,
+                },
+            )
+
+        accounts = listed_data.get("accounts")
+        target = next(
+            (item for item in accounts if isinstance(item, dict) and item.get("slot") == slot),
+            None,
+        ) if isinstance(accounts, list) else None
+        if not target or not isinstance(target.get("text"), str):
+            return contract.fail(
+                contract.CODE_INVALID_PARAMS, contract.CLS_INVALID_PARAMS,
+                f"slot={slot} 不在当前可切换账户列表中，未发送切换按键",
+                data={"slot": slot, "accounts": accounts or [], "submitted": False},
+            )
+
+        target_text = target["text"]
+        target_identity = _account_identity(target_text)
+        same_identity_count = sum(
+            _account_identity(item.get("text")) == target_identity
+            for item in accounts if isinstance(item, dict)
+        )
+        if not target_identity or same_identity_count != 1:
+            return contract.fail(
+                contract.CODE_READ_FAILED, CLS_READ_FAILED,
+                "账户列表中存在无法唯一核验的目标账户，未发送切换按键，已禁止买卖和撤单",
+                data={
+                    "slot": slot,
+                    "target_account_text": target_text,
+                    "accounts": accounts,
+                    "submitted": False,
+                },
+            )
+
+        previous = self._read_account_selector_text()
         if not previous:
             return contract.fail(
                 contract.CODE_READ_FAILED, CLS_READ_FAILED,
                 "切换前无法读取当前账户（控件 ID 0x094C），未发送切换按键，已禁止买卖和撤单",
                 data={"slot": slot, "account_verified": False, "submitted": False},
             )
-        self._send_hotkey(["alt", str(slot)], "switch_account")
 
-        # 切换会触发账户列表和资金/持仓面板重载。账户控件可能先保留旧文本，
-        # 因此轮询至变化或超时；不使用固定 HWND，确保同花顺重启后仍可定位。
-        current = None
-        deadline = time.monotonic() + ACCOUNT_VERIFY_TIMEOUT_SECS
-        while time.monotonic() < deadline:
-            self._abort_if_stale("switch_account_verify")
-            current = self._read_account_selector_text()
-            if current and current != previous:
-                break
-            time.sleep(sleep_time)
+        if _account_identity(previous) == target_identity:
+            current = previous
+            already_active = True
+        else:
+            already_active = False
+            self._send_hotkey(["alt", str(slot)], "switch_account")
 
-        if not current or current == previous:
+            # 切换会触发账户列表和资金/持仓面板重载。账户控件可能先保留旧文本，
+            # 因此轮询至与列表中目标槽位匹配；不使用固定 HWND，确保同花顺重启后仍可定位。
+            current = None
+            deadline = time.monotonic() + ACCOUNT_VERIFY_TIMEOUT_SECS
+            while time.monotonic() < deadline:
+                self._abort_if_stale("switch_account_verify")
+                current = self._read_account_selector_text()
+                if current and _account_identity(current) == target_identity:
+                    break
+                time.sleep(sleep_time)
+
+        if not current or _account_identity(current) != target_identity:
             return contract.fail(
                 contract.CODE_READ_FAILED, CLS_READ_FAILED,
-                "Alt+%s 已发送，但账户控件文本未发生可验证变化，已禁止买卖和撤单；"
-                "请确认目标账户后重试" % slot,
+                "Alt+%s 已发送，但当前账户未匹配目标账户 %s，已禁止买卖和撤单；"
+                "请确认目标账户后重试" % (slot, target_text),
                 data={
                     "slot": slot,
                     "account_verified": False,
+                    "target_account_text": target_text,
                     "previous_account_text": previous,
                     "account_text": current,
                     "submitted": False,
@@ -3168,10 +3252,11 @@ class WinThsBackend:
         if not contract.is_succeed(balance):
             return contract.fail(
                 contract.CODE_READ_FAILED, CLS_READ_FAILED,
-                "已检测到账户切换为 %s，但资金信息读取失败，已禁止买卖和撤单；请稍后重试"
+                "已核验当前账户为 %s，但资金信息读取失败，已禁止买卖和撤单；请稍后重试"
                 % current,
                 data={
                     "slot": slot,
+                    "target_account_text": target_text,
                     "account_verified": False,
                     "account_text": current,
                     "balance": None,
@@ -3182,10 +3267,13 @@ class WinThsBackend:
 
         self._last_account_text = current
         self._account_trading_blocked = False
+        message = f"当前已是：{current}" if already_active else f"已切换到：{current}"
         return contract.ok({
             "slot": slot,
+            "target_account_text": target_text,
             "account_verified": True,
             "account_text": current,
+            "already_active": already_active,
             "balance": balance.get("data"),
-            "msg": f"已切换到：{current}",
+            "msg": message,
         })

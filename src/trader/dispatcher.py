@@ -410,7 +410,7 @@ FALLBACK_TOOLS_SCHEMA = {
     },
     {
       "name": "switch_account",
-      "description": "切换同花顺客户端当前活跃的资金账户（向 xiadan 窗口发送 Alt+N，N=账户在客户端账户下拉列表中的槽位序号）。仅在 xiadan 登录了多个账户时有意义。切换后按账户控件 ID 0x094C 的 text 核验账户变化，并立即读取一次资金信息；成功时返回 account_text 和 balance，失败时禁止后续买卖和撤单。每笔 buy/sell/cancel/confirm_external_cancel 前都会重新核对该账户文本。",
+      "description": "明确选择并核验同花顺当前交易账户。连接后会收到只读 account_event（可选账户列表）；也可先调用 list_accounts。传入槽位后，程序先核对该槽位对应的账户文本：若已是当前账户，不发送热键，直接核验并返回资金；否则才发送 Alt+N 并确认当前账户匹配该槽位。每次连接后的首次买卖或撤单前必须成功调用一次本工具；失败时禁止后续买卖和撤单。每笔 buy/sell/cancel/confirm_external_cancel 前都会重新核对该账户文本。",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1204,7 +1204,8 @@ async def handle_call(
     try:
         # 账户文本是同花顺当前交易账户的唯一已确认身份信号。每个真实交易路径
         # 均在持有 win_lock 后、读取订单表/消费人工撤单令牌/发送任何 UI 输入前
-        # 重新核验；首次成功读取建立本进程基线，之后文本变化一律阻断。
+        # 重新核验；启动后必须先经 switch_account 显式建立本进程基线，之后
+        # 文本变化一律阻断。
         if method in ORDER_METHODS:
             account_preflight = await backend.verify_account_for_trade()
             if not contract.is_succeed(account_preflight):

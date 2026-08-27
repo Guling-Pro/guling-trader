@@ -219,11 +219,14 @@ reply 帧本身仍是单层 `{type,id,ok,result|error}`；除发现接口 `tools
   回显 coid；撤单动作引用同一编号但不会覆盖原买卖单的回显。回查不到合同编号的单
   （超时那批）与外部/人工单为 `null`。**对账主键是 entrust_no，coid 是增强关联**。
 * coid 应全局唯一；调用方的持久记录必须把它与目标账户绑定。固定 UUID v7 格式不
-  携带账户文本；受控端启动后不会把任何账户视为已核验。第一笔交易前会读取账户控件
-  `0x094C` 的 `text` 建立本进程账户基线；此后每笔 `buy`/`sell`/`cancel`/
-  `confirm_external_cancel` 前都会重新读取并比对。读取失败或文本变化时禁止买卖和撤单，
-  不读取订单表、不消费人工撤单令牌，也不向同花顺发送交易输入。`switch_account` 会在
-  切换后返回 `account_text` 与一次资金查询结果，成功后更新该基线。
+  携带账户文本；受控端启动后不会把任何账户视为已核验。连接完成后会发送一次只读的
+  `account_event`，列出可选账户，供调用方选择；该事件丢失时调用方必须使用
+`list_accounts` 查询。每次连接后的首次 `buy`/`sell`/`cancel`/`confirm_external_cancel` 前必须
+  成功调用 `switch_account(slot)` 明确选择账户，即使目标已经是当前账户也一样。该工具会把
+  槽位对应的下拉列表文本与控件 `0x094C` 当前文本核对；目标已是当前账户时不发送热键，
+  否则才发送 `Alt+N`。成功后才建立本进程基线。此后每笔交易前都会重新读取并比对；读取
+  失败或文本变化时禁止买卖和撤单，不读取订单表、不消费人工撤单令牌，也不向同花顺发送
+  交易输入。
 * `buy`/`sell` 首次或幂等重放返回 `submitted_unconfirmed` 时，受控端会自动执行**一次**
   只读 `query_order`，把结果放入 `data.auto_query`；顶层仍保持
   `submitted_unconfirmed`，不会把启发式命中伪装成精确确认，**绝不自动重发下单**。
@@ -334,7 +337,32 @@ Rationale：2026-07-13「报错但静默成交」几乎导致重复下单。
 * 收到 busy 按 `retry_after_secs` 退避，不要立即重试；
 * 下单类务必带 coid，超时后**重发同 id**而不是新建单。
 
-### 3.3. Trader-to-Gateway: `order_event` Push (Unsolicited)
+### 3.3. Trader-to-Gateway: `account_event` Push (Unsolicited)
+
+每次 WebSocket 连接完成后，受控端会**尝试一次**只读读取同花顺账户下拉列表，并发送：
+
+```json
+{
+  "type": "account_event",
+  "event": "available",
+  "accounts": [
+    {"slot": 1, "shortcut": "Alt+1", "text": "券商-王*甲"}
+  ],
+  "current_account_text": "券商 王*甲",
+  "partial": false,
+  "ts": 1782900000.0
+}
+```
+
+`event=unavailable` 表示连接时未能读取列表，会有空 `accounts`、`partial=true` 和可读的
+`message`。此事件不选择账户、不发送热键、不建立交易账户基线，且仅作提示：主动事件在
+断线时可能丢失，调用方必须可通过 `list_accounts` 重新查询。调用方展示列表后，必须调用
+`switch_account(slot)` 明确核验用户选择的账户，哪怕该槽位已经是当前账户。
+
+与 `order_event` 一样，`account_event` 没有 `id`，由网关通用非 reply 路径广播给当前
+控制会话；无需网关改动。它不应被当作可靠状态存储或交易授权依据。
+
+### 3.4. Trader-to-Gateway: `order_event` Push (Unsolicited)
 
 Unlike `reply` (which always answers a preceding `call` and carries its `id`),
 `order_event` is an **unsolicited push** emitted by the trader on its own
@@ -383,11 +411,10 @@ bound to this connection's `agent_token` (e.g. `guling-mcp-gateway`'s
 required** to relay it.
 
 #### Contract notes (consumers MUST honor)
-- **Account identity is carried by the connection token, not the frame.**
-  One WebSocket connection = one THS account; the frame body intentionally
-  omits any account/portfolio field. Consumers map `agent_token` →
-  (user, portfolio). (An optional `account` echo field MAY be added later for
-  defensive logging only; it must never be used for routing.)
+- **网关路由身份仍由连接 token 决定，而不是券商账户文本。** 一个受控端连接可登录
+  多个同花顺账户；`account_event` 和 `switch_account` 回执中的账户文本只用于让用户
+  选择和让受控端做本地核验，绝不能作为网关路由或跨账户订单归属的依据。消费者应把
+  `agent_token` 映射到用户/受控端，再根据其明确的账户选择维护自己的业务归属。
 - **Delivery is best-effort and lossy.** If no live SSE control session
   exists for the token, if the buffer is full, or during disconnects, events
   are **dropped and never replayed**. Consumers MUST keep a

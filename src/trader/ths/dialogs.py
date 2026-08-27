@@ -3,8 +3,9 @@
 设计（docs/superpowers/specs/2026-07-13-ths-dialog-handling-design.md）：
 **先按既有动作处置，再完整记录未知弹窗**。决策只依赖两个结构信号：
 
-1. 弹窗含 ``Edit`` 输入框 → 交给既有 ``backend.input_ocr()``；
-2. 否则按按钮标签的肯定优先级（是 > 确定 > 确认 > 同意 > 唯一按钮）
+1. 已知撤单确认框优先按肯定按钮确认，即使其中含有改价 ``Edit`` 输入框；
+2. 其他弹窗含 ``Edit`` 输入框 → 交给既有 ``backend.input_ocr()``；
+3. 否则按按钮标签的肯定优先级（是 > 确定 > 确认 > 同意 > 唯一按钮）
    ``PostMessage(BM_CLICK)``；没有可点按钮时使用 Enter/WM_CLOSE 兜底。
 
 未知弹窗仍按上述既有动作继续处理，但会在日志、截图和回执的
@@ -44,6 +45,7 @@ def normalize_button_label(raw: str) -> str:
 
 _DIALOG_NEGATIVE_LABELS = ("否", "取消", "不同意", "拒绝")
 _KNOWN_CAPTCHA_MARKERS = ("检测到您正在拷贝数据",)
+_CANCEL_CONFIRMATION_MARKERS = ("撤单确认", "是否确定以上撤销")
 
 
 def choose_button(labels: list[str]) -> Optional[str]:
@@ -88,12 +90,26 @@ def is_known_confirmation(dlg: "DialogFingerprint") -> bool:
     return affirmative and negative
 
 
+def is_known_cancel_confirmation(dlg: "DialogFingerprint") -> bool:
+    """Return whether this is the observed THS cancellation confirmation.
+
+    The real dialog includes an optional "cancel and resubmit at a new price"
+    area, so it has an ``Edit`` control even for an ordinary cancellation.
+    Recognise it from both the fixed title/body markers before applying the
+    generic Edit-to-OCR rule.
+    """
+    haystack = "\n".join((dlg.title or "", dlg.text or ""))
+    return all(marker in haystack for marker in _CANCEL_CONFIRMATION_MARKERS)
+
+
 def classify_dialog(dlg: "DialogFingerprint") -> str:
     """Pure safety decision used by :meth:`DialogSentry.dismiss`.
 
     Results are used to label feedback; unlike a fail-closed policy, an
     ``unknown`` result does not prevent the legacy handling action.
     """
+    if is_known_cancel_confirmation(dlg):
+        return "known_cancel_confirmation"
     if dlg.has_edit:
         return "known_captcha" if is_known_captcha(dlg) else "unknown_edit"
     if is_known_confirmation(dlg):
@@ -212,6 +228,20 @@ class DialogSentry:
         继续沿用原有输入、点击、Enter/WM_CLOSE 处置动作。未知判定由
         ``pump`` 额外记录并反馈，不在这里改变动作结果。
         """
+        if is_known_cancel_confirmation(dlg):
+            # A cancellation confirmation can contain an optional repricing
+            # Edit. It is not a captcha and must never be sent to OCR.
+            for label in DIALOG_AFFIRM_LABELS:
+                button = dlg.buttons.get(label)
+                if button:
+                    win32api.PostMessage(button, win32con.BM_CLICK, 0, 0)
+                    return f"click:{label}"
+            logger.warning(
+                "cancel confirmation has no recognizable affirmative button; "
+                "leaving it pending title=%r text=%r",
+                dlg.title, dlg.text[:200],
+            )
+            return "pending:cancel_confirmation_no_affirmative"
         if dlg.has_edit:
             # 验证码/身份验证：沿用原逻辑交给 OCR；未知类型会在 pump 回执中标记。
             self.backend.input_ocr()
@@ -269,7 +299,9 @@ class DialogSentry:
                 logger.info("dialog handled title=%r action=%s text=%r",
                             dlg.title, action, dlg.text[:200])
                 record = {"title": dlg.title, "text": dlg.text, "action": action}
-                if decision not in {"known_captcha", "known_confirmation"}:
+                if decision not in {
+                    "known_captcha", "known_confirmation", "known_cancel_confirmation",
+                }:
                     record["unknown"] = True
                     record["reason"] = decision
                     result.unknown_dialogs.append(dict(record))
@@ -280,6 +312,12 @@ class DialogSentry:
                 result.dialogs.append(record)
                 if not result.entrust_no:
                     result.entrust_no = extract_entrust_no(dlg.text)
+                if action.startswith("pending:"):
+                    # A recognised cancellation prompt without a safe button
+                    # must not be retried, Entered, closed, or reported as a
+                    # completed cancellation.
+                    result.status = "pending"
+                    return result
             time.sleep(0.1)
         return result
 

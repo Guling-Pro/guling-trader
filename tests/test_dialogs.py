@@ -11,6 +11,7 @@ from trader.ths.dialogs import (
     choose_button,
     extract_entrust_no,
     is_known_captcha,
+    is_known_cancel_confirmation,
     is_known_confirmation,
     normalize_button_label,
 )
@@ -93,6 +94,58 @@ def test_known_confirmation_requires_affirmative_and_negative_buttons():
     assert is_known_confirmation(_dialog(buttons={"是": 101, "否": 102}))
     assert is_known_confirmation(_dialog(buttons={"确定": 101, "取消": 102}))
     assert not is_known_confirmation(_dialog(buttons={"确定": 101}))
+
+
+def test_cancel_confirmation_with_reprice_edit_is_not_sent_to_ocr(monkeypatch):
+    import trader.ths.dialogs as dialogs_module
+
+    calls = []
+
+    class Api:
+        def PostMessage(self, *args):
+            calls.append(args)
+
+    class Con:
+        BM_CLICK = 1
+
+    class Backend:
+        ocr_called = False
+
+        def input_ocr(self):
+            self.ocr_called = True
+
+    monkeypatch.setattr(dialogs_module, "win32api", Api(), raising=False)
+    monkeypatch.setattr(dialogs_module, "win32con", Con(), raising=False)
+    dlg = _dialog(
+        text="您是否确定以上撤销买入委托？\n撤单确认\n(撤单并以新的价格委托)",
+        buttons={"否": 102, "是": 101},
+        has_edit=True,
+    )
+    backend = Backend()
+
+    assert is_known_cancel_confirmation(dlg)
+    assert classify_dialog(dlg) == "known_cancel_confirmation"
+    assert DialogSentry(backend).dismiss(dlg) == "click:是"
+    assert backend.ocr_called is False
+    assert calls == [(101, 1, 0, 0)]
+
+
+def test_cancel_confirmation_without_affirmative_button_stays_pending():
+    class Backend:
+        ocr_called = False
+
+        def input_ocr(self):
+            self.ocr_called = True
+
+    dlg = _dialog(
+        text="您是否确定以上撤销买入委托？\n撤单确认",
+        buttons={"取消": 102},
+        has_edit=True,
+    )
+    backend = Backend()
+
+    assert DialogSentry(backend).dismiss(dlg) == "pending:cancel_confirmation_no_affirmative"
+    assert backend.ocr_called is False
 
 
 def test_dismiss_unknown_edit_keeps_legacy_ocr():

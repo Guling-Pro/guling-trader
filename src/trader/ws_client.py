@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import ssl
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional, TYPE_CHECKING
@@ -195,6 +196,9 @@ class WsClient:
         # 每次成功建立连接递增。主动事件写入期间若连接已经切换，旧连接上的
         # send 即使返回也不能视为当前会话投递成功，交给看门狗保留原帧重放。
         self._connection_generation = 0
+        # 每个 WS 连接代次只尝试推送一次账户列表。推送失败不在本地重放：
+        # list_accounts 是可随时调用的权威只读查询，避免断线时反复开关账户下拉框。
+        self._account_event_generation = 0
         self.pending_rpcs: dict[str, PendingRPC] = {}
         self.reconnect_delay = 1.0
         self.max_reconnect_delay = 60.0
@@ -211,6 +215,59 @@ class WsClient:
             self.state = new_state
             if self.on_state_change:
                 self.on_state_change(new_state)
+
+    async def _publish_accounts_after_connected(self) -> None:
+        """连接成功后将可选账户作为只读事件发给上游选择。
+
+        账户列表事件只是连接时的提示，丢失或读取失败时上游仍须调用
+        ``list_accounts``。它不会建立交易账户基线，也不会发送任何切换热键。
+        """
+        generation = self._connection_generation
+        if (self.state != ConnectionState.CONNECTED
+                or self._account_event_generation == generation):
+            return
+        self._account_event_generation = generation
+
+        try:
+            async with self.backend.win_lock:
+                result = await self.backend.list_accounts()
+        except Exception as e:
+            logger.warning("连接后读取账户列表异常：%s", e, exc_info=True)
+            result = None
+
+        if self.state != ConnectionState.CONNECTED or generation != self._connection_generation:
+            return
+
+        data = result.get("data") if isinstance(result, dict) else {}
+        succeeded = isinstance(result, dict) and result.get("status") == "succeed"
+        frame = {
+            "type": "account_event",
+            "event": "available" if succeeded else "unavailable",
+            "accounts": data.get("accounts", []) if isinstance(data, dict) else [],
+            "current_account_text": (
+                data.get("current_account_text") if isinstance(data, dict) else None
+            ),
+            "partial": bool(data.get("partial", True)) if isinstance(data, dict) else True,
+            "ts": time.time(),
+        }
+        if not succeeded and isinstance(result, dict):
+            error = result.get("error")
+            if isinstance(error, dict):
+                frame["message"] = error.get("message")
+        sent = await self.send_frame(frame)
+        if sent:
+            logger.info("连接后账户列表事件已发送 event=%s accounts=%d",
+                        frame["event"], len(frame["accounts"]))
+        else:
+            logger.warning("连接后账户列表事件未写入；上游可调用 list_accounts 重试")
+
+    def _begin_connected_account_selection(self) -> None:
+        """A new control connection must not inherit the prior session's choice."""
+        reset = getattr(self.backend, "require_explicit_account_selection", None)
+        if callable(reset):
+            reset()
+        else:
+            logger.warning("后端不支持连接后账户核验重置；交易请求将由后端自身闸门决定")
 
     async def run(self) -> None:
         """主循环：连接 → 握手 → 消息处理 → 重连"""
@@ -260,7 +317,9 @@ class WsClient:
                         # pair_init 成功 → 收到 pair_pending，等 bind_ok 才 CONNECTED
                         # resume 成功 → 收到 welcome，直接 CONNECTED
                         if was_paired:
+                            self._begin_connected_account_selection()
                             self._set_state(ConnectionState.CONNECTED)
+                            await self._publish_accounts_after_connected()
                         else:
                             self._set_state(ConnectionState.AWAITING_BIND)
                             # 把 pair_pending 的 code/expires_at 推给上层（main_window）
@@ -369,7 +428,9 @@ class WsClient:
             except Exception as e:
                 logger.exception("⚠ 保存 agent_token 到 config 失败：%s", e)
 
+            self._begin_connected_account_selection()
             self._set_state(ConnectionState.CONNECTED)
+            await self._publish_accounts_after_connected()
 
         elif frame_type == "welcome":
             logger.info("欢迎消息已接收")
