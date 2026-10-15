@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-CLIENT_VERSION = "0.8.0"
+CLIENT_VERSION = "0.8.1"
 _REDACTED = "<redacted>"
 
 
