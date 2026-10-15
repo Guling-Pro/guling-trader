@@ -1425,8 +1425,14 @@ class WinThsBackend:
                     }
                     self.state.update(kind, rows)
                     return contract.ok(rows)
-                logger.warning("%s 抓到错表（第 %d/%d 次）：%s cols=%r",
-                               label, attempt, self._GRID_ATTEMPTS, reason, got_columns)
+                logger.warning("%s 抓到错表（第 %d/%d 次）：%s cols=%r foreground=%s main=%s",
+                               label, attempt, self._GRID_ATTEMPTS, reason, got_columns,
+                               _foreground_window(), self.hwnd_main)
+                # 错表=翻页没生效：xiadan 还没处理完按键（负载高/刚弹过验证码），或焦点
+                # 不在它身上导致 F 键丢失。重试前把它拉回前台，并按次数退避给渲染留时间。
+                _activate_window(self.hwnd_main)
+                time.sleep(refresh_sleep_time * attempt)
+                continue
             time.sleep(sleep_time)
         if reason:
             return contract.fail(
