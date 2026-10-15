@@ -508,6 +508,17 @@ def _release_reservation(backend, coid: str) -> None:
             logger.warning("台账撤销登记失败 coid=%s", coid, exc_info=True)
 
 
+_PRE_SUBMIT_ABORT_CODES = {contract.CODE_READ_FAILED, contract.CODE_TABLE_MISMATCH}
+
+
+def _aborted_before_submit(method: str, result: dict) -> bool:
+    """buy/sell 因下单前读表失败而中止，且 backend 明确声明未提交。"""
+    if method not in ("buy", "sell") or result.get("code") not in _PRE_SUBMIT_ABORT_CODES:
+        return False
+    data = result.get("data")
+    return isinstance(data, dict) and data.get("submitted") is False
+
+
 def _record_brief(record: Optional[dict]) -> dict:
     """台账条目的对外摘要（不回吐内部字段）。"""
     r = record or {}
@@ -1393,6 +1404,13 @@ async def handle_call(
             result = contract.fail(contract.CODE_INTERNAL_ERROR,
                                    contract.CLS_INTERNAL_ERROR,
                                    f"受控端返回了非契约形态：{type(result).__name__}")
+
+        # buy/sell 在点提交之前就因读表失败中止（backend 明确 submitted=false）：
+        # 没有任何委托产生，不能把 coid 落成 done，否则同 id 重发被幂等命中，
+        # 当天再无重试机会。撤销登记，让同 id 可原样重试。
+        if reserved_coid and _aborted_before_submit(method, result):
+            _release_reservation(backend, reserved_coid)
+            reserved_coid = None
 
         # 下单类：回填 client_order_id 并把首次回执落台账（幂等重发就靠它）。
         if reserved_coid:

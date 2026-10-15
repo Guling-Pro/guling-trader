@@ -331,6 +331,23 @@ def test_failed_account_preflight_blocks_buy_and_releases_idempotency_reservatio
     assert backend.account_checks == 2
 
 
+def test_unsubmitted_backend_failure_releases_reservation_for_same_id_retry(ledger):
+    """backend 明确「未提交」的失败（如下单前基线读表失败）不得把 coid 落成 done：
+    否则同 id 重发被幂等命中，当天永远提交不出去。"""
+    backend = OrderBackend(ledger, result=contract.fail(
+        contract.CODE_READ_FAILED, contract.CLS_READ_FAILED,
+        "下单前无法读取成交表", data={"submitted": False}))
+
+    first = _buy(backend, coid(80))
+    assert first["result"]["code"] == "read_failed"
+    assert ledger.get(coid(80)) is None
+
+    backend._result = contract.ok({"entrust_no": "888"})
+    retried = _buy(backend, coid(80))
+    assert retried["ok"] is True
+    assert backend.submits == 2
+
+
 def test_failed_account_preflight_blocks_external_cancel_before_table_read(ledger):
     """人工订单撤单在核验失败时不能读表、发确认令牌或点击撤单。"""
     backend = OrderBackend(ledger)
